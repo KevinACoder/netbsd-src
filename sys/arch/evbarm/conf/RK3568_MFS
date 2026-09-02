@@ -1,0 +1,23 @@
+#	$NetBSD$
+#
+#	RK3568 ramdisk (miniroot-in-kernel) driver-debug line.
+#
+#	Modeled on the FreeBSD mfsBSD lane: a GENERIC64 kernel with a
+#	fixed-size memory-disk root embedded via mdsetimage(8).  Boots over
+#	TFTP + U-Boot booti with no bootargs; root is the embedded md0a
+#	miniroot, console from the DTB stdout-path.
+#
+#	Everything from GENERIC64 stays enabled ("都打开") so the driver
+#	matrix is as broad as possible for bring-up.  Only the memory-disk
+#	root options are layered on top.
+
+include	"arch/evbarm/conf/GENERIC64"
+
+# RK3568 bring-up SoC (fixed-rate CRU stub + platform glue)
+options 	SOC_RK3568
+
+# Ramdisk root (miniroot embedded with mdsetimage)
+options 	MEMORY_DISK_IS_ROOT
+options 	MEMORY_DISK_ROOT_SIZE=6144	# 6144 * 512 = 3072 KiB (ramdisk.fs)
+options 	MEMORY_DISK_RBFLAGS=RB_SINGLE	# single-user: no device needed
+no options 	MEMORY_DISK_DYNAMIC		# fixed layout, mdsetimage format

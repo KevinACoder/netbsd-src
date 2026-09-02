@@ -59,6 +59,8 @@ struct rk_eqos_ops {
 	void (*set_speed_rgmii)(struct rk_eqos_softc *, int);
 	void (*clock_selection)(struct rk_eqos_softc *, int);
 	int (*get_unit)(struct rk_eqos_softc *, int);
+	int (*reset_gpio)(struct rk_eqos_softc *, int);
+	bool require_php_grf;
 };
 
 CFATTACH_DECL_NEW(rk_eqos, sizeof(struct rk_eqos_softc),
@@ -220,18 +222,6 @@ rk3588_eqos_get_unit(struct rk_eqos_softc *rk_sc, int phandle)
 	return 0;
 }
 
-static const struct rk_eqos_ops rk3588_ops = {
-	.set_mode_rgmii = rk3588_eqos_set_mode_rgmii,
-	.set_speed_rgmii = rk3588_eqos_set_speed_rgmii,
-	.clock_selection = rk3588_eqos_clock_selection,
-	.get_unit = rk3588_eqos_get_unit
-};
-
-static const struct device_compatible_entry compat_data[] = {
-	{ .compat = "rockchip,rk3588-gmac", .value = (uintptr_t)&rk3588_ops },
-	DEVICE_COMPAT_EOL
-};
-
 static int
 rk_eqos_reset_gpio(const int phandle)
 {
@@ -262,6 +252,283 @@ rk_eqos_reset_gpio(const int phandle)
 	delay(be32toh(reset_delay_us[2]));
 
 	return 0;
+}
+
+static int
+rk3588_eqos_reset_gpio(struct rk_eqos_softc *rk_sc, int phandle)
+{
+
+	return rk_eqos_reset_gpio(phandle);
+}
+
+static const struct rk_eqos_ops rk3588_ops = {
+	.set_mode_rgmii = rk3588_eqos_set_mode_rgmii,
+	.set_speed_rgmii = rk3588_eqos_set_speed_rgmii,
+	.clock_selection = rk3588_eqos_clock_selection,
+	.get_unit = rk3588_eqos_get_unit,
+	.reset_gpio = rk3588_eqos_reset_gpio,
+	.require_php_grf = true,
+};
+
+/*
+ * RK3568 specific
+ *
+ * Both GMACs are DWC Ethernet QoS (dwmac-4.20a) cores.  Interface mode,
+ * RGMII delays and the GMAC pin groups all live in the main GRF at
+ * 0xfdc60000; there is no separate php_grf on this SoC.  NetBSD has no
+ * iomux/pinctrl driver for the RK3568 yet (and U-Boot only muxes the
+ * ports it probes), so the GMAC pin groups are muxed directly from a
+ * static table below; the values match the vendor Linux device tree and
+ * the writes are idempotent with whatever the firmware left behind.
+ * There is no GPIO controller driver either, so the PHY reset GPIO is
+ * pulsed by hand from its "snps,reset-gpio" specifier.
+ */
+#define RK3568_ETHERNET0_ADDR		0xfe2a0000
+#define RK3568_ETHERNET1_ADDR		0xfe010000
+
+/* grf: per-port interface mode / RGMII delay control */
+#define RK3568_GRF_GMAC0_CON0		0x0380
+#define RK3568_GRF_GMAC0_CON1		0x0384
+#define RK3568_GRF_GMAC1_CON0		0x0388
+#define RK3568_GRF_GMAC1_CON1		0x038c
+/* grf: gmac1 io route (m0/m1); bit8 = 0 selects m0 */
+#define RK3568_GRF_GMAC1_ROUTE		0x0300
+
+/* GRF write format: <value> in bits[15:0], <write-enable> in bits[31:16] */
+#define RK3568_GRF_WRITE(val, mask)	((((mask) & 0xffff) << 16) | \
+					  ((val) & 0xffff))
+#define RK3568_GMAC_PHY_INTF_SEL_RGMII	RK3568_GRF_WRITE(__BIT(4), __BITS(6,4))
+#define RK3568_GMAC_TXCLK_DLY_ENABLE	RK3568_GRF_WRITE(__BIT(0), __BIT(0))
+#define RK3568_GMAC_RXCLK_DLY_ENABLE	RK3568_GRF_WRITE(__BIT(1), __BIT(1))
+
+/*
+ * RK3568 GPIO banks are version 2: 16 pins per data/direction register,
+ * value in bits[15:0] and write-enable in bits[31:16].
+ */
+#define RK3568_GPIO_DR_L		0x00
+#define RK3568_GPIO_DR_H		0x04
+#define RK3568_GPIO_DDR_L		0x08
+#define RK3568_GPIO_DDR_H		0x0c
+
+/* pin mux: 4 bits per pin, 4 pins per 32-bit iomux register */
+struct rk3568_eqos_pin {
+	u_int	pin;
+	u_int	func;
+};
+
+static const struct rk3568_eqos_pin rk3568_eqos_gmac0_pins[] = {
+	{  3, 2 },	/* rxd2 */
+	{  4, 2 },	/* rxd3 */
+	{  5, 2 },	/* rxclk */
+	{  6, 2 },	/* txd2 */
+	{  7, 2 },	/* txd3 */
+	{  8, 2 },	/* txclk */
+	{ 11, 1 },	/* txd0 */
+	{ 12, 1 },	/* txd1 */
+	{ 13, 1 },	/* txen */
+	{ 14, 1 },	/* rxd0 */
+	{ 15, 2 },	/* rxd1 */
+	{ 16, 2 },	/* rxdvcrs */
+	{ 19, 2 },	/* mdc */
+	{ 20, 2 },	/* mdio */
+};
+
+static const struct rk3568_eqos_pin rk3568_eqos_gmac1_pins[] = {
+	{  2, 3 },	/* txd2 */
+	{  3, 3 },	/* txd3 */
+	{  4, 3 },	/* rxd2 */
+	{  5, 3 },	/* rxd3 */
+	{  6, 3 },	/* txclk */
+	{  7, 3 },	/* rxclk */
+	{  9, 3 },	/* rxd0 */
+	{ 10, 3 },	/* rxd1 */
+	{ 11, 3 },	/* rxdvcrs */
+	{ 13, 3 },	/* txd0 */
+	{ 14, 3 },	/* txd1 */
+	{ 15, 3 },	/* txen */
+	{ 16, 3 },	/* mclkinout */
+	{ 20, 3 },	/* mdc */
+	{ 21, 3 },	/* mdio */
+};
+
+static void
+rk3568_eqos_mux_pin(struct rk_eqos_softc *rk_sc, u_int bankoff, u_int pin,
+    u_int func)
+{
+	const bus_size_t reg =
+	    bankoff + (pin / 8) * 8 + (((pin % 8) / 4) * 4);
+	const u_int shift = (pin % 4) * 4;
+
+	syscon_write_4(rk_sc->sc_grf, reg,
+	    RK3568_GRF_WRITE(func << shift, 0xf << shift));
+}
+
+static void
+rk3568_eqos_clock_selection(struct rk_eqos_softc *rk_sc, int phandle)
+{
+	const u_int bankoff = (rk_sc->sc_id == 1) ? 0x040 : 0x020;
+	const struct rk3568_eqos_pin *pins;
+	u_int npins, i;
+
+	if (rk_sc->sc_id == 1) {
+		pins = rk3568_eqos_gmac1_pins;
+		npins = __arraycount(rk3568_eqos_gmac1_pins);
+	} else {
+		pins = rk3568_eqos_gmac0_pins;
+		npins = __arraycount(rk3568_eqos_gmac0_pins);
+	}
+
+	syscon_lock(rk_sc->sc_grf);
+	if (rk_sc->sc_id == 1) {
+		syscon_write_4(rk_sc->sc_grf, RK3568_GRF_GMAC1_ROUTE,
+		    RK3568_GRF_WRITE(0, __BIT(8)));
+	}
+	for (i = 0; i < npins; i++)
+		rk3568_eqos_mux_pin(rk_sc, bankoff, pins[i].pin, pins[i].func);
+	syscon_unlock(rk_sc->sc_grf);
+}
+
+static void
+rk3568_eqos_set_mode_rgmii(struct rk_eqos_softc *rk_sc,
+    int tx_delay, int rx_delay)
+{
+	const bus_size_t con0 = (rk_sc->sc_id == 1) ?
+	    RK3568_GRF_GMAC1_CON0 : RK3568_GRF_GMAC0_CON0;
+	const bus_size_t con1 = (rk_sc->sc_id == 1) ?
+	    RK3568_GRF_GMAC1_CON1 : RK3568_GRF_GMAC0_CON1;
+	const bool txen = tx_delay >= 0;
+	const bool rxen = rx_delay >= 0;
+	uint32_t val;
+
+	if (!txen)
+		tx_delay = 0;
+	if (!rxen)
+		rx_delay = 0;
+
+	val = RK3568_GMAC_PHY_INTF_SEL_RGMII;
+	if (txen)
+		val |= RK3568_GMAC_TXCLK_DLY_ENABLE;
+	if (rxen)
+		val |= RK3568_GMAC_RXCLK_DLY_ENABLE;
+
+	syscon_lock(rk_sc->sc_grf);
+	syscon_write_4(rk_sc->sc_grf, con1, val);
+	syscon_write_4(rk_sc->sc_grf, con0,
+	    RK3568_GRF_WRITE(((uint32_t)rx_delay << 8) | (uint32_t)tx_delay,
+	    __BITS(14,8) | __BITS(6,0)));
+	syscon_unlock(rk_sc->sc_grf);
+}
+
+static int
+rk3568_eqos_get_unit(struct rk_eqos_softc *rk_sc, int phandle)
+{
+	bus_addr_t addr;
+	bus_size_t size;
+
+	fdtbus_get_reg(phandle, 0, &addr, &size);
+	if (addr == RK3568_ETHERNET1_ADDR)
+		return 1;
+	return 0;
+}
+
+static void
+rk3568_eqos_gpio_write(bus_space_tag_t bst, bus_space_handle_t bsh,
+    u_int pin, bool output, bool value)
+{
+	const bus_size_t dr = (pin < 16) ? RK3568_GPIO_DR_L : RK3568_GPIO_DR_H;
+	const bus_size_t ddr = (pin < 16) ? RK3568_GPIO_DDR_L : RK3568_GPIO_DDR_H;
+	const u_int bit = pin & 15;
+
+	/* set the data first, then switch the direction */
+	bus_space_write_4(bst, bsh, dr,
+	    __BIT(bit + 16) | (value ? __BIT(bit) : 0));
+	bus_space_write_4(bst, bsh, ddr,
+	    __BIT(bit + 16) | (output ? __BIT(bit) : 0));
+}
+
+/*
+ * The RK3568 has no GPIO controller driver under NetBSD yet, so pulse
+ * the PHY reset pin described by "snps,reset-gpio" by hand.
+ */
+static int
+rk3568_eqos_reset_gpio(struct rk_eqos_softc *rk_sc, int phandle)
+{
+	const u_int *gpio_spec, *delays;
+	bus_addr_t addr;
+	bus_size_t size;
+	bus_space_handle_t bsh;
+	bool active_low;
+	u_int pin;
+	int len;
+
+	if (!of_hasprop(phandle, "snps,reset-gpio"))
+		return 0;
+
+	gpio_spec = fdtbus_get_prop(phandle, "snps,reset-gpio", &len);
+	if (gpio_spec == NULL || len != 12)
+		return ENXIO;
+
+	delays = fdtbus_get_prop(phandle, "snps,reset-delays-us", &len);
+	if (delays == NULL || len != 12)
+		return ENXIO;
+
+	const int gpio_phandle = fdtbus_get_phandle(phandle, "snps,reset-gpio");
+	if (gpio_phandle < 0)
+		return ENOENT;
+	if (fdtbus_get_reg(gpio_phandle, 0, &addr, &size) != 0)
+		return ENOENT;
+	if (bus_space_map(rk_sc->sc_base.sc_bst, addr, 0x10, 0, &bsh) != 0)
+		return ENOMEM;
+
+	pin = be32toh(gpio_spec[1]);
+	active_low = of_hasprop(phandle, "snps,reset-active-low") ||
+	    (be32toh(gpio_spec[2]) & 1);	/* GPIO_ACTIVE_LOW */
+
+	delay(be32toh(delays[0]));
+	rk3568_eqos_gpio_write(rk_sc->sc_base.sc_bst, bsh, pin, true,
+	    !active_low);
+	delay(be32toh(delays[1]));
+	rk3568_eqos_gpio_write(rk_sc->sc_base.sc_bst, bsh, pin, true,
+	    active_low);
+	delay(be32toh(delays[2]));
+	bus_space_unmap(rk_sc->sc_base.sc_bst, bsh, 0x10);
+
+	return 0;
+}
+
+static const struct rk_eqos_ops rk3568_ops = {
+	.set_mode_rgmii = rk3568_eqos_set_mode_rgmii,
+	.set_speed_rgmii = NULL,
+	.clock_selection = rk3568_eqos_clock_selection,
+	.get_unit = rk3568_eqos_get_unit,
+	.reset_gpio = rk3568_eqos_reset_gpio,
+	.require_php_grf = false,
+};
+
+static const struct device_compatible_entry compat_data[] = {
+	{ .compat = "rockchip,rk3588-gmac", .value = (uintptr_t)&rk3588_ops },
+	{ .compat = "rockchip,rk3568-gmac", .value = (uintptr_t)&rk3568_ops },
+	DEVICE_COMPAT_EOL
+};
+
+static void
+rk_eqos_set_macaddr(struct eqos_softc *sc, int phandle)
+{
+	prop_data_t pd;
+	const u_int *mac;
+	int len;
+
+	mac = fdtbus_get_prop(phandle, "local-mac-address", &len);
+	if (mac == NULL || len != ETHER_ADDR_LEN)
+		mac = fdtbus_get_prop(phandle, "mac-address", &len);
+	if (mac == NULL || len != ETHER_ADDR_LEN)
+		return;
+
+	pd = prop_data_create_data(mac, ETHER_ADDR_LEN);
+	if (pd == NULL)
+		return;
+	prop_dictionary_set(device_properties(sc->sc_dev), "mac-address", pd);
+	prop_object_release(pd);
 }
 
 static void
@@ -318,10 +585,13 @@ rk_eqos_attach(device_t parent, device_t self, void *aux)
 		aprint_error(": couldn't get grf syscon\n");
 		return;
 	}
-	rk_sc->sc_php_grf = fdtbus_syscon_acquire(phandle, "rockchip,php_grf");
-	if (rk_sc->sc_php_grf == NULL) {
-		aprint_error(": couldn't get php_grf syscon\n");
-		return;
+	if (ops->require_php_grf) {
+		rk_sc->sc_php_grf =
+		    fdtbus_syscon_acquire(phandle, "rockchip,php_grf");
+		if (rk_sc->sc_php_grf == NULL) {
+			aprint_error(": couldn't get php_grf syscon\n");
+			return;
+		}
 	}
 
 	sc->sc_dev = self;
@@ -354,7 +624,8 @@ rk_eqos_attach(device_t parent, device_t self, void *aux)
 			return;
 		}
 	}
-	if (rk_eqos_reset_gpio(phandle) != 0)
+	if (ops->reset_gpio != NULL &&
+	    ops->reset_gpio(rk_sc, phandle) != 0)
 		aprint_error(": GPIO reset failed\n");	/* ignore */
 
 	if (ops->clock_selection != NULL)
@@ -384,6 +655,7 @@ rk_eqos_attach(device_t parent, device_t self, void *aux)
 	}
 
 	rk_eqos_init_props(sc, phandle);
+	rk_eqos_set_macaddr(sc, phandle);
 	sc->sc_phy_id = MII_PHY_ANY;
 #define CSR_RATE_RGMII	125000000	/* default */
 	sc->sc_csr_clock = CSR_RATE_RGMII;

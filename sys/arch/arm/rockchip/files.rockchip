@@ -39,6 +39,10 @@ file	arch/arm/rockchip/rk3399_pmucru.c	rk3399_pmucru & soc_rk3399
 attach	rkcru at fdt with rk3588_cru
 file	arch/arm/rockchip/rk3588_cru.c		rk3588_cru & soc_rk3588
 
+# RK3568 clock and reset unit (fixed-rate bring-up stub)
+attach	rkcru at fdt with rk3568_cru
+file	arch/arm/rockchip/rk3568_cru.c		rk3568_cru & soc_rk3568
+
 endif
 
 # IOMUX control
@@ -173,3 +177,4 @@ defflag	opt_soc.h			SOC_RK3288: SOC_ROCKCHIP
 defflag	opt_soc.h			SOC_RK3328: SOC_ROCKCHIP
 defflag	opt_soc.h			SOC_RK3399: SOC_ROCKCHIP
 defflag	opt_soc.h			SOC_RK3588: SOC_ROCKCHIP
+defflag	opt_soc.h			SOC_RK3568: SOC_ROCKCHIP

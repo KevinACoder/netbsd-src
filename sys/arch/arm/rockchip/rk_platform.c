@@ -364,3 +364,61 @@ FDT_PLATFORM(rk3588, "rockchip,rk3588", &rk3588_platform);
 
 #endif /* SOC_RK3588 */
 
+
+#ifdef SOC_RK3568
+
+#include <arm/rockchip/rk3568_platform.h>
+
+static const struct pmap_devmap *
+rk3568_platform_devmap(void)
+{
+	static const struct pmap_devmap devmap[] = {
+		DEVMAP_ENTRY(RK3568_CORE_VBASE,
+			     RK3568_CORE_PBASE,
+			     RK3568_CORE_SIZE),
+		DEVMAP_ENTRY_END
+	};
+
+	return devmap;
+}
+
+void rk3568_platform_early_putchar(char);
+
+void
+rk3568_platform_early_putchar(char c)
+{
+#ifdef CONSADDR
+#define CONSADDR_VA	((CONSADDR - RK3568_CORE_PBASE) + RK3568_CORE_VBASE)
+	volatile uint32_t *uartaddr = cpu_earlydevice_va_p() ?
+	    (volatile uint32_t *)CONSADDR_VA :
+	    (volatile uint32_t *)CONSADDR;
+
+	while ((le32toh(uartaddr[com_lsr]) & LSR_TXRDY) == 0)
+		;
+
+	uartaddr[com_data] = htole32(c);
+#undef CONSADDR_VA
+#endif
+}
+
+static u_int
+rk3568_platform_uart_freq(void)
+{
+	return RK3568_UART_FREQ;
+}
+
+static const struct fdt_platform rk3568_platform = {
+	.fp_devmap = rk3568_platform_devmap,
+	.fp_bootstrap = rk_platform_bootstrap,
+	.fp_init_attach_args = rk_platform_init_attach_args,
+	.fp_device_register = rk_platform_device_register,
+	.fp_reset = psci_fdt_reset,
+	.fp_delay = gtmr_delay,
+	.fp_uart_freq = rk3568_platform_uart_freq,
+	.fp_mpstart = arm_fdt_cpu_mpstart,
+};
+
+FDT_PLATFORM(rk3568, "rockchip,rk3568", &rk3568_platform);
+
+#endif /* SOC_RK3568 */
+
