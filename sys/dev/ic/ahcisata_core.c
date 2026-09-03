@@ -1067,14 +1067,28 @@ ahci_probe_drive(struct ata_channel *chp)
 		return;
 	}
 
-	/* bring interface up, accept FISs, power up and spin up device */
+	/* bring interface up, accept FISs, power up and spin up device.
+	 * Also start the port: some DWC AHCI implementations (e.g. the
+	 * RK3568 one) gate the PIPE PHY on PxCMD.ST, so a COMRESET issued
+	 * with ST=0 never reaches the device. */
 	AHCI_WRITE(sc, AHCI_P_CMD(chp->ch_channel),
-	    AHCI_P_CMD_ICC_AC | AHCI_P_CMD_FRE |
+	    AHCI_P_CMD_ICC_AC | AHCI_P_CMD_FRE | AHCI_P_CMD_ST |
 	    AHCI_P_CMD_POD | AHCI_P_CMD_SUD);
+	/* bring-up debug: dump OOB timing and link state around the probe */
+	aprint_normal_dev(sc->sc_atac.atac_dev,
+	    "probe ch%d: OOBR=0x%08x T1MS=0x%08x pre-SSTS=0x%08x\n",
+	    chp->ch_channel,
+	    AHCI_READ(sc, 0xbc), AHCI_READ(sc, 0xe0),
+	    AHCI_READ(sc, AHCI_P_SSTS(chp->ch_channel)));
 	/* reset the PHY and bring online */
 	switch (sata_reset_interface(chp, sc->sc_ahcit, achp->ahcic_scontrol,
 	    achp->ahcic_sstatus, AT_WAIT)) {
 	case SStatus_DET_DEV:
+	case SStatus_DET_DEV_NE:
+		aprint_normal_dev(sc->sc_atac.atac_dev,
+		    "probe ch%d: post-reset SSTS=0x%08x\n",
+		    chp->ch_channel,
+		    AHCI_READ(sc, AHCI_P_SSTS(chp->ch_channel)));
 		AHCISATA_DO_EXTRA_DELAY(sc, chp, "ahcidv", AT_WAIT);
 
 		/* Initial value, used in case the soft reset fails */

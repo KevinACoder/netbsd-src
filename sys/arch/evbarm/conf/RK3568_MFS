@@ -16,6 +16,9 @@ include	"arch/evbarm/conf/GENERIC64"
 # RK3568 bring-up SoC (fixed-rate CRU stub + platform glue)
 options 	SOC_RK3568
 
+# RK3568 SATA lanes (NanoEng combo PHY, SATA mode)
+rkcombphy*	at fdt?
+
 # Ramdisk root (miniroot embedded with mdsetimage)
 options 	MEMORY_DISK_IS_ROOT
 options 	MEMORY_DISK_ROOT_SIZE=6144	# 6144 * 512 = 3072 KiB (ramdisk.fs)

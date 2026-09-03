@@ -63,6 +63,8 @@ struct rk3568_cru_rate {
 
 static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 	/* PMU CRU */
+	{ RK3568_CLK_PCIEPHY0_REF,	100000000 },
+	{ RK3568_CLK_PCIEPHY1_REF,	100000000 },
 	{ RK3568_CLK_I2C0,	24000000 },
 	{ RK3568_PCLK_I2C0,	100000000 },
 	{ RK3568_SCLK_UART0,	24000000 },
@@ -147,6 +149,20 @@ static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 	/* Watchdog */
 	{ RK3568_PCLK_WDT_NS,	100000000 },
 	{ RK3568_TCLK_WDT_NS,	32768 },
+	/* SATA / pipe domain.  Rates are the nominal U-Boot/Linux values
+	 * (aclk_pipe = gpll_400m = 396 MHz, pclk_pipe = aclk_pipe/4); the
+	 * gates themselves are opened by the rk_combphy driver, the stub
+	 * only reports them. */
+	{ RK3568_ACLK_PIPE,	396000000 },
+	{ RK3568_PCLK_PIPE,	100000000 },
+	{ RK3568_ACLK_SATA0,	396000000 },
+	{ RK3568_CLK_SATA0_PMALIVE,	20000000 },
+	{ RK3568_CLK_SATA0_RXOOB,	50000000 },
+	{ RK3568_ACLK_SATA1,	396000000 },
+	{ RK3568_CLK_SATA1_PMALIVE,	20000000 },
+	{ RK3568_CLK_SATA1_RXOOB,	50000000 },
+	{ RK3568_PCLK_PIPEPHY0,	100000000 },
+	{ RK3568_PCLK_PIPEPHY1,	100000000 },
 };
 
 #define RK3568_CRU_NRATES	__arraycount(rk3568_cru_rates)

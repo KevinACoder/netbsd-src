@@ -41,9 +41,19 @@ __KERNEL_RCSID(0, "$NetBSD: ahcisata_fdt.c,v 1.3 2021/01/27 03:10:21 thorpej Exp
 
 #include <dev/fdt/fdtvar.h>
 
+struct ahcisata_fdt_softc {
+	struct ahci_softc sc;
+	struct fdtbus_phy *sc_phy;
+};
+
 static const struct device_compatible_entry compat_data[] = {
 	{ .compat = "snps,dwc-ahci" },
 	{ .compat = "generic-ahci" },
+	DEVICE_COMPAT_EOL
+};
+
+static const struct device_compatible_entry dwc_rk3568_compat_data[] = {
+	{ .compat = "rockchip,rk3568-dwc-ahci" },
 	DEVICE_COMPAT_EOL
 };
 
@@ -58,7 +68,8 @@ ahcisata_fdt_match(device_t parent, cfdata_t cf, void *aux)
 static void
 ahcisata_fdt_attach(device_t parent, device_t self, void *aux)
 {
-	struct ahci_softc * const sc = device_private(self);
+	struct ahcisata_fdt_softc * const fsc = device_private(self);
+	struct ahci_softc * const sc = &fsc->sc;
 	struct fdt_attach_args * const faa = aux;
 	const int phandle = faa->faa_phandle;
 	struct fdtbus_reset *rst;
@@ -66,6 +77,7 @@ ahcisata_fdt_attach(device_t parent, device_t self, void *aux)
 	char intrstr[128];
 	bus_addr_t addr;
 	bus_size_t size;
+	int error;
 	int i;
 
 	if (fdtbus_get_reg(phandle, 0, &addr, &size) != 0) {
@@ -100,6 +112,42 @@ ahcisata_fdt_attach(device_t parent, device_t self, void *aux)
 			return;
 		}
 
+	/* Enable the PHY, if any, before touching the controller. */
+	fsc->sc_phy = fdtbus_phy_get_index(phandle, 0);
+	if (fsc->sc_phy != NULL) {
+		error = fdtbus_phy_enable(fsc->sc_phy, true);
+		if (error != 0) {
+			aprint_error(": couldn't enable PHY (%d)\n", error);
+			return;
+		}
+	}
+
+	/*
+	 * DWC AHCI (rk3568): the OOB timing register (OOBR, 0xbc) survives
+	 * the HBA reset, and U-Boot leaves 0x02060b14 there, which breaks
+	 * COMINIT detection (Linux relies on the power-on default
+	 * 0x04070c15).  Program it with the two-step write-enable sequence,
+	 * and TIMER1MS to the value Linux uses.
+	 */
+	if (of_compatible_match(phandle, dwc_rk3568_compat_data)) {
+		bus_space_write_4(sc->sc_ahcit, sc->sc_ahcih, 0xbc, 0x80000000);
+		bus_space_write_4(sc->sc_ahcit, sc->sc_ahcih, 0xbc, 0x04070c15);
+		bus_space_write_4(sc->sc_ahcit, sc->sc_ahcih, 0xe0, 300000);
+		aprint_verbose_dev(self, "OOBR=0x04070c15 TIMER1MS=300000\n");
+	}
+
+	/* bring-up evidence: raw port link state right after PHY enable.
+	 * With the U-Boot preboot SATA init inherited this shows the live
+	 * link (SSTS DET=3); from a cold controller it reads 0. */
+	if (fsc->sc_phy != NULL) {
+		aprint_normal_dev(self,
+		    "post-phy SSTS=0x%08x SCTL=0x%08x CMD=0x%08x SERR=0x%08x\n",
+		    bus_space_read_4(sc->sc_ahcit, sc->sc_ahcih, 0x128),
+		    bus_space_read_4(sc->sc_ahcit, sc->sc_ahcih, 0x12c),
+		    bus_space_read_4(sc->sc_ahcit, sc->sc_ahcih, 0x118),
+		    bus_space_read_4(sc->sc_ahcit, sc->sc_ahcih, 0x130));
+	}
+
 	aprint_naive("\n");
 	aprint_normal(": AHCI SATA controller\n");
 
@@ -114,5 +162,5 @@ ahcisata_fdt_attach(device_t parent, device_t self, void *aux)
 	ahci_attach(sc);
 }
 
-CFATTACH_DECL_NEW(ahcisata_fdt, sizeof(struct ahci_softc),
+CFATTACH_DECL_NEW(ahcisata_fdt, sizeof(struct ahcisata_fdt_softc),
 	ahcisata_fdt_match, ahcisata_fdt_attach, NULL, NULL);

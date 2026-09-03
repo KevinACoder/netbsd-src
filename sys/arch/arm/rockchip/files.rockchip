@@ -115,6 +115,11 @@ device	rkemmcphy
 attach	rkemmcphy at fdt
 file	arch/arm/rockchip/rk_emmcphy.c		rkemmcphy
 
+# NanoEng combo PHY (rk3568 SATA lanes)
+device	rkcombphy
+attach	rkcombphy at fdt
+file	arch/arm/rockchip/rk_combphy.c		rkcombphy & soc_rk3568
+
 # TSADC temperature sensors
 device	rktsadc: sysmon_envsys
 attach	rktsadc at fdt with rk_tsadc
