@@ -83,6 +83,14 @@
 #define RK3568_HCLK_SDMMC2	193
 #define RK3568_CLK_SDMMC2	194
 
+/* eMMC (dwcmshc SDHCI).  ACLK/HCLK are gated only; BCLK/CCLK mux selectable
+ * sources (see rk3568_cru_muxes); TCLK is a fixed 24 MHz. */
+#define RK3568_ACLK_EMMC	121
+#define RK3568_HCLK_EMMC	122
+#define RK3568_BCLK_EMMC	123
+#define RK3568_CCLK_EMMC	124
+#define RK3568_TCLK_EMMC	125
+
 #define RK3568_PCLK_TSADC	271
 #define RK3568_CLK_TSADC	273
 
@@ -128,10 +136,16 @@
 #define RK3568_TCLK_WDT_NS	278
 
 /* One fixed-rate clock.  base.name is allocated by the driver. */
+struct rk3568_cru_mux;
+
 struct rk3568_cru_clk {
 	struct clk	base;
 	uint32_t	id;
 	uint32_t	rate;
+	/* Mux-selectable clocks (SDMMC/EMMC): the stub reads the selector
+	 * the firmware left behind and can reprogram it via set_rate.
+	 * NULL for the fixed-rate remainder. */
+	const struct rk3568_cru_mux *mux;
 };
 
 struct rk3568_cru_softc {

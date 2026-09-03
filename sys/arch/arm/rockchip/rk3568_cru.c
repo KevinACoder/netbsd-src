@@ -9,13 +9,21 @@
  * phandles and proceed to attach.  The actual clock rates were left
  * configured by U-Boot at boot, so no register programming is performed.
  *
+ * Exception - the SDMMC/eMMC card clocks are mux-selectable (no CRU
+ * divider; consumers divide further internally), and the dwcmmc driver
+ * requires working clk_set_rate() on its `ciu' clock.  For those clocks
+ * the stub reads the selector U-Boot left behind at attach and can
+ * reprogram the mux (CLKSEL_CON30/32, CLKSEL_CON28) to the smallest
+ * source >= the requested rate.  Encodings verified against Linux
+ * clk-rk3568.c and the standalone SDK fdwmmc/fdwmshc drivers.
+ *
  * Two controllers are matched:
  *   - the main CRU (rockchip,rk3568-cru) at 0xfdd20000
  *   - the PMU CRU (rockchip,rk3568-pmucru) at 0xfdd00000
  *
  * Each clock is reported at a fixed nominal rate (24 MHz / 24 MHz
  * reference, 150 MHz SDMMC, ...).  UART2's console baud clock is 24 MHz;
- * SDMMC `ciu` at 150 MHz.  Rates are only used by consumers to compute
+ * SDMMC `ciu' at 150 MHz.  Rates are only used by consumers to compute
  * divider values / baud rates; when the firmware default is close enough
  * the boot proceeds.  Once a register-accurate CRU (with real PLL/composite
  * tables like rk3328_cru.c / rk3588_cru.c) lands upstream, replace this
@@ -43,6 +51,7 @@ static struct clk *rk3568_cru_decode(device_t, int, const void *, size_t);
 static struct clk *rk3568_cru_get(void *, const char *);
 static void	rk3568_cru_put(void *, struct clk *);
 static u_int	rk3568_cru_get_rate(void *, struct clk *);
+static int	rk3568_cru_set_rate(void *, struct clk *, u_int);
 
 static const struct fdtbus_clock_controller_func rk3568_cru_fdtclock_funcs = {
 	.decode = rk3568_cru_decode,
@@ -52,6 +61,7 @@ static const struct clk_funcs rk3568_cru_clk_funcs = {
 	.get = rk3568_cru_get,
 	.put = rk3568_cru_put,
 	.get_rate = rk3568_cru_get_rate,
+	.set_rate = rk3568_cru_set_rate,
 };
 
 /* Clock ID -> fixed rate map.  IDs come from the DT binding header
@@ -72,6 +82,11 @@ static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 	{ RK3568_SCLK_UART0,	24000000 },
 	{ RK3568_PCLK_UART0,	100000000 },
 	/* Main CRU */
+	{ RK3568_ACLK_EMMC,	300000000 },
+	{ RK3568_HCLK_EMMC,	300000000 },
+	{ RK3568_BCLK_EMMC,	200000000 },
+	{ RK3568_CCLK_EMMC,	200000000 },
+	{ RK3568_TCLK_EMMC,	24000000 },
 	{ RK3568_SCLK_UART1,	24000000 },
 	{ RK3568_PCLK_UART1,	100000000 },
 	{ RK3568_SCLK_UART2,	24000000 },
@@ -181,6 +196,50 @@ static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 
 #define RK3568_CRU_NRATES	__arraycount(rk3568_cru_rates)
 
+/* Mux-selectable card clocks.  Selector tables and register fields match
+ * Linux clk-rk3568.c (PNAME(cclk_emmc_p) / PNAME(clk_sdmmc_p) /
+ * PNAME(gpll200_gpll150_cpll125_p)) and the standalone SDK fdwmmc_hw.h /
+ * fdwmshc_hw.h encodings.  CLKSEL_CON(n) = 0x100 + n*4; hiword write
+ * enable. */
+struct rk3568_cru_mux {
+	uint32_t		id;		/* clock id */
+	bus_size_t		reg;		/* CLKSEL_CON offset */
+	u_int			shift;
+	u_int			width;
+	const uint32_t *	rates;		/* rate per selector value */
+	u_int			nsel;
+};
+
+/* { xin24m, gpll_400m, gpll_300m, cpll_100m, cpll_50m, osc0_div_750k } */
+static const uint32_t rk3568_cru_sdmmc_mux_rates[] = {
+	24000000, 400000000, 300000000, 100000000, 50000000, 750000,
+};
+
+/* { xin24m, gpll_200m, gpll_150m, cpll_100m, cpll_50m, osc0_div_375k } */
+static const uint32_t rk3568_cru_cclk_emmc_mux_rates[] = {
+	24000000, 200000000, 150000000, 100000000, 50000000, 375000,
+};
+
+/* { gpll_200m, gpll_150m, cpll_125m } */
+static const uint32_t rk3568_cru_bclk_emmc_mux_rates[] = {
+	200000000, 150000000, 125000000,
+};
+
+static const struct rk3568_cru_mux rk3568_cru_muxes[] = {
+	{ RK3568_CLK_SDMMC0,	0x178,	8,  3,
+	  rk3568_cru_sdmmc_mux_rates,	__arraycount(rk3568_cru_sdmmc_mux_rates) },
+	{ RK3568_CLK_SDMMC1,	0x178,	12, 3,
+	  rk3568_cru_sdmmc_mux_rates,	__arraycount(rk3568_cru_sdmmc_mux_rates) },
+	{ RK3568_CLK_SDMMC2,	0x180,	8,  3,
+	  rk3568_cru_sdmmc_mux_rates,	__arraycount(rk3568_cru_sdmmc_mux_rates) },
+	{ RK3568_BCLK_EMMC,	0x170,	8,  2,
+	  rk3568_cru_bclk_emmc_mux_rates,
+	  __arraycount(rk3568_cru_bclk_emmc_mux_rates) },
+	{ RK3568_CCLK_EMMC,	0x170,	12, 3,
+	  rk3568_cru_cclk_emmc_mux_rates,
+	  __arraycount(rk3568_cru_cclk_emmc_mux_rates) },
+};
+
 static const struct device_compatible_entry compat_data[] = {
 	{ .compat = "rockchip,rk3568-cru" },
 	{ .compat = "rockchip,rk3568-pmucru" },
@@ -211,6 +270,7 @@ rk3568_cru_attach(device_t parent, device_t self, void *aux)
 
 	sc->sc_dev = self;
 	sc->sc_phandle = phandle;
+	sc->sc_bst = faa->faa_bst;
 	sc->sc_clkdom.name = device_xname(self);
 	sc->sc_clkdom.funcs = &rk3568_cru_clk_funcs;
 	sc->sc_clkdom.priv = sc;
@@ -238,6 +298,32 @@ rk3568_cru_attach(device_t parent, device_t self, void *aux)
 		clk_attach(&ck->base);
 	}
 	sc->sc_nclks = RK3568_CRU_NRATES;
+
+	/* Mux-selectable card clocks: link the mux descriptor and report the
+	 * selector value the firmware (U-Boot) left behind, so consumers see
+	 * the true current rate until they call set_rate. */
+	for (u_int m = 0; m < __arraycount(rk3568_cru_muxes); m++) {
+		const struct rk3568_cru_mux * const mux = &rk3568_cru_muxes[m];
+		struct rk3568_cru_clk *ck = NULL;
+		u_int sel;
+		uint32_t val;
+
+		for (u_int i = 0; i < sc->sc_nclks; i++) {
+			if (sc->sc_clks[i].id == mux->id) {
+				ck = &sc->sc_clks[i];
+				break;
+			}
+		}
+		if (ck == NULL)
+			continue;
+		ck->mux = mux;
+
+		val = bus_space_read_4(sc->sc_bst, sc->sc_bsh, mux->reg);
+		sel = __SHIFTOUT(val, __BITS(mux->shift + mux->width - 1,
+		    mux->shift));
+		if (sel < mux->nsel)
+			ck->rate = mux->rates[sel];
+	}
 
 	fdtbus_register_clock_controller(self, phandle,
 	    &rk3568_cru_fdtclock_funcs);
@@ -290,4 +376,40 @@ rk3568_cru_get_rate(void *priv, struct clk *clkp)
 	struct rk3568_cru_clk * const ck = (struct rk3568_cru_clk *)clkp;
 
 	return ck->rate;
+}
+
+static int
+rk3568_cru_set_rate(void *priv, struct clk *clkp, u_int rate)
+{
+	struct rk3568_cru_softc * const sc = priv;
+	struct rk3568_cru_clk * const ck = (struct rk3568_cru_clk *)clkp;
+	const struct rk3568_cru_mux *mux = ck->mux;
+	uint32_t mask;
+	u_int best;
+
+	if (mux == NULL) {
+		/* Fixed-rate clock: preserve the stock stub behaviour. */
+		return ck->rate == rate ? 0 : EINVAL;
+	}
+
+	/* Pick the smallest source >= the requested rate (the card clock is
+	 * derived from it by the consumer's internal divider); fall back to
+	 * the largest source if none is big enough. */
+	best = 0;
+	for (u_int sel = 1; sel < mux->nsel; sel++) {
+		if (mux->rates[sel] > mux->rates[best])
+			best = sel;
+	}
+	for (u_int sel = 0; sel < mux->nsel; sel++) {
+		if (mux->rates[sel] >= rate &&
+		    mux->rates[sel] < mux->rates[best])
+			best = sel;
+	}
+
+	mask = (((1u << mux->width) - 1) << mux->shift);
+	bus_space_write_4(sc->sc_bst, sc->sc_bsh, mux->reg,
+	    (mask << 16) | (best << mux->shift));
+	ck->rate = mux->rates[best];
+
+	return 0;
 }
