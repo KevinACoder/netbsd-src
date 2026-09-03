@@ -192,6 +192,11 @@ static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 	{ RK3568_ACLK_USB,	396000000 },
 	{ RK3568_HCLK_USB,	396000000 },
 	{ RK3568_PCLK_USB,	100000000 },
+	/* USB2 host (EHCI/OHCI panel group), hclk family ~198 MHz. */
+	{ RK3568_HCLK_USB2HOST0,	198000000 },
+	{ RK3568_HCLK_USB2HOST0_ARB,	198000000 },
+	{ RK3568_HCLK_USB2HOST1,	198000000 },
+	{ RK3568_HCLK_USB2HOST1_ARB,	198000000 },
 };
 
 #define RK3568_CRU_NRATES	__arraycount(rk3568_cru_rates)

@@ -28,15 +28,17 @@
  */
 
 /*
- * RK3568 USB2 PHY driver and USB domain bring-up for the dwc3 xHCI
- * lanes.
+ * RK3568 USB2 PHY driver and USB domain bring-up (dwc3 xHCI lanes and
+ * the EHCI/OHCI panel group).
  *
  * On this board the two USB3.0 Type-A connectors are wired to the two
  * dwc3 controllers: usbdrd30 @ 0xfcc00000 (OTG0 forced host, upper
  * connector) and usbhost30 @ 0xfd000000 (lower connector).  Both run
  * high-speed only through the usb2phy0 UTMI ports - the SuperSpeed
  * lanes are hardware-muxed to the SATA combphys and every OS on this
- * board runs these ports HS-only.
+ * board runs these ports HS-only.  The rear-panel USB2.0 Type-A group
+ * is driven by usb_host0/1_ehci+ohci through usb2phy1 (each EHCI line
+ * behind an onboard CH334P hub).
  *
  * The fixed-rate CRU stub does not program registers and no reset
  * controller is registered, so this driver owns the full USB domain
@@ -50,19 +52,34 @@
  *      request, then make sure the domain is powered).  Never power-
  *      cycle: the SATA combphy lanes may already be up.
  *   2. CRU: open the USB3OTG clock gates (clkgate_con10 bits 8-10 and
- *      12-14) and the pmucru usbphy ref gates (pmu_clkgate_con2 bits
- *      0/1).  The pipe-family gates are left to rk_combphy.
- *   3. CRU: assert + release SRST_USB3OTG0/1 (softrst_con9 bits 4/5).
- *      ATF leaves the dwc3 cores held in reset otherwise and GSNPSID
- *      reads 0.
+ *      12-14), the USB2 host H/ARB gates are on by default, and the
+ *      pmucru usbphy ref gates (pmu_clkgate_con2 bits 0-2, one per
+ *      phy + clk_ref24m).  The pipe-family gates are left to
+ *      rk_combphy.
+ *   3. CRU: assert + release SRST_USB3OTG0/1 (softrst_con9 bits 4/5)
+ *      and the USB2 host H/ARB/UTMI resets (softrst_con14 bits 4-9).
+ *      ATF leaves the cores held in reset otherwise (GSNPSID reads 0
+ *      for the dwc3s).  Also release-only the usb2phy1 POR / port
+ *      resets (softrst_con29 bits 3-5) and its GRF pclk
+ *      (softrst_con28 bit 11).
  *   4. VBUS: drive GPIO3_A1 (usb3_vbus_en, both USB3.0 Type-A ports)
- *      and GPIO3_A0 (usb2_vbus_en) high - the connectors are dead
- *      without it.  GPIO3 sits at 0xfe760000 (the RK3568 GPIO banks
- *      are not contiguous), SWPORT_DR_L @ 0x00 / SWPORT_DDR_L @ 0x08.
- *   5. usb2phy0 GRF: deassert the port suspend overrides with the
+ *      and GPIO3_A0 (usb2_vbus_en, panel group) high - the connectors
+ *      are dead without it.  GPIO3 sits at 0xfe760000 (the RK3568 GPIO
+ *      banks are not contiguous), SWPORT_DR_L @ 0x00 / SWPORT_DDR_L @
+ *      0x08.
+ *   5. Per-instance GRF: deassert the port suspend overrides with the
  *      measured working values - otg port CON0 @ 0x000 <- 0x0c00
  *      (host role incl. the iddig force-host bits), host port CON1 @
- *      0x004 <- 0x1d2 (Linux/FBSD/U-Boot agree on both).
+ *      0x004 <- 0x1d2 (Linux/FBSD/U-Boot agree on both), and enable
+ *      the 480MHz clock output (CON2 @ 0x008 bit 4 <- 0) as the Linux
+ *      inno-usb2phy driver does - the EHCI/OHCI group takes its UTMI
+ *      clock from the usb2phy1 480m output.
+ *
+ * Two instances attach (usb2phy0 @ fe8a0000 / usb2phy1 @ fe8b0000,
+ * distinguished only by their rockchip,usbgrf syscon - the port GRF
+ * offsets are identical).  The domain-level sequence above runs once
+ * on the first instance only: re-running the soft resets on the
+ * second instance would bounce the already-attached dwc3 cores.
  *
  * Attaches before the dwc3 wrapper nodes in the board DTS (fdt
  * children attach in document order) so the phy controllers are
@@ -109,23 +126,28 @@ __KERNEL_RCSID(0, "$NetBSD");
 #define	CLKGATE_CON10_USB3OTG		0x7300	/* bits 8-10 otg0, 12-14 otg1 */
 #define	CLKGATE_CON10_PIPE		0x0003	/* bits 0-1, in case rk_combphy hasn't run yet */
 #define	SOFTRST_CON9_USB3OTG		0x30	/* bit4 otg0, bit5 otg1 */
+#define	SOFTRST_CON14_USB2HOST		0x3f0	/* bits 4-9: h/arb/utmi host0 + host1 */
+#define	SOFTRST_CON28_USB2PHY1_GRF	__BIT(11) /* P_USB2PHY1_GRF, release only */
+#define	SOFTRST_CON29_USB2PHY1		0x38	/* bits 3-5: phy1 POR + usb2host0/1, release only */
 
 /* PMU CRU */
 #define	PMUCRU_CLKGATE_CON2		0x188
-#define	CLKGATE_CON2_USBPHY		0x3	/* clk_ref24m, xin_osc0_usbphy0_g */
+#define	CLKGATE_CON2_USBPHY		0x7	/* clk_ref24m, xin_osc0_usbphy0/1_g */
 
 /* GPIO3 SWPORT low-pin registers */
 #define	GPIO3_SWPORT_DR_L		0x00
 #define	GPIO3_SWPORT_DDR_L		0x08
 #define	GPIO3_VBUS_PINS			0x3	/* A0 usb2_vbus_en, A1 usb3_vbus_en */
 
-/* usb2phy0 GRF (0xfdca0000), hiword write-enable style */
+/* Per-instance usb2phy GRF (0xfdca0000 / 0xfdca8000), hiword write-enable */
 #define	USB2PHY_GRF_OTG_CON0		0x000	/* otg-port phy_sus */
 #define	USB2PHY_GRF_HOST_CON1		0x004	/* host-port phy_sus */
+#define	USB2PHY_GRF_CLKOUT_CON2		0x008	/* bit4 set = 480m output off */
 #define	USB2PHY_OTG_HOST_VAL		0x0c00	/* measured Linux host-role state (KI-006) */
 #define	USB2PHY_OTG_HOST_MASK		0xfff
 #define	USB2PHY_HOST_VAL		0x1d2	/* U-Boot/Linux host deassert value */
 #define	USB2PHY_HOST_MASK		0x1ff
+#define	USB2PHY_CLKOUT_480M_OFF		__BIT(4)
 
 struct rk_usb2phy_softc;
 
@@ -211,7 +233,7 @@ rk_usb2phy_pd_pipe_ensure(struct rk_usb2phy_softc *sc)
 	}
 }
 
-/* Clock gates + dwc3 core soft resets for both controllers. */
+/* Clock gates + core soft resets for the dwc3 and USB2 host blocks. */
 static void
 rk_usb2phy_domain_init(struct rk_usb2phy_softc *sc)
 {
@@ -227,13 +249,26 @@ rk_usb2phy_domain_init(struct rk_usb2phy_softc *sc)
 	rk_usb2phy_clrset(sc, pmucru, PMUCRU_CLKGATE_CON2,
 	    CLKGATE_CON2_USBPHY, 0);
 
-	/* Assert + release SRST_USB3OTG0/1: ATF leaves the dwc3 cores in
-	 * reset and GSNPSID reads 0 otherwise. */
+	/* Assert + release SRST_USB3OTG0/1 and the USB2 host H/ARB/UTMI
+	 * resets: ATF leaves the cores in reset otherwise (GSNPSID reads
+	 * 0 for the dwc3s). */
 	rk_usb2phy_clrset(sc, cru, CRU_SOFTRST_CON(9), SOFTRST_CON9_USB3OTG,
 	    SOFTRST_CON9_USB3OTG);
+	rk_usb2phy_clrset(sc, cru, CRU_SOFTRST_CON(14), SOFTRST_CON14_USB2HOST,
+	    SOFTRST_CON14_USB2HOST);
 	delay(100);
 	rk_usb2phy_clrset(sc, cru, CRU_SOFTRST_CON(9), SOFTRST_CON9_USB3OTG, 0);
+	rk_usb2phy_clrset(sc, cru, CRU_SOFTRST_CON(14), SOFTRST_CON14_USB2HOST,
+	    0);
 	delay(100);
+
+	/* Release-only the usb2phy1 POR / port resets and its GRF pclk -
+	 * asserting those would glitch the panel phy, releasing a reset
+	 * that is not asserted is a no-op. */
+	rk_usb2phy_clrset(sc, cru, CRU_SOFTRST_CON(29),
+	    SOFTRST_CON29_USB2PHY1, 0);
+	rk_usb2phy_clrset(sc, cru, CRU_SOFTRST_CON(28),
+	    SOFTRST_CON28_USB2PHY1_GRF, 0);
 }
 
 /* Both USB3.0 Type-A connectors are dead until GPIO3_A1 is driven. */
@@ -317,6 +352,13 @@ static const struct device_compatible_entry compat_data[] = {
 	DEVICE_COMPAT_EOL
 };
 
+/*
+ * The USB-domain sequence (PD_PIPE, clock gates, soft resets, VBUS)
+ * must run exactly once per boot: a second run would re-assert the
+ * dwc3 soft resets under the already-attached xHCI controllers.
+ */
+static bool	rk_usb2phy_domain_done;
+
 CFATTACH_DECL_NEW(rkusb2phy, sizeof(struct rk_usb2phy_softc),
     rk_usb2phy_match, rk_usb2phy_attach, NULL, NULL);
 
@@ -368,10 +410,20 @@ rk_usb2phy_attach(device_t parent, device_t self, void *aux)
 		clk_enable(clk);
 
 	aprint_naive("\n");
-	aprint_normal(": RK3568 USB2 PHY (otg + host, dwc3 lanes)\n");
+	aprint_normal(": RK3568 USB2 PHY (otg + host ports)\n");
 
-	rk_usb2phy_domain_init(sc);
-	rk_usb2phy_vbus_enable(sc);
+	if (!rk_usb2phy_domain_done) {
+		rk_usb2phy_domain_init(sc);
+		rk_usb2phy_vbus_enable(sc);
+		rk_usb2phy_domain_done = true;
+	}
+
+	/* Enable the 480MHz clock output - the EHCI/OHCI group takes its
+	 * UTMI clock from the usb2phy1 480m output (Linux inno-usb2phy
+	 * clkout_ctl: CON2 @ 0x008 bit4 <- 0). */
+	rk_usb2phy_clrset(sc, sc->sc_grf_bsh, USB2PHY_GRF_CLKOUT_CON2,
+	    USB2PHY_CLKOUT_480M_OFF, 0);
+	delay(100);
 
 	otg = &sc->sc_ports[0];
 	otg->sc = sc;
@@ -388,12 +440,16 @@ rk_usb2phy_attach(device_t parent, device_t self, void *aux)
 	rk_usb2phy_port_write(host);
 
 	aprint_normal_dev(self,
-	    "USB domain up (grf con0=0x%08x con1=0x%08x cru con10=0x%08x "
-	    "con9=0x%08x pmucru gate2=0x%08x gpio3 dr=0x%08x ddr=0x%08x)\n",
+	    "USB domain up (grf con0=0x%08x con1=0x%08x con2=0x%08x "
+	    "cru con10=0x%08x con9=0x%08x con14=0x%08x con29=0x%08x "
+	    "pmucru gate2=0x%08x gpio3 dr=0x%08x ddr=0x%08x)\n",
 	    rk_usb2phy_rd4(sc, sc->sc_grf_bsh, USB2PHY_GRF_OTG_CON0),
 	    rk_usb2phy_rd4(sc, sc->sc_grf_bsh, USB2PHY_GRF_HOST_CON1),
+	    rk_usb2phy_rd4(sc, sc->sc_grf_bsh, USB2PHY_GRF_CLKOUT_CON2),
 	    rk_usb2phy_rd4(sc, sc->sc_cru_bsh, CRU_CLKGATE_CON(10)),
 	    rk_usb2phy_rd4(sc, sc->sc_cru_bsh, CRU_SOFTRST_CON(9)),
+	    rk_usb2phy_rd4(sc, sc->sc_cru_bsh, CRU_SOFTRST_CON(14)),
+	    rk_usb2phy_rd4(sc, sc->sc_cru_bsh, CRU_SOFTRST_CON(29)),
 	    rk_usb2phy_rd4(sc, sc->sc_pmucru_bsh, PMUCRU_CLKGATE_CON2),
 	    rk_usb2phy_rd4(sc, sc->sc_gpio3_bsh, GPIO3_SWPORT_DR_L),
 	    rk_usb2phy_rd4(sc, sc->sc_gpio3_bsh, GPIO3_SWPORT_DDR_L));
