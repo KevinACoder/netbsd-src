@@ -65,6 +65,8 @@ static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 	/* PMU CRU */
 	{ RK3568_CLK_PCIEPHY0_REF,	100000000 },
 	{ RK3568_CLK_PCIEPHY1_REF,	100000000 },
+	{ RK3568_CLK_USBPHY0_REF,	24000000 },
+	{ RK3568_CLK_USBPHY1_REF,	24000000 },
 	{ RK3568_CLK_I2C0,	24000000 },
 	{ RK3568_PCLK_I2C0,	100000000 },
 	{ RK3568_SCLK_UART0,	24000000 },
@@ -163,6 +165,18 @@ static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 	{ RK3568_CLK_SATA1_RXOOB,	50000000 },
 	{ RK3568_PCLK_PIPEPHY0,	100000000 },
 	{ RK3568_PCLK_PIPEPHY1,	100000000 },
+	/* USB (dwc3 xHCI lanes).  ACLK_USB3OTG sits on the pipe family,
+	 * ref = xin24m, suspend = 32.768 kHz; the gates themselves are
+	 * opened by the rk_usb2phy driver, the stub only reports them. */
+	{ RK3568_ACLK_USB3OTG0,	396000000 },
+	{ RK3568_CLK_USB3OTG0_REF,	24000000 },
+	{ RK3568_CLK_USB3OTG0_SUSPEND,	32768 },
+	{ RK3568_ACLK_USB3OTG1,	396000000 },
+	{ RK3568_CLK_USB3OTG1_REF,	24000000 },
+	{ RK3568_CLK_USB3OTG1_SUSPEND,	32768 },
+	{ RK3568_ACLK_USB,	396000000 },
+	{ RK3568_HCLK_USB,	396000000 },
+	{ RK3568_PCLK_USB,	100000000 },
 };
 
 #define RK3568_CRU_NRATES	__arraycount(rk3568_cru_rates)

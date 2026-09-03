@@ -54,6 +54,9 @@ __KERNEL_RCSID(0, "$NetBSD: dwc3_fdt.c,v 1.20 2022/06/12 08:04:07 skrll Exp $");
 
 #define	DWC3_GUCTL1			0xc11c
 #define	 GUCTL1_TX_IPGAP_LINECHECK_DIS	__BIT(28)
+#define	 GUCTL1_PARKMODE_DISABLE_HS	__BIT(16)
+#define	 GUCTL1_PARKMODE_DISABLE_SS	__BIT(17)
+#define	 GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK __BIT(26)
 
 #define	DWC3_SNPSID			0xc120
 #define	 DWC3_SNPSID_REV		__BITS(15,0)
@@ -62,12 +65,13 @@ __KERNEL_RCSID(0, "$NetBSD: dwc3_fdt.c,v 1.20 2022/06/12 08:04:07 skrll Exp $");
 #define	 GUSB2PHYCFG_PHYSOFTRST		__BIT(31)
 #define	 GUSB2PHYCFG_U2_FREECLK_EXISTS	__BIT(30)
 #define	 GUSB2PHYCFG_USBTRDTIM		__BITS(13,10)
+#define	 GUSB2PHYCFG_ENBLSLPM		__BIT(8)
 #define	 GUSB2PHYCFG_SUSPHY		__BIT(6)
 #define	 GUSB2PHYCFG_PHYIF		__BIT(3)
-#define	 GUSB2PHYCFG_ENBLSLPM		__BIT(0)
 
 #define	DWC3_GUSB3PIPECTL(n)		(0xc2c0 + ((n) * 4))
 #define	 GUSB3PIPECTL_PHYSOFTRST	__BIT(31)
+#define	 GUSB3PIPECTL_DISRXDETINP3	__BIT(28)
 #define	 GUSB3PIPECTL_UX_EXIT_PX	__BIT(27)
 #define	 GUSB3PIPECTL_DEPOCHANGE	__BIT(18)
 #define	 GUSB3PIPECTL_SUSPHY		__BIT(17)
@@ -129,6 +133,10 @@ dwc3_fdt_enable_phy(struct xhci_softc *sc, const int phandle, u_int rev)
 	u_int phyif_utmi_bits;
 	uint32_t val;
 
+	max_speed = fdtbus_get_string(phandle, "maximum-speed");
+	if (max_speed == NULL)
+		max_speed = "super-speed";
+
 	val = RD4(sc, DWC3_GUSB2PHYCFG(0));
 	if (of_getprop_uint32(phandle, "snps,phyif-utmi-bits", &phyif_utmi_bits) != 0) {
 		phy_type = fdtbus_get_string(phandle, "phy_type");
@@ -163,18 +171,30 @@ dwc3_fdt_enable_phy(struct xhci_softc *sc, const int phandle, u_int rev)
 		val &= ~GUSB3PIPECTL_SUSPHY;
 	if (of_hasprop(phandle, "snps,dis-del-phy-power-chg-quirk"))
 		val &= ~GUSB3PIPECTL_DEPOCHANGE;
+	if (of_hasprop(phandle, "snps,dis-rxdet-inp3-quirk"))
+		val |= GUSB3PIPECTL_DISRXDETINP3;
 	WR4(sc, DWC3_GUSB3PIPECTL(0), val);
 
 	if (rev >= 0x250a) {
 		val = RD4(sc, DWC3_GUCTL1);
 		if (of_hasprop(phandle, "snps,dis-tx-ipgap-linecheck-quirk"))
 			val |= GUCTL1_TX_IPGAP_LINECHECK_DIS;
+		if (of_hasprop(phandle, "snps,parkmode-disable-hs-quirk"))
+			val |= GUCTL1_PARKMODE_DISABLE_HS;
+		if (of_hasprop(phandle, "snps,parkmode-disable-ss-quirk"))
+			val |= GUCTL1_PARKMODE_DISABLE_SS;
+		/*
+		 * HS-only config with the SS PHY fused present (rk3568: the
+		 * SS lane is muxed away): force the core to the USB2 clock
+		 * for the USB3 routing, or port link training never
+		 * completes.  Linux applies this on maximum-speed =
+		 * high-speed for rev >= 0x290a; the GHWPARAMS3.SSPHY probe
+		 * other drivers use never fires on this IP.
+		 */
+		if (rev >= 0x290a && strcmp(max_speed, "high-speed") == 0)
+			val |= GUCTL1_DEV_FORCE_20_CLK_FOR_30_CLK;
 		WR4(sc, DWC3_GUCTL1, val);
 	}
-
-	max_speed = fdtbus_get_string(phandle, "maximum-speed");
-	if (max_speed == NULL)
-		max_speed = "super-speed";
 
 	val = RD4(sc, DWC3_DCFG);
 	val &= ~DCFG_SPEED;
@@ -189,6 +209,14 @@ dwc3_fdt_enable_phy(struct xhci_softc *sc, const int phandle, u_int rev)
 	else
 		val |= __SHIFTIN(DCFG_SPEED_SS, DCFG_SPEED);	/* default to super speed */
 	WR4(sc, DWC3_DCFG, val);
+
+	/* bring-up debug: core register window (dmesg is the only one on
+	 * the booti lane); compare against the Linux working-state
+	 * regdump in known-issues KI-012. */
+	aprint_normal_dev(sc->sc_dev,
+	    "GCTL=0x%08x GUCTL1=0x%08x GUSB2PHYCFG0=0x%08x GUSB3PIPECTL0=0x%08x\n",
+	    RD4(sc, DWC3_GCTL), RD4(sc, DWC3_GUCTL1),
+	    RD4(sc, DWC3_GUSB2PHYCFG(0)), RD4(sc, DWC3_GUSB3PIPECTL(0)));
 }
 
 static void
@@ -208,6 +236,7 @@ static const struct device_compatible_entry compat_data[] = {
 	{ .compat = "fsl,imx8mq-dwc3" },
 	{ .compat = "rockchip,rk3328-dwc3" },
 	{ .compat = "rockchip,rk3399-dwc3" },
+	{ .compat = "rockchip,rk3568-dwc3" },
 	{ .compat = "samsung,exynos5250-dwusb3" },
 	{ .compat = "snps,dwc3" },
 	DEVICE_COMPAT_EOL

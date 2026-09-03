@@ -19,6 +19,9 @@ options 	SOC_RK3568
 # RK3568 SATA lanes (NanoEng combo PHY, SATA mode)
 rkcombphy*	at fdt?
 
+# RK3568 USB2 PHY (dwc3 xHCI lanes, USB domain bring-up)
+rkusb2phy*	at fdt?
+
 # Ramdisk root (miniroot embedded with mdsetimage)
 options 	MEMORY_DISK_IS_ROOT
 options 	MEMORY_DISK_ROOT_SIZE=6144	# 6144 * 512 = 3072 KiB (ramdisk.fs)

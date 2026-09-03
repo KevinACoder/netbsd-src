@@ -120,6 +120,11 @@ device	rkcombphy
 attach	rkcombphy at fdt
 file	arch/arm/rockchip/rk_combphy.c		rkcombphy & soc_rk3568
 
+# USB2 PHY + dwc3 USB domain bring-up (rk3568 xHCI lanes)
+device	rkusb2phy
+attach	rkusb2phy at fdt
+file	arch/arm/rockchip/rk_usb2phy.c		rkusb2phy & soc_rk3568
+
 # TSADC temperature sensors
 device	rktsadc: sysmon_envsys
 attach	rktsadc at fdt with rk_tsadc
