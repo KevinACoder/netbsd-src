@@ -1,0 +1,42 @@
+#	$NetBSD$
+#
+#	RK3568 SATA-root lane: same bring-up SoC glue as RK3568_MFS, but
+#	with NO memory-disk root - the root filesystem is the FFS GPT
+#	partition labelled "netbsdroot" on the free SATA disk (installed
+#	from the official NetBSD-11.0 evbarm-aarch64 sets).
+#
+#	Boot over TFTP + U-Boot booti with no bootargs (aarch64 does not
+#	parse root= from bootargs): the board DTB carries
+#	/chosen/netbsd,gpt-label = "netbsdroot", which fdt_boot.c matches
+#	against the GPT wedge name (dkwedge_find_by_wname).  Boots
+#	multi-user (default boothowto), console from the DTB stdout-path.
+#
+#	Everything from GENERIC64 stays enabled ("都打开"), matching
+#	RK3568_MFS so both lanes exercise the same driver matrix.
+
+include	"arch/evbarm/conf/GENERIC64"
+
+# RK3568 bring-up SoC (fixed-rate CRU stub + platform glue)
+options 	SOC_RK3568
+
+# RK3568 SATA / PCIe lanes (NanoEng combo PHY, SATA + PCIe modes).
+# pass 8: fdt default-pass attach order follows the node's phandle
+# value (fdt_get_order), not document order - on this dtb pcie2x1 has a
+# lower phandle than combphy2 and would attach (and fail to find its
+# phy) before the phy controller is registered.  Pin the combphys to
+# pass 8 so all three lanes are registered before the root complexes.
+rkcombphy*	at fdt? pass 8
+
+# RK3568 USB2 PHY (dwc3 xHCI lanes, USB domain bring-up)
+rkusb2phy*	at fdt?
+
+# RK3568 PCIe3 PHY (pcie30phy SRAM firmware) and DWC PCIe hosts.
+# The phy attaches in pass 9 so it registers before the root complexes;
+# the rkdwpcie line stays after rkcombphy (same default pass, fdt
+# children attach in document order and combphy2 must exist first).
+rk30pciephy*	at fdt? pass 9
+rkdwpcie*	at fdt?
+
+# Intel Wireless (802.11ac, PCIe): Dual Band Wireless-AC 7260 in the
+# x4 slot; firmware lives on the root filesystem (pkg/sets), not here.
+iwm*		at pci? dev ? function ?
