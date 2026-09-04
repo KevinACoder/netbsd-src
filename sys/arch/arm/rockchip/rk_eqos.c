@@ -310,6 +310,23 @@ static const struct rk_eqos_ops rk3588_ops = {
 #define RK3568_GPIO_DDR_L		0x08
 #define RK3568_GPIO_DDR_H		0x0c
 
+/* MAC MDIO access, for raw PHY pokes before the mii bus exists.
+ * Field layout per dwc_eqos_reg.h: PA[24:21], RDA[20:16], CR[10:8],
+ * GOC[3:2], GB[0]. */
+#define RK3568_EQOS_MDIO_ADDRESS	0x0200
+#define  RK3568_EQOS_MDIO_ADDRESS_PA		__BITS(24,21)
+#define  RK3568_EQOS_MDIO_ADDRESS_RDA		__BITS(20,16)
+#define  RK3568_EQOS_MDIO_ADDRESS_GB		__BIT(0)
+#define  RK3568_EQOS_MDIO_ADDRESS_GOC_WRITE	__BIT(2)
+#define  RK3568_EQOS_MDIO_ADDRESS_GOC_READ	__BITS(3,2)
+#define  RK3568_EQOS_MDIO_ADDRESS_CR_100_150	__BIT(8)	/* pclk 100MHz */
+#define RK3568_EQOS_MDIO_DATA		0x0204
+
+#define RK3568_EQOS_RTL8211F_OUI1	0x001c
+#define RK3568_EQOS_RTL8211F_OUI2	0xc916
+#define RK3568_EQOS_RTL8211F_PAGESEL	0x1f
+#define RK3568_EQOS_RTL8211F_TXDELAY	__BIT(8)	/* d08.0x11 bit8 */
+
 /* pin mux: 4 bits per pin, 4 pins per 32-bit iomux register */
 struct rk3568_eqos_pin {
 	u_int	pin;
@@ -446,6 +463,103 @@ rk3568_eqos_gpio_write(bus_space_tag_t bst, bus_space_handle_t bsh,
 	    __BIT(bit + 16) | (output ? __BIT(bit) : 0));
 }
 
+static int
+rk3568_eqos_mdio_read(struct rk_eqos_softc *rk_sc, int phy, int reg,
+    uint32_t *valp)
+{
+	struct eqos_softc * const sc = &rk_sc->sc_base;
+	int retry;
+
+	bus_space_write_4(sc->sc_bst, sc->sc_bsh, RK3568_EQOS_MDIO_ADDRESS,
+	    __SHIFTIN((uint32_t)phy, RK3568_EQOS_MDIO_ADDRESS_PA) |
+	    __SHIFTIN((uint32_t)reg, RK3568_EQOS_MDIO_ADDRESS_RDA) |
+	    RK3568_EQOS_MDIO_ADDRESS_CR_100_150 |
+	    RK3568_EQOS_MDIO_ADDRESS_GOC_READ |
+	    RK3568_EQOS_MDIO_ADDRESS_GB);
+	for (retry = 1000; retry > 0; retry--) {
+		if ((bus_space_read_4(sc->sc_bst, sc->sc_bsh,
+		    RK3568_EQOS_MDIO_ADDRESS) &
+		    RK3568_EQOS_MDIO_ADDRESS_GB) == 0)
+			break;
+		delay(10);
+	}
+	if (retry == 0)
+		return ETIMEDOUT;
+	*valp = bus_space_read_4(sc->sc_bst, sc->sc_bsh,
+	    RK3568_EQOS_MDIO_DATA);
+	return 0;
+}
+
+static int
+rk3568_eqos_mdio_write(struct rk_eqos_softc *rk_sc, int phy, int reg,
+    uint32_t val)
+{
+	struct eqos_softc * const sc = &rk_sc->sc_base;
+	int retry;
+
+	bus_space_write_4(sc->sc_bst, sc->sc_bsh, RK3568_EQOS_MDIO_DATA, val);
+	bus_space_write_4(sc->sc_bst, sc->sc_bsh, RK3568_EQOS_MDIO_ADDRESS,
+	    __SHIFTIN((uint32_t)phy, RK3568_EQOS_MDIO_ADDRESS_PA) |
+	    __SHIFTIN((uint32_t)reg, RK3568_EQOS_MDIO_ADDRESS_RDA) |
+	    RK3568_EQOS_MDIO_ADDRESS_CR_100_150 |
+	    RK3568_EQOS_MDIO_ADDRESS_GOC_WRITE |
+	    RK3568_EQOS_MDIO_ADDRESS_GB);
+	for (retry = 1000; retry > 0; retry--) {
+		if ((bus_space_read_4(sc->sc_bst, sc->sc_bsh,
+		    RK3568_EQOS_MDIO_ADDRESS) &
+		    RK3568_EQOS_MDIO_ADDRESS_GB) == 0)
+			break;
+		delay(10);
+	}
+	return (retry == 0) ? ETIMEDOUT : 0;
+}
+
+/*
+ * The RTL8211F straps its internal RGMII TX-delay on, and the PHY hard
+ * reset above re-latches that strap.  Stacked on the MAC-side GRF delay
+ * from the board DT (calibrated with the PHY delay off, as vendor Linux
+ * does by clearing this same bit) it breaks the gmac0 TX eye: long TX
+ * frames never reach the wire while RX and autoneg look fine.  Clear
+ * the strap bit again after the reset, exactly like the vendor Linux
+ * realtek driver does (page d08, reg 0x11, bit8).  Measured on this
+ * board 2026-09-04: gmac0 PHY strap d08.0x11=0x0109, working Linux
+ * state 0x0009.  A no-op for PHYs that strap the delay off (gmac1).
+ */
+static void
+rk3568_eqos_phy_tx_delay_clear(struct rk_eqos_softc *rk_sc)
+{
+	struct eqos_softc * const sc = &rk_sc->sc_base;
+	uint32_t id1, id2, val;
+	int phy, error;
+
+	for (phy = 0; phy < 32; phy++) {
+		if (rk3568_eqos_mdio_read(rk_sc, phy, MII_PHYIDR1, &id1) != 0)
+			continue;
+		if (rk3568_eqos_mdio_read(rk_sc, phy, MII_PHYIDR2, &id2) != 0)
+			continue;
+		if (id1 != RK3568_EQOS_RTL8211F_OUI1 ||
+		    id2 != RK3568_EQOS_RTL8211F_OUI2)
+			continue;
+
+		error = rk3568_eqos_mdio_write(rk_sc, phy,
+		    RK3568_EQOS_RTL8211F_PAGESEL, 0x0d08);
+		if (error == 0)
+			error = rk3568_eqos_mdio_read(rk_sc, phy, 0x11, &val);
+		if (error == 0 && (val & RK3568_EQOS_RTL8211F_TXDELAY) != 0) {
+			error = rk3568_eqos_mdio_write(rk_sc, phy, 0x11,
+			    val & ~RK3568_EQOS_RTL8211F_TXDELAY);
+			if (error == 0)
+				aprint_normal_dev(sc->sc_dev,
+				    "RTL8211F phy %d: cleared strapped "
+				    "RGMII TX-delay (d08.0x11 %#x -> %#x)\n",
+				    phy, (unsigned)val,
+				    (unsigned)(val & ~RK3568_EQOS_RTL8211F_TXDELAY));
+		}
+		rk3568_eqos_mdio_write(rk_sc, phy,
+		    RK3568_EQOS_RTL8211F_PAGESEL, 0);
+	}
+}
+
 /*
  * The RK3568 has no GPIO controller driver under NetBSD yet, so pulse
  * the PHY reset pin described by "snps,reset-gpio" by hand.
@@ -492,6 +606,8 @@ rk3568_eqos_reset_gpio(struct rk_eqos_softc *rk_sc, int phandle)
 	    active_low);
 	delay(be32toh(delays[2]));
 	bus_space_unmap(rk_sc->sc_base.sc_bst, bsh, 0x10);
+
+	rk3568_eqos_phy_tx_delay_clear(rk_sc);
 
 	return 0;
 }
