@@ -30,12 +30,13 @@
  */
 
 /*
- * RK3568 NanoEng combo PHY driver (SATA mode bring-up).
+ * RK3568 NanoEng combo PHY driver (SATA and PCIe lane modes).
  *
  * The RK3568 SATA controllers (sata0 @ 0xfc000000, sata1 @ 0xfc400000)
- * share their lane with a NanoEng combo PHY that must be switched to
- * SATA mode, given a 100 MHz reference clock and a powered PIPE power
- * domain before the AHCI controller can see devices.
+ * and the pcie2x1 controller (@ 0xfe260000, M.2 slot) share their lanes
+ * with NanoEng combo PHYs that must be switched to the consumer's mode,
+ * given a 100 MHz reference clock and a powered PIPE power domain before
+ * the controller can see anything on the lane.
  *
  * There is no register-accurate rk3568 CRU upstream (our fixed-rate
  * stub does not program registers), so this driver owns the full
@@ -82,12 +83,14 @@ __KERNEL_RCSID(0, "$NetBSD");
 #include <sys/bus.h>
 #include <sys/device.h>
 #include <sys/endian.h>
+#include <sys/kmem.h>
 #include <sys/systm.h>
 
 #include <dev/fdt/fdtvar.h>
 
 /* PHY type argument values (dt-bindings/phy/phy.h) */
 #define	PHY_TYPE_SATA			1
+#define	PHY_TYPE_PCIE			2
 
 /*
  * Physical base addresses.  Everything below sits inside the
@@ -149,6 +152,13 @@ struct rk_combphy_softc {
 	bus_space_handle_t	sc_gpio0_bsh;
 	u_int			sc_idx;		/* 0 = combphy0 (sata0), 1 = combphy1 */
 	bool			sc_enabled;
+};
+
+/* Per-consumer handle: the acquire callback carries the requested lane
+ * mode (PHY_TYPE_*) to the enable callback. */
+struct rk_combphy_ref {
+	struct rk_combphy_softc	*ref_sc;
+	u_int			ref_type;
 };
 
 static int	rk_combphy_match(device_t, cfdata_t, void *);
@@ -423,10 +433,99 @@ rk_combphy_config_sata(struct rk_combphy_softc *sc)
 	rk_combphy_clrset(sc, cru, CRU_CLKSEL_CON29, 0xf3, 0x30);
 }
 
+/*
+ * PCIe mode (combphy2, the pcie2x1 M.2 lane), mirroring the vendor
+ * bare-metal SDK fdwpcie FDwPcieCombphy2Init (validated on this board;
+ * KI-008/009), which in turn matches Linux phy-rockchip-naneng-combphy
+ * rk3568 PCIe mode.  Unlike the SATA path there is no power-domain cycle
+ * and no reset assert: bare-metal boots this lane from a cold controller
+ * with the exact sequence below (PPLL/refclk from rk_combphy_set_refclk,
+ * then GRF mode words, mmio PLL tuning, softreset release last).
+ */
+static void
+rk_combphy_config_pcie(struct rk_combphy_softc *sc)
+{
+	bus_space_handle_t cru = sc->sc_cru_bsh;
+	bus_space_handle_t phygrf = sc->sc_phygrf_bsh;
+	bus_space_handle_t mmio = sc->sc_bsh;
+	const u_int idx = sc->sc_idx;
+	const uint32_t apb_rst = SOFTRST_CON28_PIPEPHY_APB << (idx * 2);
+	const uint32_t core_rst = SOFTRST_CON28_PIPEPHY_CORE << (idx * 2);
+	uint32_t val, pll9c, plla0;
+
+	/* Make sure the PHY's APB interface is running, and hold the PHY
+	 * core in reset while it is being configured.  Bare-metal
+	 * (fdwpcie) skips the assert because its cold PHY never ran; in
+	 * our boot flow U-Boot may have left the unconfigured PHY
+	 * running, and its PLL then never locks - the same reason the
+	 * SATA path asserts the core reset. */
+	rk_combphy_clrset(sc, cru, CRU_SOFTRST_CON(28), apb_rst, 0);
+	rk_combphy_clrset(sc, cru, CRU_SOFTRST_CON(28), core_rst, core_rst);
+	delay(100);
+
+	rk_combphy_set_refclk(sc);
+
+	/* pciephy2 refclk mux: mirror fdwpcie's measured value.  fdwpcie
+	 * clears mux[11] (selecting the osc0 path) and its board tests
+	 * enumerate the M.2 NVMe; the div path with mux=1 (the SATA lane
+	 * value) demonstrably leaves this PHY's PLL unlocked. */
+	rk_combphy_clrset(sc, sc->sc_pmucru_bsh, PMUCRU_CLKSEL_CON9,
+	    0x1 << 11, 0);
+
+	/* CRU clock gates: pipe family (aclk/pclk_pipe), this lane's
+	 * pclk_pipephyN APB clock.  Gate polarity: 1 = off, 0 = on. */
+	rk_combphy_clrset(sc, cru, CRU_CLKGATE_CON(10), CLKGATE_CON10_PIPE_MASK, 0);
+	rk_combphy_clrset(sc, cru, CRU_CLKGATE_CON(34),
+	    CLKGATE_CON34_PIPEPHY_MASK << idx, 0);
+
+	/* PIPE PHY GRF PCIe mode words + pipe_clk_100m (con1 bits[14:13] = 2).
+	 * Note: unlike SATA there is no main-PIPE_GRF write in the PCIe
+	 * mode - Linux con0-3_for_pcie (and the FreeBSD fork) only touch
+	 * the per-lane pipe-phy GRF. */
+	rk_combphy_clrset(sc, phygrf, 0x00, 0xffff, 0x1000);
+	rk_combphy_clrset(sc, phygrf, 0x04, 0xffff, 0x0000);
+	rk_combphy_clrset(sc, phygrf, 0x08, 0xffff, 0x0101);
+	rk_combphy_clrset(sc, phygrf, 0x0c, 0xffff, 0x0200);
+	rk_combphy_clrset(sc, phygrf, 0x04, 0x3 << 13, 0x2 << 13);
+
+	/* PHY mmio: 100 MHz PCIe PLL parameters (SSC downward, KVCO,
+	 * rx_trim, su_trim quadruplet) and the Tx-detect-Rx errata bit. */
+	val = rk_combphy_rd4(sc, mmio, 0x7c);
+	rk_combphy_wr4(sc, mmio, 0x7c, (val & ~(0x3 << 4)) | (0x1 << 4));
+	rk_combphy_wr4(sc, mmio, 0x74, 0xc0);
+	val = rk_combphy_rd4(sc, mmio, 0x80);
+	rk_combphy_wr4(sc, mmio, 0x80, (val & ~(0x7 << 2)) | (0x2 << 2));
+	rk_combphy_wr4(sc, mmio, 0x6c, 0x4c);
+	rk_combphy_wr4(sc, mmio, 0x28, 0x90);
+	rk_combphy_wr4(sc, mmio, 0x2c, 0x43);
+	rk_combphy_wr4(sc, mmio, 0x30, 0x88);
+	rk_combphy_wr4(sc, mmio, 0x34, 0x56);
+	val = rk_combphy_rd4(sc, mmio, 0x64);
+	rk_combphy_wr4(sc, mmio, 0x64, val | __BIT(5));
+
+	/* Config done, release the PHY core reset: this starts the
+	 * internal calibration and PLL. */
+	rk_combphy_clrset(sc, cru, CRU_SOFTRST_CON(28), core_rst, 0);
+	delay(1000);
+
+	/* PLL settle like the SATA path: a link training started too
+	 * early sees no echo. */
+	delay(500 * 1000);
+
+	pll9c = rk_combphy_rd4(sc, mmio, 0x9c);
+	plla0 = rk_combphy_rd4(sc, mmio, 0xa0);
+	aprint_normal_dev(sc->sc_dev,
+	    "PCIe lane configured (PLL 0x98=0x%08x 0x9c=0x%08x 0xa0=0x%08x)\n",
+	    rk_combphy_rd4(sc, mmio, 0x98), pll9c, plla0);
+	if (pll9c == 0 && plla0 == 0)
+		aprint_error_dev(sc->sc_dev, "PHY PLL looks unlocked\n");
+}
+
 static void *
 rk_combphy_acquire(device_t dev, const void *data, size_t datalen)
 {
 	struct rk_combphy_softc * const sc = device_private(dev);
+	struct rk_combphy_ref *ref;
 	u_int phy_type;
 
 	if (datalen != 4) {
@@ -434,27 +533,41 @@ rk_combphy_acquire(device_t dev, const void *data, size_t datalen)
 		return NULL;
 	}
 	phy_type = be32dec(data);
-	if (phy_type != PHY_TYPE_SATA) {
+	if (phy_type != PHY_TYPE_SATA && phy_type != PHY_TYPE_PCIE) {
 		aprint_error_dev(dev,
-		    "phy type %u not supported (SATA only)\n", phy_type);
+		    "phy type %u not supported (SATA/PCIe only)\n", phy_type);
 		return NULL;
 	}
 
-	return sc;
+	ref = kmem_alloc(sizeof(*ref), KM_SLEEP);
+	ref->ref_sc = sc;
+	ref->ref_type = phy_type;
+	return ref;
 }
 
 static void
 rk_combphy_release(device_t dev, void *priv)
 {
+	struct rk_combphy_ref * const ref = priv;
+
+	kmem_free(ref, sizeof(*ref));
 }
 
 static int
 rk_combphy_enable(device_t dev, void *priv, bool enable)
 {
-	struct rk_combphy_softc * const sc = device_private(dev);
+	struct rk_combphy_softc * const sc =
+	    ((struct rk_combphy_ref *)priv)->ref_sc;
+	const u_int type = ((struct rk_combphy_ref *)priv)->ref_type;
 
 	if (!enable || sc->sc_enabled)
 		return 0;
+
+	if (type == PHY_TYPE_PCIE) {
+		rk_combphy_config_pcie(sc);
+		sc->sc_enabled = true;
+		return 0;
+	}
 
 	/* If firmware (U-Boot "scsi scan" preboot on this board) already
 	 * initialized and calibrated the PHY, keep that state: the registers
@@ -504,7 +617,7 @@ rk_combphy_attach(device_t parent, device_t self, void *aux)
 		return;
 	}
 	if (addr < RK3568_COMBPHY0_BASE ||
-	    addr >= RK3568_COMBPHY0_BASE + 2 * RK3568_COMBPHY_STEP) {
+	    addr >= RK3568_COMBPHY0_BASE + 3 * RK3568_COMBPHY_STEP) {
 		aprint_error(": unsupported lane (0x%08x)\n", (uint32_t)addr);
 		return;
 	}
@@ -537,7 +650,7 @@ rk_combphy_attach(device_t parent, device_t self, void *aux)
 	}
 
 	aprint_naive("\n");
-	aprint_normal(": RK3568 NanoEng combo PHY (lane %u, SATA)\n", sc->sc_idx);
+	aprint_normal(": RK3568 NanoEng combo PHY (lane %u)\n", sc->sc_idx);
 
 	fdtbus_register_phy_controller(self, phandle, &rk_combphy_funcs);
 

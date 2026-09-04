@@ -129,6 +129,17 @@ file	arch/arm/rockchip/rk_usb2phy.c		rkusb2phy & soc_rk3568
 attach	sdhc at fdt with rk_dwcmshc
 file	arch/arm/rockchip/rk_dwcmshc.c		rk_dwcmshc & soc_rk3568
 
+# PCIe3 NanoEng PHY (rk3568 pcie30phy, SRAM firmware, pcie3x2 lane)
+device	rk30pciephy
+attach	rk30pciephy at fdt
+file	arch/arm/rockchip/rk_pcie30phy.c	rk30pciephy & soc_rk3568
+file	arch/arm/rockchip/rk_pcie30phy_fw.c	rk30pciephy & soc_rk3568
+
+# DesignWare PCIe host (rk3568 pcie2x1 / pcie3x2)
+device	rkdwpcie: pcibus, pcihost_fdt
+attach	rkdwpcie at fdt
+file	arch/arm/rockchip/rk_pcie.c		rkdwpcie & soc_rk3568
+
 # TSADC temperature sensors
 device	rktsadc: sysmon_envsys
 attach	rktsadc at fdt with rk_tsadc

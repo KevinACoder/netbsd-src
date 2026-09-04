@@ -1,0 +1,10 @@
+#	$NetBSD$
+#
+# RK3568 lab: parent directories for the iwm(4) firmware COPY'd in from
+# the workspace by the `list' file (iwlwifi-7260-17.ucode for the Intel
+# Wireless-AC 7260 on the PCIe x4 slot).  firmload(9) searches
+# /libdata/firmware/<driver>/ at boot.
+
+./libdata		type=dir
+./libdata/firmware	type=dir
+./libdata/firmware/iwm	type=dir

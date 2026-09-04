@@ -4,7 +4,10 @@
 .include "${NETBSDSRCDIR}/distrib/common/Makefile.distrib"
 
 IMAGE=		ramdisk.fs
-IMAGESIZE=	3072k
+# RK3568 lab: grown from 3072k to fit the iwm 7260 firmware COPY'd in
+# from the workspace (see list); keep in sync with MEMORY_DISK_ROOT_SIZE
+# in sys/arch/evbarm/conf/RK3568_MFS (9216 sectors = 4608 KiB).
+IMAGESIZE=	4608k
 MAKEFS_FLAGS+=	-f 15
 
 WARNS=		1
@@ -15,7 +18,7 @@ DBG+=		-mthumb -mthumb-interwork
 
 CRUNCHBIN=	ramdiskbin
 LISTS=		${.CURDIR}/list ${DISTRIBDIR}/common/list.sysinst
-MTREECONF=	${DISTRIBDIR}/common/mtree.common
+MTREECONF=	${DISTRIBDIR}/common/mtree.common ${.CURDIR}/mtree.rk3568
 .if empty(MACHINE_ARCH:M*eb)
 IMAGEENDIAN=	le
 .else
