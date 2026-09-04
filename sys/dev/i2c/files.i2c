@@ -365,6 +365,21 @@ attach	rkpmic at iic
 attach	rkreg at rkpmic
 file	dev/i2c/rkpmic.c			rkpmic
 
+# Rockchip RK809 PMIC (RK817 register layout), read-only inventory
+device	rk809pmic
+attach	rk809pmic at iic
+file	dev/i2c/rk809pmic.c			rk809pmic
+
+# Epson RX-8025T real-time clock
+device	rx8025rtc
+attach	rx8025rtc at iic
+file	dev/i2c/rx8025rtc.c			rx8025rtc
+
+# Texas Instruments INA3221 power monitor
+device	ina3221mon: sysmon_envsys
+attach	ina3221mon at iic
+file	dev/i2c/ina3221.c			ina3221mon
+
 # SSD1306 or SH1106 OLED/PLED display
 attach	ssdfb at iic with ssdfb_iic
 file	dev/i2c/ssdfb_i2c.c			ssdfb_iic

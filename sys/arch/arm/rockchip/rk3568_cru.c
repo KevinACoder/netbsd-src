@@ -17,6 +17,22 @@
  * source >= the requested rate.  Encodings verified against Linux
  * clk-rk3568.c and the standalone SDK fdwmmc/fdwmshc drivers.
  *
+ * ARMCLK is a read-only clock whose rate is computed by reading the
+ * APLL/GPLL CON registers and the core0 mux/divider the firmware (and
+ * BL31) left behind, so cpufreq_dt reports the factual CPU frequency.
+ * set_rate on it returns EINVAL (no DVFS in the stub).
+ *
+ * The main CRU instance also registers a generic reset controller over
+ * the SOFTRST_CON registers (#reset-cells = 1), so consumers like
+ * rktsadc can assert/deassert their documented soft resets.
+ *
+ * Finally, each instance performs a one-shot, idempotent bring-up of
+ * the onboard i2c buses (pin iomux + clock mux/gates + controller soft
+ * reset pulse), mirroring the standalone SDK fdwi2c.c FDwi2cPlatformInit
+ * and the Linux clk tree defaults: U-Boot only ever enabled i2c0 (for
+ * the PMIC), so i2c1 (RTC + power monitor) would otherwise come up with
+ * its pins in GPIO mode and its clocks gated.
+ *
  * Two controllers are matched:
  *   - the main CRU (rockchip,rk3568-cru) at 0xfdd20000
  *   - the PMU CRU (rockchip,rk3568-pmucru) at 0xfdd00000
@@ -36,6 +52,7 @@ __KERNEL_RCSID(0, "$NetBSD: rk3568_cru.c,v 1.1 2026/09/01 00:00:00 rk3568-bringu
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/device.h>
+#include <sys/endian.h>
 #include <sys/kmem.h>
 #include <sys/bus.h>
 
@@ -53,6 +70,11 @@ static void	rk3568_cru_put(void *, struct clk *);
 static u_int	rk3568_cru_get_rate(void *, struct clk *);
 static int	rk3568_cru_set_rate(void *, struct clk *, u_int);
 
+static void *	rk3568_cru_reset_acquire(device_t, const void *, size_t);
+static void	rk3568_cru_reset_release(device_t, void *);
+static int	rk3568_cru_reset_assert(device_t, void *);
+static int	rk3568_cru_reset_deassert(device_t, void *);
+
 static const struct fdtbus_clock_controller_func rk3568_cru_fdtclock_funcs = {
 	.decode = rk3568_cru_decode,
 };
@@ -62,6 +84,13 @@ static const struct clk_funcs rk3568_cru_clk_funcs = {
 	.put = rk3568_cru_put,
 	.get_rate = rk3568_cru_get_rate,
 	.set_rate = rk3568_cru_set_rate,
+};
+
+static const struct fdtbus_reset_controller_func rk3568_cru_fdtreset_funcs = {
+	.acquire = rk3568_cru_reset_acquire,
+	.release = rk3568_cru_reset_release,
+	.reset_assert = rk3568_cru_reset_assert,
+	.reset_deassert = rk3568_cru_reset_deassert,
 };
 
 /* Clock ID -> fixed rate map.  IDs come from the DT binding header
@@ -80,11 +109,17 @@ static const struct rk3568_cru_rate rk3568_cru_rates[] = {
 	{ RK3568_CLK_PCIE30PHY_REF_N,	100000000 },
 	{ RK3568_CLK_USBPHY0_REF,	24000000 },
 	{ RK3568_CLK_USBPHY1_REF,	24000000 },
-	{ RK3568_CLK_I2C0,	24000000 },
+	/* clk_i2c0 = clk_pdpmu = ppll 200 MHz / 2 = 100 MHz (same nominal
+	 * rate as the CRU-domain i2c units; standalone fdwi2c uses 100 MHz
+	 * for the divider math on both buses). */
+	{ RK3568_CLK_I2C0,	100000000 },
 	{ RK3568_PCLK_I2C0,	100000000 },
 	{ RK3568_SCLK_UART0,	24000000 },
 	{ RK3568_PCLK_UART0,	100000000 },
 	/* Main CRU */
+	/* ARMCLK: rate filled in from the live PLL/mux/divider registers
+	 * at attach (read-only clock). */
+	{ RK3568_ARMCLK,	0 },
 	{ RK3568_ACLK_PIPE,	300000000 },
 	{ RK3568_PCLK_PIPE,	100000000 },
 	/* PCIe controllers (pcie2x1 / pcie3x2) */
@@ -266,6 +301,229 @@ static const struct rk3568_cru_mux rk3568_cru_muxes[] = {
 	  __arraycount(rk3568_cru_cclk_emmc_mux_rates) },
 };
 
+/* ---------------------------------------------------------------- */
+/*
+ * Register access helpers.  Rockchip CRU/GRF registers take a write
+ * enable mask in the high halfword (write (mask << 16) | value).
+ */
+
+static uint32_t
+rk3568_cru_read(struct rk3568_cru_softc *sc, bus_size_t reg)
+{
+
+	return bus_space_read_4(sc->sc_bst, sc->sc_bsh, reg);
+}
+
+static void
+rk3568_cru_write(struct rk3568_cru_softc *sc, bus_size_t reg, uint32_t val)
+{
+
+	bus_space_write_4(sc->sc_bst, sc->sc_bsh, reg, val);
+}
+
+static void
+rk3568_cru_clrset(struct rk3568_cru_softc *sc, bus_size_t reg,
+    uint32_t mask, uint32_t val)
+{
+
+	rk3568_cru_write(sc, reg, (mask << 16) | (val & mask));
+}
+
+/*
+ * PLL rate from the rk3328-style CON registers (RK3568_PLL_CON(n) =
+ * n * 4): rate = 24 MHz * FBDIV / (REFDIV * POSTDIV1 * POSTDIV2).
+ * CON0: FBDIV[11:0], POSTDIV1[14:12]; CON1: REFDIV[5:0],
+ * POSTDIV2[8:6].  Register layout verified against Linux clk-pll.c
+ * (rockchip_rk3036_pll_con_to_rate) and clk-rk3568.c PLL_APLL/GPLL.
+ */
+static u_int
+rk3568_cru_pll_rate(struct rk3568_cru_softc *sc, bus_size_t con0)
+{
+	const uint32_t c0 = rk3568_cru_read(sc, con0);
+	const uint32_t c1 = rk3568_cru_read(sc, con0 + 4);
+	const u_int fbdiv = __SHIFTOUT(c0, __BITS(11, 0));
+	const u_int postdiv1 = __SHIFTOUT(c0, __BITS(14, 12));
+	const u_int refdiv = __SHIFTOUT(c1, __BITS(5, 0));
+	const u_int postdiv2 = __SHIFTOUT(c1, __BITS(8, 6));
+
+	if (fbdiv == 0 || refdiv == 0 || postdiv1 == 0 || postdiv2 == 0)
+		return 0;
+
+	return (u_int)(((uint64_t)24000000 * fbdiv) /
+	    ((uint64_t)refdiv * postdiv1 * postdiv2));
+}
+
+/*
+ * ARMCLK: mux = CLKSEL_CON0 bit6 (0 = APLL, 1 = GPLL), core0 divider
+ * = CLKSEL_CON0[4:0].  APLL CON0 is at 0x000, GPLL CON0 at 0x004
+ * (RK3568_PLL_CON(0) / RK3568_PLL_CON(1)); MODE_CON0 (0x0c0) is not
+ * consulted - if the mux points at a PLL, the firmware left it in
+ * normal mode.
+ */
+static u_int
+rk3568_cru_armclk_rate(struct rk3568_cru_softc *sc)
+{
+	const uint32_t con0 = rk3568_cru_read(sc, 0x100);
+	const u_int div = __SHIFTOUT(con0, __BITS(4, 0));
+	u_int parent_rate;
+
+	if ((con0 & __BIT(6)) != 0)
+		parent_rate = rk3568_cru_pll_rate(sc, 0x004);
+	else
+		parent_rate = rk3568_cru_pll_rate(sc, 0x000);
+
+	if (parent_rate == 0)
+		return 0;
+
+	return parent_rate / (div + 1);
+}
+
+/* ---------------------------------------------------------------- */
+/*
+ * Generic reset controller over the main CRU SOFTRST_CON registers
+ * (0x400 + (id / 16) * 4, bit id % 16; 1 = asserted).  Same layout as
+ * rk_cru.c.
+ */
+
+static void *
+rk3568_cru_reset_acquire(device_t dev, const void *data, size_t len)
+{
+
+	if (len != 4)
+		return NULL;
+
+	return (void *)(uintptr_t)be32dec(data);
+}
+
+static void
+rk3568_cru_reset_release(device_t dev, void *priv)
+{
+}
+
+static int
+rk3568_cru_reset_assert(device_t dev, void *priv)
+{
+	struct rk3568_cru_softc * const sc = device_private(dev);
+	const uintptr_t reset_id = (uintptr_t)priv;
+	const bus_size_t reg = 0x400 + (reset_id / 16) * 4;
+	const uint32_t bit = 1u << (reset_id % 16);
+
+	rk3568_cru_clrset(sc, reg, bit, bit);
+
+	return 0;
+}
+
+static int
+rk3568_cru_reset_deassert(device_t dev, void *priv)
+{
+	struct rk3568_cru_softc * const sc = device_private(dev);
+	const uintptr_t reset_id = (uintptr_t)priv;
+	const bus_size_t reg = 0x400 + (reset_id / 16) * 4;
+	const uint32_t bit = 1u << (reset_id % 16);
+
+	rk3568_cru_clrset(sc, reg, bit, 0);
+
+	return 0;
+}
+
+/* ---------------------------------------------------------------- */
+/*
+ * Onboard i2c bus bring-up.  Everything U-Boot did for i2c0 only
+ * (pin iomux, clock mux/gates, controller soft reset pulse) applied
+ * here idempotently for both buses, following the standalone SDK
+ * fdwi2c.c FDwi2cPlatformInit exactly:
+ *   i2c0 (PMU CRU instance): PMUGRF GPIO0B1/B2 fn1 (IOMUX_L @0x08,
+ *     mask 0x0ff0 -> 0x0110); pmucru clksel_con3 (0x10c) div[6:0] = 1
+ *     (clk_pdpmu -> 100 MHz); pmucru clkgate_con1 (0x184) bits0/1
+ *     open; pmucru softrst_con0 (0x200) bits3/4 pulse.
+ *   i2c1 (main CRU instance): PMUGRF GPIO0B3/B4 fn1 (IOMUX_L mask
+ *     0x7000 -> 0x1000, IOMUX_H @0x0c mask 0x7 -> 0x1); cru
+ *     clksel_con71 (0x21c) mux[9:8] = 1 (gpll_100m); clkgate_con30
+ *     (0x378) bits0/1 + clkgate_con32 (0x380) bit10 open; softrst_con22
+ *     (0x458) bits2/3 pulse.
+ */
+#define RK3568_PMUGRF_BASE	0xfdc20000
+#define RK3568_PMUGRF_GPIO0B_IOMUX_L	0x08
+#define RK3568_PMUGRF_GPIO0B_IOMUX_H	0x0c
+
+/* PMUGRF is outside both CRU instances; map it once through the boot
+ * bus tag (rk_platform.c devmaps the region) and keep the handle. */
+static void
+rk3568_cru_pmugrf_clrset(struct rk3568_cru_softc *sc, bus_size_t reg,
+    uint32_t mask, uint32_t val)
+{
+	static bus_space_tag_t bst;
+	static bus_space_handle_t bsh;
+	static bool mapped;
+
+	if (!mapped) {
+		if (bus_space_map(sc->sc_bst, RK3568_PMUGRF_BASE, 0x100, 0,
+		    &bsh) != 0)
+			return;
+		bst = sc->sc_bst;
+		mapped = true;
+	}
+	bus_space_write_4(bst, bsh, reg, (mask << 16) | (val & mask));
+}
+
+static void
+rk3568_cru_i2c0_bringup(struct rk3568_cru_softc *sc)
+{
+	uint32_t val;
+
+	/* Pin iomux: GPIO0_B1 (SCL) / B2 (SDA) -> func 1. */
+	rk3568_cru_pmugrf_clrset(sc, RK3568_PMUGRF_GPIO0B_IOMUX_L,
+	    0x0ff0, 0x0110);
+
+	/* clk_i2c0 divider: clk_pdpmu / (div + 1), div = 1 -> 100 MHz. */
+	val = rk3568_cru_read(sc, 0x10c) & 0x7f;
+	if (val != 1)
+		rk3568_cru_clrset(sc, 0x10c, 0x7f, 1);
+
+	/* Open pclk_i2c0 / clk_i2c0 gates. */
+	rk3568_cru_clrset(sc, 0x184, 0x3, 0);
+
+	/* Pulse the controller soft resets. */
+	rk3568_cru_clrset(sc, 0x200, 0x18, 0x18);
+	delay(10);
+	rk3568_cru_clrset(sc, 0x200, 0x18, 0);
+
+	aprint_verbose_dev(sc->sc_dev, "i2c0 bus bring-up done\n");
+}
+
+static void
+rk3568_cru_i2c1_bringup(struct rk3568_cru_softc *sc)
+{
+	uint32_t val;
+
+	/* Pin iomux: GPIO0_B3 (SCL) / B4 (SDA) -> func 1. */
+	rk3568_cru_pmugrf_clrset(sc, RK3568_PMUGRF_GPIO0B_IOMUX_L,
+	    0x7000, 0x1000);
+	rk3568_cru_pmugrf_clrset(sc, RK3568_PMUGRF_GPIO0B_IOMUX_H,
+	    0x7, 0x1);
+
+	/* clk_i2c mux -> gpll_100m. */
+	val = __SHIFTOUT(rk3568_cru_read(sc, 0x21c), __BITS(9, 8));
+	if (val != 1)
+		rk3568_cru_clrset(sc, 0x21c, 0x3 << 8, 1 << 8);
+
+	/* Open pclk_i2c1 / clk_i2c1 gates + the shared clk_i2c gate. */
+	rk3568_cru_clrset(sc, 0x378, 0x3, 0);
+	rk3568_cru_clrset(sc, 0x380, 0x400, 0);
+
+	/* Pulse the controller soft resets (SRST_P_I2C1 / SRST_I2C1). */
+	rk3568_cru_clrset(sc, 0x458, 0xc, 0xc);
+	delay(10);
+	rk3568_cru_clrset(sc, 0x458, 0xc, 0);
+
+	aprint_verbose_dev(sc->sc_dev, "i2c1 bus bring-up done\n");
+}
+
+static const struct device_compatible_entry rk3568_cru_only_compat[] = {
+	{ .compat = "rockchip,rk3568-cru" },
+	DEVICE_COMPAT_EOL
+};
+
 static const struct device_compatible_entry compat_data[] = {
 	{ .compat = "rockchip,rk3568-cru" },
 	{ .compat = "rockchip,rk3568-pmucru" },
@@ -309,6 +567,9 @@ rk3568_cru_attach(device_t parent, device_t self, void *aux)
 		aprint_error(": couldn't map registers\n");
 		return;
 	}
+
+	sc->sc_is_cru =
+	    of_compatible_match(phandle, rk3568_cru_only_compat);
 
 	/* Register a fixed-rate clock for every known ID.  All clocks share
 	 * one clk_domain and one funcs table; rk3568_cru_get_rate returns
@@ -356,6 +617,29 @@ rk3568_cru_attach(device_t parent, device_t self, void *aux)
 
 	aprint_naive("\n");
 	aprint_normal(": RK3568 CRU (fixed-rate bring-up stub)\n");
+
+	if (sc->sc_is_cru) {
+		/* Compute the factual ARMCLK rate from the live PLL/mux/
+		 * divider registers (read-only clock for cpufreq_dt). */
+		const u_int armclk_rate = rk3568_cru_armclk_rate(sc);
+
+		for (u_int i = 0; i < sc->sc_nclks; i++) {
+			if (sc->sc_clks[i].id == RK3568_ARMCLK) {
+				if (armclk_rate != 0)
+					sc->sc_clks[i].rate = armclk_rate;
+				aprint_normal_dev(self, "ARMCLK %u MHz\n",
+				    sc->sc_clks[i].rate / 1000000);
+				break;
+			}
+		}
+
+		fdtbus_register_reset_controller(self, phandle,
+		    &rk3568_cru_fdtreset_funcs);
+
+		rk3568_cru_i2c1_bringup(sc);
+	} else {
+		rk3568_cru_i2c0_bringup(sc);
+	}
 }
 
 static struct clk *

@@ -38,6 +38,12 @@ rkdwpcie*	at fdt?
 # x4 slot; firmware iwlwifi-7260-17.ucode baked into the miniroot.
 iwm*		at pci? dev ? function ?
 
+# Onboard I2C devices (i2c0 PMIC, i2c1 battery RTC + power monitor);
+# rkiic/iic/cpufreqdt/rktsadc come in via GENERIC64.
+rk809pmic*	at iic?
+rx8025rtc*	at iic?
+ina3221mon*	at iic?
+
 # Ramdisk root (miniroot embedded with mdsetimage)
 options 	MEMORY_DISK_IS_ROOT
 options 	MEMORY_DISK_ROOT_SIZE=9216	# 9216 * 512 = 4608 KiB (ramdisk.fs + iwm fw)

@@ -40,3 +40,9 @@ rkdwpcie*	at fdt?
 # Intel Wireless (802.11ac, PCIe): Dual Band Wireless-AC 7260 in the
 # x4 slot; firmware lives on the root filesystem (pkg/sets), not here.
 iwm*		at pci? dev ? function ?
+
+# Onboard I2C devices (i2c0 PMIC, i2c1 battery RTC + power monitor);
+# rkiic/iic/cpufreqdt/rktsadc come in via GENERIC64.
+rk809pmic*	at iic?
+rx8025rtc*	at iic?
+ina3221mon*	at iic?

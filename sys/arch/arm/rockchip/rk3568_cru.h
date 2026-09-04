@@ -16,6 +16,11 @@
 
 #include <dev/clk/clk_backend.h>
 
+/* Main CRU: ARMCLK (mux/divider only - the stub computes the rate by
+ * reading the APLL/GPLL CON registers the firmware left behind; it is
+ * a read-only clock). */
+#define RK3568_ARMCLK		10
+
 /* PMU CRU clock IDs */
 #define RK3568_CLK_PCIEPHY0_REF	31
 #define RK3568_CLK_PCIEPHY1_REF	34
@@ -176,6 +181,9 @@ struct rk3568_cru_softc {
 	int			sc_phandle;
 	bus_space_tag_t		sc_bst;
 	bus_space_handle_t	sc_bsh;
+	/* true for the main CRU instance (owns ARMCLK, the SOFTRST
+	 * registers and the i2c1 clock tree); false for the PMU CRU. */
+	bool			sc_is_cru;
 
 	struct clk_domain	sc_clkdom;
 

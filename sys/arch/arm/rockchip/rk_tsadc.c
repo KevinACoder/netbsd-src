@@ -145,6 +145,20 @@ __KERNEL_RCSID(0, "$NetBSD: rk_tsadc.c,v 1.16 2021/12/11 19:24:21 mrg Exp $");
 #define  RK3399_GRF_TSADC_TESTBIT_VCM_EN_H      (0x10001 << 7)
 #define  RK3399_GRF_TSADC_TESTBIT_H_ON          (0x10001 << 2)
 
+/*
+ * RK3568 (Linux rockchip_thermal.c rk_tsadcv7_initialize): the sensor
+ * enable taps live in the GRF at 0x0600, with the usual hiword write
+ * enable; TRM 18.5 requires >= 10 us between TSEN and the ANA taps,
+ * and >= 90 us after them.
+ */
+#define RK3568_GRF_TSADC_CON                    0x0600
+#define RK3568_GRF_TSADC_TSEN                   (0x10001 << 8)
+#define RK3568_GRF_TSADC_ANA_REG0               (0x10001 << 0)
+#define RK3568_GRF_TSADC_ANA_REG1               (0x10001 << 1)
+#define RK3568_GRF_TSADC_ANA_REG2               (0x10001 << 2)
+#define RK3568_TSADC_AUTO_PERIOD_TIME           1622 /* 2.5ms */
+#define RK3568_TSADC_USER_INTER_PD_SOC         0xfc0 /* 97us, >= 90us */
+
 #define TEMP_uC_TO_uK             273150000
 
 #define TSHUT_MODE_CPU    0
@@ -222,6 +236,7 @@ static void rk_tsadc_tshut_set(struct rk_tsadc_softc *s);
 static void rk_tsadc_init_tshut(struct rk_tsadc_softc *, int, int);
 static void rk_tsadc_init_common(struct rk_tsadc_softc *, int, int);
 static void rk_tsadc_init_rk3399(struct rk_tsadc_softc *, int, int);
+static void rk_tsadc_init_rk3568(struct rk_tsadc_softc *, int, int);
 static void rk_tsadc_init_enable(struct rk_tsadc_softc *);
 static void rk_tsadc_init(struct rk_tsadc_softc *, int, int);
 static void rk_tsadc_refresh(struct sysmon_envsys *, envsys_data_t *);
@@ -400,6 +415,51 @@ static const rk_data_array rk3399_data_array[] = {
 #undef ENTRY
 };
 
+/*
+ * Table from the Linux rockchip_thermal driver (rk3568_code_table,
+ * ADC_INCREMENT).
+ */
+static const rk_data_array rk3568_data_array[] = {
+#define ENTRY(d,C)	{ .data = (d), .temp = (C) * 1000 * 1000, }
+	ENTRY(0,   -40),
+	ENTRY(1584, -40),
+	ENTRY(1620, -35),
+	ENTRY(1652, -30),
+	ENTRY(1688, -25),
+	ENTRY(1720, -20),
+	ENTRY(1756, -15),
+	ENTRY(1788, -10),
+	ENTRY(1824,  -5),
+	ENTRY(1856,   0),
+	ENTRY(1892,   5),
+	ENTRY(1924,  10),
+	ENTRY(1956,  15),
+	ENTRY(1992,  20),
+	ENTRY(2024,  25),
+	ENTRY(2060,  30),
+	ENTRY(2092,  35),
+	ENTRY(2128,  40),
+	ENTRY(2160,  45),
+	ENTRY(2196,  50),
+	ENTRY(2228,  55),
+	ENTRY(2264,  60),
+	ENTRY(2300,  65),
+	ENTRY(2332,  70),
+	ENTRY(2368,  75),
+	ENTRY(2400,  80),
+	ENTRY(2436,  85),
+	ENTRY(2468,  90),
+	ENTRY(2500,  95),
+	ENTRY(2536, 100),
+	ENTRY(2572, 105),
+	ENTRY(2604, 110),
+	ENTRY(2636, 115),
+	ENTRY(2672, 120),
+	ENTRY(2704, 125),
+	ENTRY(TSADC_DATA_MAX, 125),
+#undef ENTRY
+};
+
 static const rk_data rk3288_data_table = {
 	.rd_name = "RK3288",
 	.rd_array = rk3288_data_array,
@@ -442,10 +502,25 @@ static const rk_data rk3399_data_table = {
 	.rd_version = 3,
 };
 
+static const rk_data rk3568_data_table = {
+	.rd_name = "RK3568",
+	.rd_array = rk3568_data_array,
+	.rd_size = __arraycount(rk3568_data_array),
+	.rd_init = rk_tsadc_init_rk3568,
+	.rd_decr = false,
+	.rd_max = 2704,
+	.rd_min = 1584,
+	.rd_auto_period = RK3568_TSADC_AUTO_PERIOD_TIME,
+	.rd_auto_period_ht = RK3568_TSADC_AUTO_PERIOD_TIME,
+	.rd_num_sensors = 2,
+	.rd_version = 3,
+};
+
 static const struct device_compatible_entry compat_data[] = {
 	{ .compat = "rockchip,rk3288-tsadc",	.data = &rk3288_data_table },
 	{ .compat = "rockchip,rk3328-tsadc",	.data = &rk3328_data_table },
 	{ .compat = "rockchip,rk3399-tsadc",	.data = &rk3399_data_table },
+	{ .compat = "rockchip,rk3568-tsadc",	.data = &rk3568_data_table },
 	DEVICE_COMPAT_EOL
 };
 
@@ -761,6 +836,33 @@ rk_tsadc_init_rk3399(struct rk_tsadc_softc *sc, int mode, int polarity)
 				      RK3399_GRF_SARADC_TESTBIT_ON);
 	syscon_write_4(sc->sc_syscon, RK3399_GRF_TSADC_TESTBIT_H,
 				      RK3399_GRF_TSADC_TESTBIT_H_ON);
+	DELAY(100);
+	syscon_unlock(sc->sc_syscon);
+
+	rk_tsadc_init_common(sc, mode, polarity);
+}
+
+/*
+ * RK3568: Linux rk_tsadcv7_initialize.  The AUTO_PERIOD/debounce and
+ * polarity setup happens in rk_tsadc_init_common; here we set the
+ * user conversion latency and bring the sensor up through the GRF.
+ */
+static void
+rk_tsadc_init_rk3568(struct rk_tsadc_softc *sc, int mode, int polarity)
+{
+
+	TSADC_WRITE(sc, TSADC_USER_CON, RK3568_TSADC_USER_INTER_PD_SOC);
+
+	syscon_lock(sc->sc_syscon);
+	syscon_write_4(sc->sc_syscon, RK3568_GRF_TSADC_CON,
+				      RK3568_GRF_TSADC_TSEN);
+	DELAY(15);
+	syscon_write_4(sc->sc_syscon, RK3568_GRF_TSADC_CON,
+				      RK3568_GRF_TSADC_ANA_REG0);
+	syscon_write_4(sc->sc_syscon, RK3568_GRF_TSADC_CON,
+				      RK3568_GRF_TSADC_ANA_REG1);
+	syscon_write_4(sc->sc_syscon, RK3568_GRF_TSADC_CON,
+				      RK3568_GRF_TSADC_ANA_REG2);
 	DELAY(100);
 	syscon_unlock(sc->sc_syscon);
 
