@@ -453,14 +453,14 @@ rk_combphy_config_pcie(struct rk_combphy_softc *sc)
 	const uint32_t core_rst = SOFTRST_CON28_PIPEPHY_CORE << (idx * 2);
 	uint32_t val, pll9c, plla0;
 
-	/* Make sure the PHY's APB interface is running, and hold the PHY
-	 * core in reset while it is being configured.  Bare-metal
-	 * (fdwpcie) skips the assert because its cold PHY never ran; in
-	 * our boot flow U-Boot may have left the unconfigured PHY
-	 * running, and its PLL then never locks - the same reason the
-	 * SATA path asserts the core reset. */
+	/* Make sure the PHY's APB interface is running.  Like fdwpcie, do
+	 * NOT assert the core reset around the tuning: CRU soft resets
+	 * come up released, so fdwpcie tunes a live PHY, and writes
+	 * issued while the core is held never land - the U-Boot port
+	 * proved this on 2026-09-04, where assert-first left TXPLL_LOCK=0
+	 * even with the exact fdwpcie register set (KI-022).  The release
+	 * below still covers a PHY left held by a failed earlier attempt. */
 	rk_combphy_clrset(sc, cru, CRU_SOFTRST_CON(28), apb_rst, 0);
-	rk_combphy_clrset(sc, cru, CRU_SOFTRST_CON(28), core_rst, core_rst);
 	delay(100);
 
 	rk_combphy_set_refclk(sc);
