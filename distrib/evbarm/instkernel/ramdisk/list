@@ -87,8 +87,8 @@ COPY	${DISTRIBDIR}/common/services		etc/services
 # and the installation tools
 COPY	${CURDIR}/dot.profile		.profile
 
-# RK3568 lab: Intel Wireless-AC 7260 firmware for iwm(4) on the PCIe x4
-# slot.  iwm loads <fwdir>/iwm/iwlwifi-7260-17.ucode via firmload(9),
-# and /libdata/firmware is in the default search path.  The blob lives
-# outside the source tree, in the lab workspace next to src/.
-COPY	${NETBSDSRCDIR}/../board/firmware/iwlwifi-7260-17.ucode	libdata/firmware/iwm/iwlwifi-7260-17.ucode
+# RK3568 lab: Intel Wireless-AC 7260 firmware for iwm(4) on the PCIe
+# slots.  iwm loads <fwdir>/if_iwm/iwlwifi-7260-17.ucode via firmload(9)
+# (the directory prefix is the driver name), and /libdata/firmware is in
+# the default search path.  Source is the in-tree distribution copy.
+COPY	${NETBSDSRCDIR}/external/intel-fw-public/iwl7260/dist/iwlwifi-7260-17.ucode	libdata/firmware/if_iwm/iwlwifi-7260-17.ucode

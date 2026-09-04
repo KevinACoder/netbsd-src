@@ -7,4 +7,4 @@
 
 ./libdata		type=dir
 ./libdata/firmware	type=dir
-./libdata/firmware/iwm	type=dir
+./libdata/firmware/if_iwm	type=dir
