@@ -298,7 +298,7 @@ gicv3_fdt_attach_mbi(struct gicv3_fdt_softc *sc)
 
 		frame = kmem_zalloc(sizeof(*frame), KM_SLEEP);
 		frame->frame_reg = addr;
-		frame->frame_pic = pic_list[0];
+		frame->frame_pic = &sc->sc_gic.sc_pic;
 		frame->frame_base = base_spi;
 		frame->frame_count = num_spis;
 

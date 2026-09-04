@@ -336,6 +336,15 @@ gic_v2m_msi_intr_establish(struct arm_pci_msi *msi,
 	const int spi = __SHIFTOUT(ih, ARM_PCI_INTR_IRQ);
 	const int mpsafe = (ih & ARM_PCI_INTR_MPSAFE) ? IST_MPSAFE : 0;
 
+	/*
+	 * pic pins and pic_sources[] are indexed by GIC INTID.  The
+	 * mbi-ranges value (and the SETSPI doorbell DATA written by the
+	 * device, gic_v2m_msi_data) are used as the INTID itself, not as
+	 * an SPI number -- the same interpretation FreeBSD's gic_v3(4)
+	 * makes, and the only one that is self-consistent on the RK3568
+	 * GIC-600 (KI-023: its ITLinesNumber ends below INTID 328, so the
+	 * DT value must already be an INTID).
+	 */
 	return pic_establish_intr(frame->frame_pic, spi, ipl,
 	    IST_EDGE | mpsafe, func, arg, xname);
 }
