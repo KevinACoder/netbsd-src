@@ -1567,17 +1567,17 @@ iwm_prepare_card_hw(struct iwm_softc *sc)
 {
 	int t = 0;
 
+	if (iwm_set_hw_ready(sc))
+		return 0;
+
 	/*
 	 * The device may be in a low-power PCIe link state in which it
-	 * will not react to host accesses at all.  Keep its link power
-	 * management disabled for as long as the driver owns the card.
+	 * will not react to host accesses at all.  Disable the device's
+	 * link power management while waking it up.
 	 */
 	IWM_SETBITS(sc, IWM_CSR_DBG_LINK_PWR_MGMT_REG,
 	    IWM_CSR_RESET_LINK_PWR_MGMT_DISABLED);
 	DELAY(1000);
-
-	if (iwm_set_hw_ready(sc))
-		return 0;
 
 	/* If HW is not ready, prepare the conditions to check again */
 	IWM_SETBITS(sc, IWM_CSR_HW_IF_CONFIG_REG,
@@ -6237,9 +6237,17 @@ iwm_do_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 		break;
 
 	case IEEE80211_S_SCAN:
-		if (ostate == nstate &&
-		    ISSET(sc->sc_flags, IWM_FLAG_SCANNING))
-			return 0;
+		/*
+		 * The firmware rejects a second scan request while a scan
+		 * is running (fatal 0xEE8 assertion).  net80211 can ask for
+		 * another scan while one is in progress (e.g. an active
+		 * `list scan` right after up triggered the initial scan).
+		 * Refuse the request: the ioctl then returns an error
+		 * instead of waiting forever for a scan completion that
+		 * never comes.
+		 */
+		if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING))
+			return EBUSY;
 		if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_UMAC_SCAN))
 			err = iwm_umac_scan(sc);
 		else
