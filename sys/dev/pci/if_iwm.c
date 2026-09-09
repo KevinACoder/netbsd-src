@@ -153,7 +153,7 @@ __KERNEL_RCSID(0, "$NetBSD: if_iwm.c,v 1.90 2024/11/10 11:44:36 mlelstv Exp $");
 #ifdef IWM_DEBUG
 #define DPRINTF(x)	do { if (iwm_debug > 0) printf x; } while (0)
 #define DPRINTFN(n, x)	do { if (iwm_debug >= (n)) printf x; } while (0)
-int iwm_debug = 0;
+int iwm_debug = 1;
 #else
 #define DPRINTF(x)	do { ; } while (0)
 #define DPRINTFN(n, x)	do { ; } while (0)
@@ -668,8 +668,11 @@ iwm_read_firmware(struct iwm_softc *sc, enum iwm_ucode_type ucode_type)
 	if (fw->fw_status == IWM_FW_STATUS_NONE) {
 		fw->fw_status = IWM_FW_STATUS_INPROGRESS;
 	} else {
-		while (fw->fw_status == IWM_FW_STATUS_INPROGRESS)
-			tsleep(&sc->sc_fw, 0, "iwmfwp", 0);
+		while (fw->fw_status == IWM_FW_STATUS_INPROGRESS) {
+			err = tsleep(&sc->sc_fw, 0, "iwmfwp", mstohz(10000));
+			if (err)
+				return err;	/* loader stuck: don't wait forever */
+		}
 	}
 	status = fw->fw_status;
 
@@ -1564,10 +1567,17 @@ iwm_prepare_card_hw(struct iwm_softc *sc)
 {
 	int t = 0;
 
+	/*
+	 * The device may be in a low-power PCIe link state in which it
+	 * will not react to host accesses at all.  Keep its link power
+	 * management disabled for as long as the driver owns the card.
+	 */
+	IWM_SETBITS(sc, IWM_CSR_DBG_LINK_PWR_MGMT_REG,
+	    IWM_CSR_RESET_LINK_PWR_MGMT_DISABLED);
+	DELAY(1000);
+
 	if (iwm_set_hw_ready(sc))
 		return 0;
-
-	DELAY(100);
 
 	/* If HW is not ready, prepare the conditions to check again */
 	IWM_SETBITS(sc, IWM_CSR_HW_IF_CONFIG_REG,
@@ -4208,8 +4218,12 @@ iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 	/* if the command wants an answer, busy sc_cmd_resp */
 	if (wantresp) {
 		KASSERT(!async);
-		while (sc->sc_wantresp != IWM_CMD_RESP_IDLE)
-			tsleep(&sc->sc_wantresp, 0, "iwmcmdsl", 0);
+		while (sc->sc_wantresp != IWM_CMD_RESP_IDLE) {
+			err = tsleep(&sc->sc_wantresp, PCATCH, "iwmcmdsl",
+			    mstohz(5000));
+			if (err)
+				return err;	/* timeout or signal */
+		}
 		sc->sc_wantresp = ring->qid << 16 | ring->cur;
 	}
 
@@ -7113,6 +7127,7 @@ iwm_nic_error(struct iwm_softc *sc)
 {
 	struct iwm_error_event_table t;
 	uint32_t base;
+	int i;
 
 	aprint_error_dev(sc->sc_dev, "dumping device error log\n");
 	base = sc->sc_uc.uc_error_event_table;
@@ -7179,6 +7194,21 @@ iwm_nic_error(struct iwm_softc *sc)
 	aprint_error_dev(sc->sc_dev, "%08X | lmpm_pmg_sel\n", t.lmpm_pmg_sel);
 	aprint_error_dev(sc->sc_dev, "%08X | timestamp\n", t.u_timestamp);
 	aprint_error_dev(sc->sc_dev, "%08X | flow_handler\n", t.flow_handler);
+
+	/*
+	 * The table continues with t.valid - 1 more entries, one per
+	 * error the firmware recorded; the first entry is the header
+	 * printed above.  Each entry starts with an error id.
+	 */
+	for (i = ERROR_START_OFFSET; i < t.valid * ERROR_ELEM_SIZE;
+	    i += ERROR_ELEM_SIZE) {
+		uint32_t error_id;
+
+		if (iwm_read_mem(sc, base + i, &error_id, 1))
+			break;
+		aprint_error_dev(sc->sc_dev, "%08X | %s\n", error_id,
+		    iwm_desc_lookup(error_id));
+	}
 
 	if (sc->sc_uc.uc_umac_error_event_table)
 		iwm_nic_umac_error(sc);
@@ -7636,6 +7666,15 @@ iwm_softintr(void *arg)
 		aprint_error_dev(sc->sc_dev, "fatal firmware error\n");
  fatal:
 		s = splnet();
+		/*
+		 * Terminate an in-progress scan explicitly: the scan
+		 * completion notification will never arrive, and the
+		 * net80211 scan state would be left dangling otherwise.
+		 */
+		if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING)) {
+			CLR(sc->sc_flags, IWM_FLAG_SCANNING);
+			iwm_endscan(sc);
+		}
 		ifp->if_flags &= ~IFF_UP;
 		iwm_stop(ifp, 1);
 		splx(s);
@@ -8036,6 +8075,18 @@ iwm_attach(device_t parent, device_t self, void *aux)
 			aprint_normal_dev(sc->sc_dev,
 			    "couldn't create load_fw sysctl node\n");
 		}
+#ifdef IWM_DEBUG
+		/* Debug output level sysctl node */
+		if ((err = sysctl_createv(&sc->sc_clog, 0, NULL, &node,
+		    CTLFLAG_READWRITE, CTLTYPE_INT, "debug",
+		    SYSCTL_DESCR("iwm debugging output level"),
+		    NULL, 0, &iwm_debug, 0,
+		    CTL_HW, iwm_sysctl_root_num, iwm_nodenum, CTL_CREATE,
+		    CTL_EOL)) != 0) {
+			aprint_normal_dev(sc->sc_dev,
+			    "couldn't create debug sysctl node\n");
+		}
+#endif
 	}
 
 	callout_init(&sc->sc_calib_to, 0);
