@@ -38,6 +38,10 @@ rkdwpcie*	at fdt?
 # x4 slot; firmware iwlwifi-7260-17.ucode baked into the miniroot.
 iwm*		at pci? dev ? function ?
 
+# iwm firmware-error dumps (iwm_nic_error) for the scan-time fatal
+# firmware error investigation on this board.
+options 	IWM_DEBUG
+
 # Onboard I2C devices (i2c0 PMIC, i2c1 battery RTC + power monitor);
 # rkiic/iic/cpufreqdt/rktsadc come in via GENERIC64.
 rk809pmic*	at iic?

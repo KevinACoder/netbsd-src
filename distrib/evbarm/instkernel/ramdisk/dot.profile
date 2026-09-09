@@ -66,10 +66,14 @@ if [ "X${DONEPROFILE}" = "X" ]; then
 
 	grep() sed -n "/$1/p"
 
-	if [ -x /sysinst ]; then
+	# rk3568 lab: stay in the shell instead of starting sysinst; "touch
+	# /runsysinst" re-enables the installer.  The interactive menu
+	# wastes console time during driver debugging.
+	if [ -x /sysinst ] && [ -f /runsysinst ]; then
 		# run the installation or upgrade script.
 		sysinst || stty sane
 	else
+		echo "sysinst skipped (touch /runsysinst to enable it)."
 		echo "This image contains utilities which may be needed"
 		echo "to get you out of a pinch."
 	fi
