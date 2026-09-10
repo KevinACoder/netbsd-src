@@ -153,7 +153,7 @@ __KERNEL_RCSID(0, "$NetBSD: if_iwm.c,v 1.90 2024/11/10 11:44:36 mlelstv Exp $");
 #ifdef IWM_DEBUG
 #define DPRINTF(x)	do { if (iwm_debug > 0) printf x; } while (0)
 #define DPRINTFN(n, x)	do { if (iwm_debug >= (n)) printf x; } while (0)
-int iwm_debug = 1;
+int iwm_debug = 0;
 #else
 #define DPRINTF(x)	do { ; } while (0)
 #define DPRINTFN(n, x)	do { ; } while (0)
@@ -6238,16 +6238,23 @@ iwm_do_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 
 	case IEEE80211_S_SCAN:
 		/*
-		 * The firmware rejects a second scan request while a scan
-		 * is running (fatal 0xEE8 assertion).  net80211 can ask for
-		 * another scan while one is in progress (e.g. an active
-		 * `list scan` right after up triggered the initial scan).
-		 * Refuse the request: the ioctl then returns an error
-		 * instead of waiting forever for a scan completion that
-		 * never comes.
+		 * Firmware scans all channels at once.  Initialize the
+		 * net80211 scan flags before its next-channel callback
+		 * comes back here to start the firmware scan.
 		 */
-		if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING))
-			return EBUSY;
+		if ((ic->ic_flags & IEEE80211_F_SCAN) == 0) {
+			ieee80211_begin_scan(ic, 0);
+			return 0;
+		}
+		/*
+		 * A scan ioctl resets ic_state to INIT even if firmware
+		 * is still scanning.  Join that scan and restore the state
+		 * needed to receive frames and deliver its completion.
+		 */
+		if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING)) {
+			ic->ic_state = IEEE80211_S_SCAN;
+			return 0;
+		}
 		if (isset(sc->sc_enabled_capa, IWM_UCODE_TLV_CAPA_UMAC_SCAN))
 			err = iwm_umac_scan(sc);
 		else
@@ -6907,7 +6914,7 @@ iwm_stop(struct ifnet *ifp, int disable)
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
 
-	sc->sc_flags &= ~IWM_FLAG_HW_INITED;
+	sc->sc_flags &= ~(IWM_FLAG_HW_INITED | IWM_FLAG_SCANNING);
 	sc->sc_flags |= IWM_FLAG_STOPPED;
 	sc->sc_generation++;
 	ifp->if_flags &= ~(IFF_RUNNING | IFF_OACTIVE);
