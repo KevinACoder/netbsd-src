@@ -571,7 +571,7 @@ iwm_fix_channel(struct iwm_softc *sc, struct mbuf *m)
 	    subtype != IEEE80211_FC0_SUBTYPE_PROBE_RESP)
 		return;
 
-	int chan = le32toh(sc->sc_last_phy_info.channel);
+	int chan = le16toh(sc->sc_last_phy_info.channel);
 	if (chan < __arraycount(ic->ic_channels))
 		ic->ic_curchan = &ic->ic_channels[chan];
 }
@@ -3966,8 +3966,8 @@ iwm_rx_rx_mpdu(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 
 	m_set_rcvif(m, IC2IFP(ic));
 
-	if (le32toh(phy_info->channel) < __arraycount(ic->ic_channels))
-		c = &ic->ic_channels[le32toh(phy_info->channel)];
+	if (le16toh(phy_info->channel) < __arraycount(ic->ic_channels))
+		c = &ic->ic_channels[le16toh(phy_info->channel)];
 
 	s = splnet();
 
