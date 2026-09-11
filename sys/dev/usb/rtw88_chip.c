@@ -72,6 +72,7 @@ static unsigned int rtw88_tx_probe_dbg;
 static unsigned int rtw88_rx_bcn_dbg;
 static unsigned int rtw88_rx_mgmt_dbg;
 static unsigned int rtw88_txpwr_dbg;
+static unsigned int rtw88_tx_data_dbg;
 
 static void
 rtw88_chip_setup_device(struct rtw88_chip *chip, device_t dev)
@@ -218,9 +219,21 @@ rtw88_chip_start(struct rtw88_chip *chip)
 			rtw_write8(rtwdev, 0x0610 + i, lladdr[i]);
 	}
 
-	/* Linux add_interface(): no beacon function on an unlinked port. */
-	rtw_write8_mask(rtwdev, REG_BCN_CTRL,
-	    BIT_EN_BCN_FUNCTION | BIT_DIS_TSF_UDT, 0);
+	/*
+	 * Linux add_interface() (mac80211.c) programs port-0 bcn_ctrl =
+	 * BIT_EN_BCN_FUNCTION with an 0xff mask, i.e. it *enables* the beacon
+	 * function.  Earlier bring-up revisions cleared it; match Linux.
+	 */
+	rtw_write8_mask(rtwdev, REG_BCN_CTRL, 0xff, BIT_EN_BCN_FUNCTION);
+
+	/*
+	 * Bring-up probe: force the RX "accept all" bit so no unicast frame can
+	 * be discarded by the address filter (MACID0/BSSID).  If AUTH/probe
+	 * responses appear with this set but not without it, the blocker is the
+	 * port-0 address filter; otherwise the AUTH never made it onto the air.
+	 * REMOVE before finishing.
+	 */
+	rtw_write32_set(rtwdev, REG_RCR, BIT_AAP);
 
 	/*
 	 * Bring-up: verify the filter registers actually took the writes
@@ -233,10 +246,11 @@ rtw88_chip_start(struct rtw88_chip *chip)
 		for (i = 0; i < 6; i++)
 			rb[i] = rtw_read8(rtwdev, 0x0610 + i);
 		printf("rtw88dbg macid0 rb %02x:%02x:%02x:%02x:%02x:%02x "
-		    "bcn_ctrl 0x%02x flt mgmt 0x%04x ctrl 0x%04x data "
-		    "0x%04x\n",
+		    "bcn_ctrl 0x%02x nettype 0x%08x flt mgmt 0x%04x ctrl 0x%04x "
+		    "data 0x%04x\n",
 		    rb[0], rb[1], rb[2], rb[3], rb[4], rb[5],
 		    rtw_read8(rtwdev, REG_BCN_CTRL),
+		    rtw_read32(rtwdev, 0x0100),
 		    rtw_read16(rtwdev, REG_RXFLTMAP0),
 		    rtw_read16(rtwdev, REG_RXFLTMAP1),
 		    rtw_read16(rtwdev, REG_RXFLTMAP2));
@@ -434,6 +448,18 @@ int
 rtw88_chip_tx(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 {
 
+	/* Bring-up: does the data path (ARP/DHCP/ping) reach the driver? */
+	if (!is_mgmt && rtw88_tx_data_dbg < 40) {
+		const uint8_t *p = mtod(m, const uint8_t *);
+		size_t len = m->m_pkthdr.len;
+		uint16_t fc = len >= 2 ? (uint16_t)(p[0] | (p[1] << 8)) : 0;
+
+		printf("rtw88dbg tx data #%u len %zu fc 0x%04x dst "
+		    "%02x:%02x:%02x:%02x:%02x:%02x\n", rtw88_tx_data_dbg,
+		    len, fc, p[4], p[5], p[6], p[7], p[8], p[9]);
+		rtw88_tx_data_dbg++;
+	}
+
 	return rtw88_chip_tx_frame(chip, m, is_mgmt);
 }
 
@@ -492,6 +518,26 @@ rtw88_chip_mac_addr(const struct rtw88_chip *chip)
 {
 
 	return chip->info.mac_addr;
+}
+
+/*
+ * Bind one peer station's chip-side state (the rtw_sta_info that lives in
+ * the sta/vif drv_priv[] areas) before a station iterator runs.  Linux does
+ * this once in rtw_sta_add(); the shadow mac80211 has no station-add
+ * callback, so the compat iterator calls this first.  Idempotent: the
+ * per-station rtw_update_sta_info() path only needs si->sta/si->vif set.
+ */
+void
+rtw88_sta_init(struct ieee80211_sta *sta, struct ieee80211_vif *vif,
+    struct rtw_dev *rtwdev)
+{
+	struct rtw_sta_info *si = (struct rtw_sta_info *)sta->drv_priv;
+	struct rtw_vif *rtwvif = (struct rtw_vif *)vif->drv_priv;
+
+	si->rtwdev = rtwdev;
+	si->sta = sta;
+	si->vif = vif;
+	si->mac_id = rtwvif->mac_id;
 }
 
 /* ------------------------------------------------------------------ */

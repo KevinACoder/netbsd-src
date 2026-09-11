@@ -41,6 +41,7 @@
 struct ieee80211_hw;
 struct ieee80211_vif;
 struct ieee80211_sta;
+struct rtw_dev;
 
 /* must run before any work item can be queued */
 void	rtw88_workqueue_ready(void);
@@ -59,5 +60,13 @@ struct ieee80211_vif *rtw88_mac80211_vif(struct ieee80211_hw *);
 struct ieee80211_sta *rtw88_mac80211_sta(struct ieee80211_hw *);
 void	rtw88_mac80211_set_sta(struct ieee80211_hw *, const uint8_t *, bool);
 void	rtw88_mac80211_set_assoc(struct ieee80211_hw *, const uint8_t *, bool);
+/*
+ * Bind the chip's per-station view (struct rtw_sta_info, which lives in the
+ * sta/vif drv_priv[] areas) before any station iterator runs.  Linux does
+ * this in rtw_sta_add(); the shadow mac80211 here has no such callback, so
+ * the station iterators call it themselves.
+ */
+void	rtw88_sta_init(struct ieee80211_sta *, struct ieee80211_vif *,
+	    struct rtw_dev *);
 
 #endif /* _RTW88_GLUE_H_ */

@@ -100,6 +100,7 @@ static unsigned int rtw88_tx_sub[RTW88_TX_EP_MAX];
 static unsigned int rtw88_tx_comp[RTW88_TX_EP_MAX];
 static unsigned int rtw88_tx_dump;
 static unsigned int rtw88_rsvd_probe;
+static unsigned int rtw88_h2c_dbg;
 
 static void
 rtw88_trace(const char *fmt, ...)
@@ -571,8 +572,16 @@ rtw88_usb_write_data_h2c(struct rtw_dev *rtwdev, u8 *buf, u32 size)
 	pkt_info.tx_pkt_size = size;
 	pkt_info.qsel = TX_DESC_QSEL_H2C;
 
-	rtw_info(rtwdev, "h2c packet %u bytes, 0x290=0x%02x\n", size,
-	    rtw_read8(rtwdev, REG_RXDMA_MODE));
+	/*
+	 * Bring-up: the coex/scan handshake pushes a 32-byte H2C on every
+	 * channel hop (a few per second), which drowns the serial console and
+	 * hides the AUTH/scan trace.  Print only the first few.
+	 */
+	if (rtw88_h2c_dbg < 8) {
+		rtw_info(rtwdev, "h2c packet %u bytes, 0x290=0x%02x\n", size,
+		    rtw_read8(rtwdev, REG_RXDMA_MODE));
+		rtw88_h2c_dbg++;
+	}
 
 	return rtw88_usb_write_data(rtwdev, &pkt_info, buf);
 }

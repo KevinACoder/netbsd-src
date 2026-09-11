@@ -671,6 +671,12 @@ ieee80211_iterate_stations_atomic(struct ieee80211_hw *hw,
 
 	if (!ctx->sta_valid)
 		return;
+	/*
+	 * The shadow mac80211 never issues a station-add callback, so the chip
+	 * side's per-station state (rtw_sta_info in drv_priv[]) is unbound
+	 * until here.  Without it the iterator dereferences si->sta == NULL.
+	 */
+	rtw88_sta_init(&ctx->sta, &ctx->vif, hw->priv);
 	iterator(data, &ctx->sta);
 }
 
