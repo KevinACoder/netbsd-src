@@ -1343,6 +1343,10 @@ file	dev/ic/sl811hs.c		slhci			needs-flag
 #
 include "external/bsd/dwc2/conf/files.dwc2"
 
+# Realtek rtw88 (RTL8821CU USB)
+#
+include "external/bsd/rtw88/files.rtw88"
+
 # SD Host controller
 device	sdhc: sdmmcbus
 file	dev/sdmmc/sdhc.c		sdhc			needs-flag

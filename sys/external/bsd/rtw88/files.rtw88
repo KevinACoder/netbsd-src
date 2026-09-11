@@ -1,0 +1,55 @@
+#	$NetBSD$
+#
+# Realtek rtw88 chip logic for the RTL8821CU (USB), imported from the
+# dual-licensed (GPL-2.0 OR BSD-3-Clause) lwfinger/rtw88 tree.  The dist
+# files are used unmodified; netbsd/ supplies the Linux API shapes they
+# compile against and the kernel glue they run on.
+#
+# The files carry the rtw88u attribute (the device defined in
+# dev/usb/files.usb) so that they are only built into kernels with the
+# driver, and CPPFLAGS.rtw88u gives them the two private include
+# directories: netbsd/ first, because it provides linux/*.h and
+# net/mac80211.h, then dist/ for the chip headers.
+
+makeoptions	rtw88u	"CPPFLAGS.rtw88u"+="-I$S/external/bsd/rtw88/netbsd"
+makeoptions	rtw88u	"CPPFLAGS.rtw88u"+="-I$S/external/bsd/rtw88/dist"
+
+# CONFIG_RTW88_DEBUG compiles the rtw_dbg() logging in (RTW_DBG_* masks);
+# CONFIG_RTW88_DEBUGFS and CONFIG_RTW88_LEDS stay off, they would need
+# debugfs and the LED class.
+makeoptions	rtw88u	"CPPFLAGS.rtw88u"+="-DCONFIG_RTW88_DEBUG"
+
+# The imported code casts away const and volatile in a few spots; those
+# warnings are not actionable here (the files are used unmodified).
+makeoptions	rtw88u	"CWARNFLAGS.rtw88u"+="-Wno-cast-qual"
+makeoptions	rtw88u	"CWARNFLAGS.rtw88u"+="-Wno-discarded-qualifiers"
+# the Linux sources do arithmetic on void pointers
+makeoptions	rtw88u	"CWARNFLAGS.rtw88u"+="-Wno-pointer-arith"
+# read-modify-write helpers trip the uninitialised-use analysis
+makeoptions	rtw88u	"CWARNFLAGS.rtw88u"+="-Wno-maybe-uninitialized"
+
+# compat layer (sk_buff, workqueue, completion, firmware(9), mac80211 stubs)
+file	external/bsd/rtw88/netbsd/rtw88_compat.c	rtw88u
+
+# imported chip logic, used as-is
+file	external/bsd/rtw88/dist/main.c			rtw88u
+file	external/bsd/rtw88/dist/util.c			rtw88u
+file	external/bsd/rtw88/dist/tx.c			rtw88u
+file	external/bsd/rtw88/dist/rx.c			rtw88u
+file	external/bsd/rtw88/dist/mac.c			rtw88u
+file	external/bsd/rtw88/dist/phy.c			rtw88u
+file	external/bsd/rtw88/dist/coex.c			rtw88u
+file	external/bsd/rtw88/dist/efuse.c			rtw88u
+file	external/bsd/rtw88/dist/fw.c			rtw88u
+file	external/bsd/rtw88/dist/ps.c			rtw88u
+file	external/bsd/rtw88/dist/sec.c			rtw88u
+file	external/bsd/rtw88/dist/bf.c			rtw88u
+file	external/bsd/rtw88/dist/regd.c			rtw88u
+file	external/bsd/rtw88/dist/sar.c			rtw88u
+file	external/bsd/rtw88/dist/rtw8821c.c		rtw88u
+file	external/bsd/rtw88/dist/rtw8821c_table.c		rtw88u
+file	external/bsd/rtw88/dist/debug.c			rtw88u
+
+# usbdi(9) transport and the chip/net80211 glue
+file	dev/usb/rtw88_usb.c				rtw88u
+file	dev/usb/rtw88_chip.c				rtw88u
