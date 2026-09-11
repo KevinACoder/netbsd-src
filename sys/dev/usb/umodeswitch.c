@@ -62,6 +62,13 @@ static int umodeswitch_detach(device_t, int);
 CFATTACH_DECL2_NEW(umodeswitch, 0, umodeswitch_match,
     umodeswitch_attach, umodeswitch_detach, NULL, NULL, NULL);
 
+/*
+ * Lab: result of the last send_bulkmsg() transfer, for the mode-switch
+ * wrappers that need to report why a device did (not) flip personality.
+ */
+static usbd_status umodeswitch_last_status;
+static uint32_t umodeswitch_last_count;
+
 static int
 send_bulkmsg(struct usbd_device *dev, void *cmd, size_t cmdlen)
 {
@@ -70,7 +77,8 @@ send_bulkmsg(struct usbd_device *dev, void *cmd, size_t cmdlen)
 	usb_endpoint_descriptor_t *ed;
 	struct usbd_pipe *pipe;
 	struct usbd_xfer *xfer;
-	int err, i;
+	usb_config_descriptor_t *cdesc;
+	int err, i, j, pass;
 
 	/* Move the device into the configured state. */
 	err = usbd_set_config_index(dev, 0, 0);
@@ -79,25 +87,45 @@ send_bulkmsg(struct usbd_device *dev, void *cmd, size_t cmdlen)
 		return UMATCH_NONE;
 	}
 
-	err = usbd_device2interface_handle(dev, 0, &iface);
-	if (err != 0) {
-		aprint_error("%s: failed to get interface\n", __func__);
-		return UMATCH_NONE;
-	}
-
-	id = usbd_get_interface_descriptor(iface);
+	/*
+	 * Prefer the mass-storage interface (like usb_modeswitch does), and
+	 * fall back to interface 0 when no interface advertises it.
+	 */
+	cdesc = usbd_get_config_descriptor(dev);
+	iface = NULL;
+	id = NULL;
 	ed = NULL;
-	for (i = 0 ; i < id->bNumEndpoints ; i++) {
-		ed = usbd_interface2endpoint_descriptor(iface, i);
-		if (ed == NULL)
-			continue;
-		if (UE_GET_DIR(ed->bEndpointAddress) != UE_DIR_OUT)
-			continue;
-		if ((ed->bmAttributes & UE_XFERTYPE) == UE_BULK)
-			break;
-	}
+	for (pass = 0; pass < 2 && ed == NULL; pass++) {
+		unsigned nif = cdesc != NULL ? cdesc->bNumInterface : 1;
+		for (i = 0; i < nif; i++) {
+			if (usbd_device2interface_handle(dev, i, &iface) != 0)
+				continue;
+			id = usbd_get_interface_descriptor(iface);
+			if (id == NULL)
+				continue;
+			if (pass == 0 && id->bInterfaceClass != 8)
+				continue;
+			ed = NULL;
+			for (j = 0; j < id->bNumEndpoints; j++) {
+				usb_endpoint_descriptor_t *eed;
 
-	if (i == id->bNumEndpoints)
+				eed = usbd_interface2endpoint_descriptor(iface, j);
+				if (eed == NULL)
+					continue;
+				if (UE_GET_DIR(eed->bEndpointAddress) != UE_DIR_OUT)
+					continue;
+				if ((eed->bmAttributes & UE_XFERTYPE) != UE_BULK)
+					continue;
+				ed = eed;
+				break;
+			}
+			if (ed != NULL)
+				break;
+		}
+		if (pass == 1 && ed == NULL)
+			return UMATCH_NONE;
+	}
+	if (ed == NULL)
 		return UMATCH_NONE;
 
 	err = usbd_open_pipe(iface, ed->bEndpointAddress,
@@ -116,6 +144,8 @@ send_bulkmsg(struct usbd_device *dev, void *cmd, size_t cmdlen)
 
 		err = usbd_transfer(xfer);
 
+		usbd_get_xfer_status(xfer, NULL, NULL, &umodeswitch_last_count,
+		    &umodeswitch_last_status);
 #if 0 /* XXXpooka: at least my huawei "fails" this always, but still detaches */
 		if (err)
 			aprint_error("%s: transfer failed\n", __func__);
@@ -355,6 +385,94 @@ u3g_4gsystems_reinit(struct usbd_device *dev)
 }
 
 /*
+ * Realtek USB wireless adapters (RTL8811CU/RTL8821CU family) come up as a
+ * fake CD-ROM drive ("Realtek Driver Storage") holding a Windows driver.
+ * A SCSI START/STOP UNIT with LoEj set makes them re-enumerate as an
+ * 802.11ac NIC.  The message is the one usb_modeswitch sends for 0bda:1a2b;
+ * only the CBW tag differs from u3g_bulk_scsi_eject().
+ */
+static int
+realtek_rtl8821cu_reinit(struct usbd_device *dev)
+{
+	unsigned char cmd[31];
+	usb_config_descriptor_t *cdesc;
+	usb_interface_descriptor_t *id;
+	usb_endpoint_descriptor_t *ed;
+	struct usbd_interface *iface;
+	int attempt, i, j, rv = UMATCH_HIGHEST;
+
+	memset(cmd, 0, sizeof(cmd));
+	/* Byte 0..3: Command Block Wrapper (CBW) signature */
+	set_cbw(cmd);
+	/* 4..7: CBW Tag, has to be unique, but only a single transfer is used. */
+	cmd[4] = 0x12;
+	cmd[5] = 0x34;
+	cmd[6] = 0x56;
+	cmd[7] = 0x78;
+	/* 8..11: CBW Transfer Length, no data here */
+	/* 12: CBW Flag: output, so 0 */
+	/* 13: CBW Lun: 0 */
+	/* 14: CBW Length */
+	cmd[14] = 0x06;
+
+	/* Rest is the SCSI payload */
+
+	/* 0: SCSI START/STOP opcode */
+	cmd[15] = 0x1b;
+	/* 1..3 unused */
+	/* 4: LoEj */
+	cmd[19] = 0x02;
+	/* 5: unused */
+
+	/*
+	 * Lab: dump the fake-CD personality's layout so the endpoint the
+	 * message has to go to can be verified against the Linux record.
+	 */
+	(void)usbd_set_config_index(dev, 0, 0);
+	cdesc = usbd_get_config_descriptor(dev);
+	if (cdesc != NULL) {
+		for (i = 0; i < cdesc->bNumInterface; i++) {
+			if (usbd_device2interface_handle(dev, i, &iface) != 0)
+				continue;
+			id = usbd_get_interface_descriptor(iface);
+			if (id == NULL)
+				continue;
+			aprint_normal("umodeswitch: if %d class %#x/%#x/%#x,"
+			    " %d endpoints\n", id->bInterfaceNumber,
+			    id->bInterfaceClass, id->bInterfaceSubClass,
+			    id->bInterfaceProtocol, id->bNumEndpoints);
+			for (j = 0; j < id->bNumEndpoints; j++) {
+				ed = usbd_interface2endpoint_descriptor(iface, j);
+				if (ed != NULL)
+					aprint_normal("umodeswitch:   ep %#x attr"
+					    " %#x maxpkt %d\n",
+					    ed->bEndpointAddress, ed->bmAttributes,
+					    UGETW(ed->wMaxPacketSize));
+			}
+		}
+	}
+
+	/*
+	 * Lab: send the eject up to three times.  The transfer result and
+	 * byte count are reported (usb_modeswitch only warns on failure, so
+	 * the in-kernel path has to be equally tolerant here).
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		rv = send_bulkmsg(dev, cmd, sizeof(cmd));
+		aprint_normal("umodeswitch: Realtek eject attempt %d: status %d"
+		    " (%s), count %u\n", attempt + 1,
+		    (int)umodeswitch_last_status,
+		    usbd_errstr(umodeswitch_last_status),
+		    (unsigned)umodeswitch_last_count);
+		if (umodeswitch_last_status == USBD_NORMAL_COMPLETION)
+			break;
+		delay(100000);
+	}
+
+	return rv;
+}
+
+/*
  * First personality:
  *
  * Claim the entire device if a mode-switch is required.
@@ -447,6 +565,11 @@ umodeswitch_match(device_t parent, cfdata_t match, void *aux)
 		default:
 			break;
 		}
+
+	case USB_VENDOR_REALTEK:
+		if (uaa->uaa_product == USB_PRODUCT_REALTEK_RTL8821CU_CD)
+			return realtek_rtl8821cu_reinit(uaa->uaa_device);
+		break;
 
 	default:
 		break;
