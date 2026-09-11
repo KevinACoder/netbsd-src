@@ -49,6 +49,8 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/kmem.h>
 #include <sys/mutex.h>
 #include <sys/condvar.h>
+#include <sys/kthread.h>
+#include <sys/queue.h>
 #include <sys/callout.h>
 #include <sys/workqueue.h>
 #include <sys/device.h>
@@ -153,71 +155,130 @@ rtw88_skb_queue_purge(struct sk_buff_head *q)
 /* ------------------------------------------------------------------ */
 
 /*
- * One NetBSD workqueue for every rtw88 work item: the chip code expects
- * queue_work() to run its items on a thread (it takes mutexes and sleeps),
- * and a single worker also gives the serialisation the Linux side gets from
- * the mac80211 workqueue.
+ * Deferred work runs on a private thread rather than workqueue(9): work items
+ * are queued from USB completion callbacks, which run in softint context and
+ * must not take a sleeping mutex.  The pending list is guarded by a spin
+ * mutex and the worker is poked with wakeup(), both of which are safe from
+ * any context.
  */
-static struct workqueue *rtw88_wq;
-static int rtw88_wq_refs;
-static kmutex_t rtw88_wq_lock;
-static bool rtw88_wq_lock_ready;
+struct rtw88_work_item {
+	SIMPLEQ_ENTRY(rtw88_work_item) wi_entry;
+	struct work_struct *wi_work;
+};
+
+static SIMPLEQ_HEAD(, rtw88_work_item) rtw88_pending =
+    SIMPLEQ_HEAD_INITIALIZER(rtw88_pending);
+static kmutex_t rtw88_pending_mtx;
+static bool rtw88_worker_started;
+static bool rtw88_ready;
 
 static void
-rtw88_workqueue_worker(struct work *wk, void *arg)
+rtw88_workqueue_worker(void *arg)
 {
-	struct work_struct *w = container_of(wk, struct work_struct, wk_work);
+	struct rtw88_work_item *item;
+	struct work_struct *w;
 
-	(void)arg;
-	w->wk_queued = false;
-	w->wk_func(w);
+	for (;;) {
+		mutex_enter(&rtw88_pending_mtx);
+		item = SIMPLEQ_FIRST(&rtw88_pending);
+		if (item != NULL)
+			SIMPLEQ_REMOVE_HEAD(&rtw88_pending, wi_entry);
+		mutex_exit(&rtw88_pending_mtx);
+
+		if (item == NULL) {
+			/* wakeup() from the producer cuts this short */
+			kpause("rtw88wq", false, 1, NULL);
+			continue;
+		}
+
+		w = item->wi_work;
+		kmem_free(item, sizeof(*item));
+
+		/* the item may requeue itself from inside wk_func() */
+		w->wk_queued = 0;
+		atomic_store_relaxed(&w->wk_running, 1);
+		w->wk_func(w);
+		atomic_store_relaxed(&w->wk_running, 0);
+	}
+}
+
+void
+rtw88_workqueue_ready(void)
+{
+	lwp_t *lwp;
+	int error;
+
+	if (rtw88_ready)
+		return;
+	rtw88_ready = true;
+	netbsd_spin_mutex_init(&rtw88_pending_mtx);
+
+	error = kthread_create(PRI_NONE, 0, NULL, rtw88_workqueue_worker,
+	    NULL, &lwp, "rtw88wq");
+	if (error != 0) {
+		printf("rtw88: cannot start the work thread (%d)\n", error);
+		return;
+	}
+	rtw88_worker_started = true;
 }
 
 struct workqueue *
 rtw88_workqueue_alloc(const char *name)
 {
-	char qname[16];
 
-	mutex_enter(&rtw88_wq_lock);
-	if (rtw88_wq == NULL) {
-		snprintf(qname, sizeof(qname), "rtw88");
-		if (workqueue_create(&rtw88_wq, qname, rtw88_workqueue_worker,
-		    NULL, PRI_NONE, IPL_NONE, WQ_MPSAFE) != 0) {
-			mutex_exit(&rtw88_wq_lock);
-			return NULL;
-		}
-	}
-	rtw88_wq_refs++;
-	mutex_exit(&rtw88_wq_lock);
-	return rtw88_wq;
-}
-
-void
-rtw88_workqueue_free(struct workqueue *wq)
-{
-
-	if (wq == NULL)
-		return;
-	mutex_enter(&rtw88_wq_lock);
-	if (--rtw88_wq_refs == 0 && rtw88_wq != NULL) {
-		workqueue_destroy(rtw88_wq);
-		rtw88_wq = NULL;
-	}
-	mutex_exit(&rtw88_wq_lock);
+	rtw88_workqueue_ready();
+	/* the queue is a singleton; the handle is only a token */
+	return rtw88_worker_started ? (struct workqueue *)&rtw88_pending : NULL;
 }
 
 /*
- * Called from the driver's attach before any work can be queued, so the
- * workqueue mutex is always initialised before its first use.
+ * The chip code calls destroy_workqueue() from failure paths that may run on
+ * the rtw88 worker itself (rtw_core_init() bailing out, for example), so the
+ * thread is kept for the lifetime of the kernel.
  */
 void
-rtw88_workqueue_ready(void)
+rtw88_workqueue_free(struct workqueue *wq)
+{
+	(void)wq;
+}
+
+/*
+ * Wait for a work item that is queued or currently running.  There is no way
+ * to cancel an item that has not run yet, so this is a flush, which is what
+ * the callers (rtw_core_stop and friends) actually need before tearing state
+ * down.
+ */
+void
+rtw88_work_flush(struct work_struct *w)
 {
 
-	if (!rtw88_wq_lock_ready) {
-		netbsd_mutex_init(&rtw88_wq_lock);
-		rtw88_wq_lock_ready = true;
+	while (w->wk_queued != 0 || w->wk_running)
+		kpause("rtw88fl", false, 1, NULL);
+}
+
+/*
+ * Queue an item for the worker: safe from softint and callout context.
+ */
+void
+rtw88_work_enqueue_safe(struct work_struct *w)
+{
+	struct rtw88_work_item *item;
+
+	if (!rtw88_worker_started)
+		return;
+	if (atomic_cas_uint(&w->wk_queued, 0, 1) != 0)
+		return;
+
+	item = kmem_alloc(sizeof(*item), KM_NOSLEEP);
+	if (item == NULL) {
+		w->wk_queued = 0;
+		return;
 	}
+	item->wi_work = w;
+	mutex_enter(&rtw88_pending_mtx);
+	SIMPLEQ_INSERT_TAIL(&rtw88_pending, item, wi_entry);
+	mutex_exit(&rtw88_pending_mtx);
+	wakeup(&rtw88_pending);
 }
 
 void
@@ -228,8 +289,6 @@ rtw88_delayed_work_callout(void *arg)
 	dw->dw_scheduled = false;
 	if (dw->dw_cancel)
 		return;
-	if (dw->work.wk_wq == NULL)
-		dw->work.wk_wq = rtw88_wq;
 	rtw88_work_enqueue(&dw->work);
 }
 
@@ -240,6 +299,67 @@ rtw88_timer_callout(void *arg)
 
 	tl->tl_pending = false;
 	tl->tl_func(tl);
+}
+
+/* ------------------------------------------------------------------ */
+/* deferred calls                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * net80211 calls into the driver at splnet, but the chip code below sleeps,
+ * so those paths are deferred here and run on the rtw88 workqueue.
+ */
+/*
+ * The work item cannot be freed from inside its own callback (the workqueue
+ * still walks it afterwards), so deferred calls are taken from a small pool
+ * whose entries are recycled.
+ */
+#define	RTW88_ASYNC_CALLS	16
+
+struct rtw88_async_call {
+	struct work_struct	work;
+	void			(*fn)(void *);
+	void			*arg;
+	volatile unsigned int	in_use;
+	bool			initialised;
+};
+
+static struct rtw88_async_call rtw88_async_calls[RTW88_ASYNC_CALLS];
+static unsigned int rtw88_async_call_next;
+
+static void
+rtw88_async_call_cb(struct work_struct *work)
+{
+	struct rtw88_async_call *call =
+	    container_of(work, struct rtw88_async_call, work);
+
+	call->fn(call->arg);
+	call->in_use = 0;
+}
+
+int
+rtw88_call_async(void (*fn)(void *), void *arg)
+{
+	struct rtw88_async_call *call;
+	unsigned int i, slot;
+
+	for (i = 0; i < RTW88_ASYNC_CALLS; i++) {
+		slot = (rtw88_async_call_next + i) % RTW88_ASYNC_CALLS;
+		call = &rtw88_async_calls[slot];
+		if (atomic_cas_uint(&call->in_use, 0, 1) != 0)
+			continue;
+		call->fn = fn;
+		call->arg = arg;
+		if (!call->initialised) {
+			call->initialised = true;
+			INIT_WORK(&call->work, rtw88_async_call_cb);
+		}
+		rtw88_async_call_next = slot + 1;
+		rtw88_work_enqueue(&call->work);
+		return 0;
+	}
+
+	return EAGAIN;
 }
 
 /* ------------------------------------------------------------------ */

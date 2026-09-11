@@ -89,6 +89,7 @@ struct rtw88_usb {
 	struct usbd_interface	*iface;
 
 	kmutex_t		reg_mtx;
+	kmutex_t		tx_mtx;	/* serialises TX submission */
 	uint32_t		usb_data[128];
 	unsigned int		usb_data_index;
 

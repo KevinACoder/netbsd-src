@@ -242,11 +242,17 @@ rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 		return EINVAL;
 	}
 
-	skb = alloc_skb(len, GFP_ATOMIC);
+	/*
+	 * The transport pushes the TX descriptor in front of the frame, so the
+	 * buffer needs the headroom mac80211 would otherwise reserve
+	 * (hw->extra_tx_headroom = chip->tx_pkt_desc_sz).
+	 */
+	skb = alloc_skb(rtwdev->chip->tx_pkt_desc_sz + len, GFP_ATOMIC);
 	if (skb == NULL) {
 		m_freem(m);
 		return ENOMEM;
 	}
+	skb_reserve(skb, rtwdev->chip->tx_pkt_desc_sz);
 	m_copydata(m, 0, len, skb_put(skb, len));
 	m_freem(m);
 

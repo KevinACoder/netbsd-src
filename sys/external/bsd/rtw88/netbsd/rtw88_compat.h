@@ -490,49 +490,87 @@ u32p_replace_bits(u32 *p, u32 v, u32 mask)
 #define	GFP_NOWAIT		KM_NOSLEEP
 #define	__GFP_ZERO		0x80000000
 
+/*
+ * Linux allocations carry no size at free time, but kmem_free() requires it,
+ * so every block gets a size header that kfree()/vfree() peel off again.
+ */
+static __always_inline __unused void *
+rtw88_kmem_alloc(size_t size, int flags, bool zero)
+{
+	size_t *p;
+
+	p = kmem_alloc(size + sizeof(size_t), flags);
+	if (p == NULL)
+		return NULL;
+	if (zero)
+		memset(p, 0, size + sizeof(size_t));
+	*p = size;
+	return p + 1;
+}
+
+static __always_inline __unused void
+rtw88_kmem_free(const void *ptr)
+{
+	size_t *p;
+
+	if (ptr == NULL)
+		return;
+	p = (size_t *)(uintptr_t)ptr - 1;
+	kmem_free(p, *p + sizeof(size_t));
+}
+
 static __always_inline __unused void *
 kmalloc(size_t size, gfp_t flags)
 {
-	return kmem_alloc(size, (int)flags);
+	return rtw88_kmem_alloc(size, (int)flags, false);
 }
 
 static __always_inline __unused void *
 kzalloc(size_t size, gfp_t flags)
 {
-	return kmem_zalloc(size, (int)flags);
+	return rtw88_kmem_alloc(size, (int)flags, true);
 }
 
 static __always_inline __unused void *
 kcalloc(size_t n, size_t size, gfp_t flags)
 {
-	return kmem_zalloc(n * size, (int)flags);
+	return rtw88_kmem_alloc(n * size, (int)flags, true);
 }
 
 static __always_inline __unused void
 kfree(const void *p)
 {
-	if (p != NULL)
-		kmem_free((void *)(uintptr_t)p, 0);
+	rtw88_kmem_free(p);
 }
 
 static __always_inline __unused void *
 kmemdup(const void *src, size_t len, gfp_t flags)
 {
-	void *p = kmem_alloc(len, (int)flags);
+	void *p = kmalloc(len, flags);
 
 	if (p != NULL)
 		memcpy(p, src, len);
 	return p;
 }
 
-#define	vmalloc(size)		kmem_alloc((size), KM_SLEEP)
-#define	vzalloc(size)		kmem_zalloc((size), KM_SLEEP)
-#define	kvmalloc(size, flags)	kmem_alloc((size), (int)(flags))
+static __always_inline __unused void *
+vmalloc(size_t size)
+{
+	return rtw88_kmem_alloc(size, KM_SLEEP, false);
+}
+
+static __always_inline __unused void *
+vzalloc(size_t size)
+{
+	return rtw88_kmem_alloc(size, KM_SLEEP, true);
+}
+
+#define	kvmalloc(size, flags)	kmalloc((size), (flags))
+
 static __always_inline __unused void
 vfree(const void *p)
 {
-	if (p != NULL)
-		kmem_free((void *)(uintptr_t)p, 0);
+	rtw88_kmem_free(p);
 }
 
 /*
@@ -543,14 +581,14 @@ static __always_inline __unused void *
 devm_kmalloc(struct device *dev, size_t size, gfp_t flags)
 {
 	(void)dev;
-	return kmem_alloc(size, (int)flags);
+	return kmalloc(size, flags);
 }
 
 static __always_inline __unused void *
 devm_kzalloc(struct device *dev, size_t size, gfp_t flags)
 {
 	(void)dev;
-	return kmem_zalloc(size, (int)flags);
+	return kzalloc(size, flags);
 }
 
 static __always_inline __unused void *
@@ -801,6 +839,13 @@ static __always_inline __unused void
 netbsd_mutex_destroy(kmutex_t *m)
 {
 	mutex_destroy(m);
+}
+
+/* spin mutex: safe to take from softint context */
+static __always_inline __unused void
+netbsd_spin_mutex_init(kmutex_t *m)
+{
+	mutex_init(m, MUTEX_SPIN, IPL_VM);
 }
 
 static __always_inline __unused void
@@ -1069,7 +1114,8 @@ struct work_struct {
 	struct work		wk_work;
 	work_func_t		wk_func;
 	struct workqueue	*wk_wq;
-	volatile bool		wk_queued;
+	volatile unsigned int	wk_queued;
+	volatile unsigned int	wk_running;
 };
 
 struct delayed_work {
@@ -1092,10 +1138,11 @@ struct workqueue_struct {
  */
 struct workqueue *rtw88_workqueue_alloc(const char *name);
 void	rtw88_workqueue_free(struct workqueue *);
+void	rtw88_work_flush(struct work_struct *);
 
 #define	INIT_WORK(w, f)		do {					\
 	(w)->wk_func = (f);						\
-	(w)->wk_queued = false;						\
+	(w)->wk_queued = 0;						\
 } while (0)
 
 #define	INIT_DELAYED_WORK(w, f)	do {					\
@@ -1110,13 +1157,19 @@ void	rtw88_workqueue_free(struct workqueue *);
 #define	DECLARE_DELAYED_WORK(w, f)	struct delayed_work w = {	\
 					.work = { .wk_func = (f) } }
 
+/*
+ * NetBSD's workqueue panics if the same work item is queued twice (it has no
+ * per-item pending state of its own), so queueing is made idempotent here:
+ * an item that has not run yet is not queued again.
+ */
+void	rtw88_work_enqueue_safe(struct work_struct *);
+
 static __always_inline __unused void
 rtw88_work_enqueue(struct work_struct *w)
 {
 	if (w->wk_wq == NULL)
 		w->wk_wq = rtw88_workqueue_alloc("rtw88");
-	w->wk_queued = true;
-	workqueue_enqueue(w->wk_wq, &w->wk_work, NULL);
+	rtw88_work_enqueue_safe(w);
 }
 
 #define	queue_work(wq, w)						\
@@ -1167,14 +1220,15 @@ cancel_delayed_work_sync(struct delayed_work *dw)
 	bool was = cancel_delayed_work(dw);
 
 	callout_halt(&dw->dw_callout, NULL);
+	rtw88_work_flush(&dw->work);
 	return was;
 }
 
 #define	cancel_work(w)		((void)0)
-#define	cancel_work_sync(w)	do { } while (0)
+#define	cancel_work_sync(w)	rtw88_work_flush(w)
 #define	flush_workqueue(wq)	do { } while (0)
-#define	flush_work(w)		do { } while (0)
-#define	flush_delayed_work(w)	do { } while (0)
+#define	flush_work(w)		rtw88_work_flush(w)
+#define	flush_delayed_work(w)	rtw88_work_flush(&(w)->work)
 #define	destroy_workqueue(wq)	rtw88_workqueue_free((wq)->wq_wq)
 
 static __always_inline __unused struct workqueue_struct *

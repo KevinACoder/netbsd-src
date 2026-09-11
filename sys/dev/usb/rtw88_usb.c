@@ -310,10 +310,11 @@ rtw88_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 }
 
 static void
-rtw88_usb_tx_work(struct work_struct *w)
+rtw88_usb_tx_submit(struct rtw88_usb *usb)
 {
-	struct rtw88_usb *usb = container_of(w, struct rtw88_usb, tx_work);
 	int i;
+
+	mutex_enter(&usb->tx_mtx);
 
 	for (i = 0; i < usb->n_tx_pipe; i++) {
 		struct sk_buff *skb;
@@ -358,6 +359,15 @@ rtw88_usb_tx_work(struct work_struct *w)
 			}
 		}
 	}
+	mutex_exit(&usb->tx_mtx);
+}
+
+static void
+rtw88_usb_tx_work(struct work_struct *w)
+{
+	struct rtw88_usb *usb = container_of(w, struct rtw88_usb, tx_work);
+
+	rtw88_usb_tx_submit(usb);
 }
 
 static int
@@ -395,7 +405,13 @@ rtw88_usb_tx_kick_off(struct rtw_dev *rtwdev)
 {
 	struct rtw88_usb *usb = rtw88_usb_from_dev(rtwdev);
 
-	rtw88_work_enqueue(&usb->tx_work);
+	/*
+	 * Submit right away rather than through the workqueue: the chip code
+	 * polls the hardware for packets it has just queued (firmware and
+	 * reserved page download) and would otherwise wait for a workqueue
+	 * that it is itself occupying.
+	 */
+	rtw88_usb_tx_submit(usb);
 }
 
 /*
@@ -407,7 +423,6 @@ rtw88_usb_write_data(struct rtw_dev *rtwdev,
     struct rtw_tx_pkt_info *pkt_info, u8 *buf)
 {
 	const struct rtw_chip_info *chip = rtwdev->chip;
-	struct rtw_tx_desc *pkt_desc;
 	struct sk_buff *skb;
 	unsigned int size = pkt_info->tx_pkt_size;
 	int ret;
@@ -416,12 +431,9 @@ rtw88_usb_write_data(struct rtw_dev *rtwdev,
 	if (skb == NULL)
 		return -ENOMEM;
 
+	/* room for the descriptor that rtw88_usb_tx_write() pushes later */
 	skb_reserve(skb, chip->tx_pkt_desc_sz);
 	skb_put_data(skb, buf, size);
-	pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
-	memset(pkt_desc, 0, chip->tx_pkt_desc_sz);
-	rtw_tx_fill_tx_desc(rtwdev, pkt_info, pkt_desc);
-	rtw_tx_fill_txdesc_checksum(rtwdev, pkt_info, pkt_desc);
 
 	ret = rtw88_usb_tx_write(rtwdev, pkt_info, skb);
 	if (ret == 0)
@@ -755,6 +767,7 @@ rtw88_usb_attach(struct rtw88_chip *chip, struct usbd_interface *iface)
 
 	usb->rtwdev = rtwdev;
 	netbsd_mutex_init(&usb->reg_mtx);
+	netbsd_mutex_init(&usb->tx_mtx);
 	rtw88_skb_queue_init(&usb->rx_queue);
 	for (i = 0; i < RTW88_TX_EP_MAX; i++) {
 		rtw88_skb_queue_init(&usb->tx_queue[i]);
@@ -835,4 +848,5 @@ rtw88_usb_detach(struct rtw88_chip *chip)
 	for (i = 0; i < usb->n_tx_pipe; i++)
 		usbd_close_pipe(usb->tx_pipe[i]);
 	netbsd_mutex_destroy(&usb->reg_mtx);
+	netbsd_mutex_destroy(&usb->tx_mtx);
 }
