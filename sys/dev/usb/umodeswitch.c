@@ -65,9 +65,75 @@ CFATTACH_DECL2_NEW(umodeswitch, 0, umodeswitch_match,
 /*
  * Lab: result of the last send_bulkmsg() transfer, for the mode-switch
  * wrappers that need to report why a device did (not) flip personality.
+ * The CSW pair reports the status stage of a Bulk-Only transaction.
  */
 static usbd_status umodeswitch_last_status;
 static uint32_t umodeswitch_last_count;
+static usbd_status umodeswitch_last_csw_status;
+static uint32_t umodeswitch_last_csw_count;
+
+/* Time to let the device settle before the interface is released. */
+#define	UMODESWITCH_RELEASE_DELAY	100000	/* us */
+
+/*
+ * Lab: read the 13 byte Command Status Wrapper that ends a Bulk-Only
+ * transaction.  usb_modeswitch does this whenever the message content starts
+ * with the CBW signature (the "55534243" test in its sources) and only then
+ * waits and releases the interface; several Realtek sticks acknowledge the
+ * eject command but do not flip personality until the status stage of the
+ * command has been read.  A failure here is expected when the device leaves
+ * the bus mid-transaction, so it is reported through the
+ * umodeswitch_last_csw_* variables instead of aborting the mode switch.
+ */
+static void
+read_csw(struct usbd_interface *iface, usb_interface_descriptor_t *id)
+{
+	usb_endpoint_descriptor_t *eed;
+	struct usbd_pipe *pipe;
+	struct usbd_xfer *xfer;
+	uint8_t buf[13];
+	int err, j;
+
+	umodeswitch_last_csw_status = USBD_NOT_STARTED;
+	umodeswitch_last_csw_count = 0;
+
+	for (j = 0; j < id->bNumEndpoints; j++) {
+		eed = usbd_interface2endpoint_descriptor(iface, j);
+		if (eed == NULL)
+			continue;
+		if (UE_GET_DIR(eed->bEndpointAddress) != UE_DIR_IN)
+			continue;
+		if ((eed->bmAttributes & UE_XFERTYPE) != UE_BULK)
+			continue;
+		break;
+	}
+	if (j == id->bNumEndpoints)
+		return;
+
+	err = usbd_open_pipe(iface, eed->bEndpointAddress,
+	    USBD_EXCLUSIVE_USE, &pipe);
+	if (err != 0) {
+		umodeswitch_last_csw_status = (usbd_status)err;
+		return;
+	}
+
+	if (usbd_create_xfer(pipe, sizeof(buf), 0, 0, &xfer) == 0) {
+		memset(buf, 0, sizeof(buf));
+		usbd_setup_xfer(xfer, NULL, buf, sizeof(buf),
+		    USBD_SYNCHRONOUS | USBD_SHORT_XFER_OK,
+		    USBD_DEFAULT_TIMEOUT, NULL);
+		err = usbd_transfer(xfer);
+		usbd_get_xfer_status(xfer, NULL, NULL,
+		    &umodeswitch_last_csw_count,
+		    &umodeswitch_last_csw_status);
+		usbd_destroy_xfer(xfer);
+	} else {
+		umodeswitch_last_csw_status = USBD_NOMEM;
+	}
+
+	usbd_abort_pipe(pipe);
+	usbd_close_pipe(pipe);
+}
 
 static int
 send_bulkmsg(struct usbd_device *dev, void *cmd, size_t cmdlen)
@@ -153,6 +219,22 @@ send_bulkmsg(struct usbd_device *dev, void *cmd, size_t cmdlen)
 		err = 0;
 #endif
 		usbd_destroy_xfer(xfer);
+
+		/*
+		 * Lab: a message that starts with the CBW signature carries a
+		 * SCSI command, so the device expects the host to fetch the
+		 * status.  Only a completed Bulk-Only transaction makes some
+		 * of these sticks act on the command (usb_modeswitch does the
+		 * same for its "55534243" messages).
+		 */
+		if (((const uint8_t *)cmd)[0] == 0x55 &&
+		    ((const uint8_t *)cmd)[1] == 0x53 &&
+		    ((const uint8_t *)cmd)[2] == 0x42 &&
+		    ((const uint8_t *)cmd)[3] == 0x43)
+			read_csw(iface, id);
+
+		/* Give the device a moment before the interface is released. */
+		delay(UMODESWITCH_RELEASE_DELAY);
 	} else {
 		aprint_error("%s: failed to allocate xfer\n", __func__);
 		err = USBD_NOMEM;
@@ -460,10 +542,14 @@ realtek_rtl8821cu_reinit(struct usbd_device *dev)
 	for (attempt = 0; attempt < 3; attempt++) {
 		rv = send_bulkmsg(dev, cmd, sizeof(cmd));
 		aprint_normal("umodeswitch: Realtek eject attempt %d: status %d"
-		    " (%s), count %u\n", attempt + 1,
+		    " (%s), count %u, csw %d (%s), csw count %u\n",
+		    attempt + 1,
 		    (int)umodeswitch_last_status,
 		    usbd_errstr(umodeswitch_last_status),
-		    (unsigned)umodeswitch_last_count);
+		    (unsigned)umodeswitch_last_count,
+		    (int)umodeswitch_last_csw_status,
+		    usbd_errstr(umodeswitch_last_csw_status),
+		    (unsigned)umodeswitch_last_csw_count);
 		if (umodeswitch_last_status == USBD_NORMAL_COMPLETION)
 			break;
 		delay(100000);
