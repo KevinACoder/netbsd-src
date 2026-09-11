@@ -677,7 +677,14 @@ static void query_phy_status(struct rtw_dev *rtwdev, u8 *phy_status,
 		query_phy_status_page1(rtwdev, phy_status, pkt_stat);
 		break;
 	default:
-		rtw_warn(rtwdev, "unused phy status page (%d)\n", page);
+		/* bring-up: rate-limited, floods the console otherwise */
+		{
+			static unsigned int rtw88_ps_page_warn;
+
+			if (rtw88_ps_page_warn++ < 30)
+				rtw_warn(rtwdev,
+				    "unused phy status page (%d)\n", page);
+		}
 		return;
 	}
 }

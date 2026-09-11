@@ -868,6 +868,20 @@ rtw88_usb_dbg_dump(struct rtw_dev *rtwdev)
 		    "probe 0x290: saved 0x%02x w0x55->r 0x%02x restore->r 0x%02x\n",
 		    saved, before, after);
 	}
+
+	/* latched by the phy table loaders (dist/phy.c, bring-up only) */
+	{
+		extern unsigned int rtw88_dark_kind, rtw88_dark_n;
+		extern unsigned int rtw88_dark_addr, rtw88_dark_data;
+
+		if (rtw88_dark_kind != 0)
+			rtw_info(rtwdev,
+			    "domain dark: kind %u entry %u addr 0x%x data 0x%x\n",
+			    rtw88_dark_kind, rtw88_dark_n, rtw88_dark_addr,
+			    rtw88_dark_data);
+		else
+			rtw_info(rtwdev, "domain dark: no\n");
+	}
 }
 
 /* ------------------------------------------------------------------ */

@@ -1420,11 +1420,19 @@ void	rtw88_skb_queue_purge(struct sk_buff_head *);
 #define	skb_queue_purge(q)	rtw88_skb_queue_purge(q)
 #define	skb_peek(q)		((q)->next)
 #define	skb_queue_walk(q, skb)						\
-	for ((skb) = (q)->next; (skb) != NULL; (skb) = (skb)->next)
+	for ((skb) = (q)->next;						\
+	     (skb) != (struct sk_buff *)(q);				\
+	     (skb) = (skb)->next)
+/*
+ * The queue head terminates the list (rtw88_skb_queue_init sets q->next
+ * = (struct sk_buff *)q), so the walk must stop on the head - testing
+ * for NULL instead iterates the head itself and the caller frees or
+ * dereferences a struct sk_buff_head as if it were a packet.
+ */
 #define	skb_queue_walk_safe(q, skb, tmp)				\
-	for ((skb) = (q)->next, (tmp) = (skb) ? (skb)->next : NULL;	\
-	     (skb) != NULL;						\
-	     (skb) = (tmp), (tmp) = (skb) ? (skb)->next : NULL)
+	for ((skb) = (q)->next, (tmp) = (skb)->next;			\
+	     (skb) != (struct sk_buff *)(q);				\
+	     (skb) = (tmp), (tmp) = (skb)->next)
 
 static __always_inline __unused unsigned int
 skb_headlen(const struct sk_buff *skb)
