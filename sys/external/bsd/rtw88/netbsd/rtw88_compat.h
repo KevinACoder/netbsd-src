@@ -750,8 +750,32 @@ struct va_format {
 	va_list		*va;
 };
 
+/*
+ * The dist print helpers funnel everything through dev_printk(); the debug
+ * paths (rtw_dbg et. al.) use the Linux "%pV" wrapped-format convention,
+ * which NetBSD's printf does not understand -- without the special case it
+ * prints the pointer instead of the message.
+ */
+static __unused void
+rtw88_vdev_printk(struct device *dev, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	printf("%s: ", dev->name);
+	if (strstr(fmt, "%pV") != NULL) {
+		const struct va_format *vaf = va_arg(ap,
+		    const struct va_format *);
+
+		vprintf(vaf->fmt, *vaf->va);
+	} else {
+		vprintf(fmt, ap);
+	}
+	va_end(ap);
+}
+
 #define	dev_printk(level, dev, fmt, ...)				\
-	printf("%s: " fmt, (dev)->name, ##__VA_ARGS__)
+	rtw88_vdev_printk((dev), (fmt), ##__VA_ARGS__)
 #define	dev_err(dev, fmt, ...)	dev_printk(KERN_ERR, dev, fmt, ##__VA_ARGS__)
 #define	dev_warn(dev, fmt, ...)	dev_printk(KERN_WARNING, dev, fmt, ##__VA_ARGS__)
 #define	dev_info(dev, fmt, ...)	dev_printk(KERN_INFO, dev, fmt, ##__VA_ARGS__)

@@ -84,9 +84,51 @@ static void	rtw88_usb_rx_submit(struct rtw88_rx_xfer *);
 /* ------------------------------------------------------------------ */
 
 /*
+ * Bring-up instrumentation: a rate-limited trace of every register access
+ * (address, width, value).  It is armed by the chip-start glue so the efuse
+ * probe does not burn the budget, and goes silent after the limit to keep
+ * the console usable.  Remove once the bring-up is closed.
+ */
+static unsigned int rtw88_trace_left;
+/* Bring-up instrumentation counters (rx bulk completions / tx ring full). */
+static unsigned int rtw88_rx_dbg;
+static unsigned int rtw88_tx_dbg;
+static unsigned int rtw88_tx_nobuf;
+
+static void
+rtw88_trace(const char *fmt, ...)
+{
+	va_list ap;
+
+	if (rtw88_trace_left == 0)
+		return;
+	if (rtw88_trace_left == 1) {
+		rtw88_trace_left = 0;
+		printf("rtw88t: trace limit hit, muting\n");
+		return;
+	}
+	printf("rtw88t %u: ", 1500 - rtw88_trace_left);
+	rtw88_trace_left--;
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+}
+
+void
+rtw88_trace_arm(unsigned int n)
+{
+
+	rtw88_trace_left = n;
+	if (n != 0)
+		printf("rtw88t: armed for %u lines\n", n);
+}
+
+/*
  * Register accesses go through vendor control requests; on the 8821C the
  * always-powered sections additionally need one byte written to 0x4e0 after
- * a read (the "register security" workaround of the vendor driver).
+ * every access, reads and writes alike (the "register security" workaround
+ * of the vendor driver; missing it after writes leaves the power-on sequence
+ * and the firmware download with silently dropped write steps).
  */
 static void
 rtw88_usb_reg_sec(struct rtw_dev *rtwdev, u32 addr, __le32 *data)
@@ -144,10 +186,14 @@ rtw88_usb_read(struct rtw_dev *rtwdev, u32 addr, u16 len)
 		rtw_dbg(rtwdev, RTW_DBG_USB,
 		    "%s: read 0x%x len %u failed: %s\n", __func__, addr, len,
 		    usbd_errstr(err));
+		rtw88_trace("rd%u 0x%x FAILED %s\n", len, addr,
+		    usbd_errstr(err));
 		return 0;
 	}
 
 	rtw88_usb_reg_sec(rtwdev, addr, data);
+
+	rtw88_trace("rd%u 0x%x = 0x%08x\n", len, addr, le32_to_cpu(*data));
 
 	return le32_to_cpu(*data);
 }
@@ -199,6 +245,10 @@ rtw88_usb_write(struct rtw_dev *rtwdev, u32 addr, u32 val, int len)
 		rtw_dbg(rtwdev, RTW_DBG_USB,
 		    "%s: write 0x%x len %d failed: %s\n", __func__, addr, len,
 		    usbd_errstr(err));
+	else
+		rtw88_trace("wr%u 0x%x <- 0x%08x\n", len, addr, val);
+
+	rtw88_usb_reg_sec(rtwdev, addr, data);
 }
 
 static void
@@ -297,6 +347,11 @@ rtw88_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	struct rtw88_tx_xfer *tx = priv;
 	struct rtw88_usb *usb = tx->usb;
 
+	if (rtw88_tx_dbg < 10)
+		printf("rtw88dbg tx done #%u: ep %d status %d\n",
+		    rtw88_tx_dbg, tx->ep, status);
+	rtw88_tx_dbg++;
+
 	if (tx->skb != NULL) {
 		rtw88_skb_free(tx->skb);
 		tx->skb = NULL;
@@ -324,9 +379,12 @@ rtw88_usb_tx_submit(struct rtw88_usb *usb)
 		while ((skb = rtw88_skb_dequeue(&usb->tx_queue[i])) != NULL) {
 			tx = TAILQ_FIRST(&usb->tx_free[i]);
 			if (tx == NULL) {
-				rtw_err(usb->rtwdev,
-				    "%s: no free tx buffer on pipe %d\n",
-				    __func__, i);
+				if (rtw88_tx_nobuf < 3) {
+					rtw_err(usb->rtwdev,
+					    "%s: no free tx buffer on pipe %d\n",
+					    __func__, i);
+					rtw88_tx_nobuf++;
+				}
 				rtw88_skb_free(skb);
 				continue;
 			}
@@ -511,6 +569,13 @@ rtw88_usb_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	}
 
 	usbd_get_xfer_status(xfer, NULL, NULL, &len, NULL);
+
+	/* Bring-up instrumentation: are bulk IN transfers completing? */
+	if (len > 0 && (rtw88_rx_dbg < 30 || (rtw88_rx_dbg % 500) == 0))
+		printf("rtw88dbg rx #%u: %u bytes\n", rtw88_rx_dbg, len);
+	if (len > 0)
+		rtw88_rx_dbg++;
+
 	if (len > 0) {
 		skb = alloc_skb(len, GFP_ATOMIC);
 		if (skb != NULL) {
@@ -764,6 +829,9 @@ rtw88_usb_attach(struct rtw88_chip *chip, struct usbd_interface *iface)
 	struct rtw88_usb *usb = &chip->usb;
 	struct rtw_dev *rtwdev = &chip->rtwdev;
 	int i, ret;
+
+	/* Bring-up instrumentation: trace writes, firmware and state changes. */
+	rtw_debug_mask |= RTW_DBG_USB | RTW_DBG_FW | RTW_DBG_STATE;
 
 	usb->rtwdev = rtwdev;
 	netbsd_mutex_init(&usb->reg_mtx);

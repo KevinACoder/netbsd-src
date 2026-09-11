@@ -703,7 +703,8 @@ rtw88_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 
 	case SIOCADDMULTI:
 	case SIOCDELMULTI:
-		error = ether_ioctl(ifp, cmd, data);
+		if ((error = ether_ioctl(ifp, cmd, data)) == ENETRESET)
+			error = 0;
 		break;
 
 	default:
@@ -712,10 +713,22 @@ rtw88_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 	}
 
 	if (error == ENETRESET) {
+		/*
+		 * net80211 asks for a refresh of hardware settings (channel,
+		 * filters).  A full chip restart (MAC power cycle + firmware
+		 * download) is disruptive and not what this asks for: bring
+		 * the chip up only if it is not running yet, otherwise just
+		 * reprogram the radio and let the state machine push the rest.
+		 */
 		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) ==
 		    (IFF_UP | IFF_RUNNING) &&
-		    (ic->ic_opmode != IEEE80211_M_MONITOR))
-			rtw88_init(ifp);
+		    ic->ic_roaming != IEEE80211_ROAMING_MANUAL) {
+			if (!sc->sc_chip_started)
+				rtw88_init(ifp);
+			else if (sc->sc_chip != NULL)
+				rtw88_chip_set_channel(sc->sc_chip,
+				    ieee80211_chan2ieee(ic, ic->ic_curchan));
+		}
 		error = 0;
 	}
 

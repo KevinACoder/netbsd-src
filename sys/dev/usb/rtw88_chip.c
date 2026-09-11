@@ -57,6 +57,9 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include "rtw88var.h"
 
+/* Bring-up instrumentation: demuxed rx packet counter. */
+static unsigned int rtw88_rx_pkt_dbg;
+
 static void
 rtw88_chip_setup_device(struct rtw88_chip *chip, device_t dev)
 {
@@ -112,6 +115,10 @@ rtw88_chip_attach(struct usbd_device *udev, struct usbd_interface *iface,
 		goto err_core;
 	}
 
+	rtw_info(rtwdev, "chip id %u, cut %u, sys_cfg 0x%08x\n",
+	    rtwdev->chip->id, rtwdev->hal.cut_version,
+	    rtwdev->hal.chip_version);
+
 	error = rtw_register_hw(rtwdev, chip->hw);
 	if (error != 0) {
 		rtw_err(rtwdev, "failed to initialise the device\n");
@@ -154,6 +161,8 @@ rtw88_chip_start(struct rtw88_chip *chip)
 	struct rtw_dev *rtwdev = &chip->rtwdev;
 	int error;
 
+	rtw_info(rtwdev, "chip start begin\n");
+	rtw88_trace_arm(1500);
 	mutex_lock(&rtwdev->mutex);
 	error = rtw_core_start(rtwdev);
 	mutex_unlock(&rtwdev->mutex);
@@ -161,6 +170,16 @@ rtw88_chip_start(struct rtw88_chip *chip)
 		rtw_err(rtwdev, "failed to start the chip (%d)\n", error);
 		return error;
 	}
+	rtw88_trace_arm(0);
+	rtw_info(rtwdev, "chip start done\n");
+	/*
+	 * Bring-up probes: the firmware asserts BIT_WINTINI_RDY and friends
+	 * in REG_MCUFW_CTRL while booting; REG_HMETFR shows whether the H2C
+	 * mailboxes are free (bits clear) or still owned by the firmware.
+	 */
+	rtw_info(rtwdev, "fw state: MCUFW_CTRL 0x%08x HMETFR 0x%02x\n",
+	    rtw_read32(rtwdev, REG_MCUFW_CTRL), rtw_read8(rtwdev, REG_HMETFR));
+	rtw88_trace_arm(150);
 	chip->started = true;
 	return 0;
 }
@@ -172,6 +191,7 @@ rtw88_chip_stop(struct rtw88_chip *chip)
 
 	if (!chip->started)
 		return;
+	rtw_info(rtwdev, "chip stop\n");
 	mutex_lock(&rtwdev->mutex);
 	rtw_core_stop(rtwdev);
 	mutex_unlock(&rtwdev->mutex);
@@ -369,6 +389,15 @@ rtw88_chip_rx_work(struct work_struct *w)
 			rx_buf = rx_desc + pkt_desc_sz;
 			rtw_rx_query_rx_desc(rtwdev, rx_desc, rx_buf, &pkt_stat,
 			    &rx_status);
+
+			/* Bring-up instrumentation: what does the demux see? */
+			if (rtw88_rx_pkt_dbg < 30)
+				printf("rtw88dbg rxpkt #%u: len %u drvinfo %u "
+				    "shift %u c2h %d rssi %d\n", rtw88_rx_pkt_dbg,
+				    pkt_stat.pkt_len, pkt_stat.drv_info_sz,
+				    pkt_stat.shift, pkt_stat.is_c2h,
+				    pkt_stat.rssi);
+			rtw88_rx_pkt_dbg++;
 
 			pkt_offset = pkt_desc_sz + pkt_stat.drv_info_sz +
 			    pkt_stat.shift;
