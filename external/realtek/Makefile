@@ -3,7 +3,7 @@
 .include <bsd.own.mk>
 
 .if ${MKFIRMWARE} != "no"
-SUBDIR+=	rtwn urtwn
+SUBDIR+=	rtwn urtwn rtw88
 .endif
 
 .include <bsd.subdir.mk>

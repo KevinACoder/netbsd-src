@@ -259,6 +259,9 @@
 ./libdata/firmware/if_urtwn/rtl8192cfw.bin	base-firmware-root	firmware
 ./libdata/firmware/if_urtwn/rtl8192cfwU.bin	base-firmware-root	firmware
 ./libdata/firmware/if_urtwn/rtl8192eefw.bin	base-firmware-root	firmware
+./libdata/firmware/if_rtw88			base-firmware-root
+./libdata/firmware/if_rtw88/Realtek-Firmware-License.txt	base-firmware-root	firmware
+./libdata/firmware/if_rtw88/rtw8821c_fw.bin	base-firmware-root	firmware
 ./libdata/firmware/if_wpi			base-firmware-root
 ./libdata/firmware/if_wpi/LICENSE.ipw3945-ucode	base-obsolete	obsolete,firmware
 ./libdata/firmware/if_wpi/LICENSE.iwlwifi-3945-ucode	base-firmware-root	firmware
