@@ -540,6 +540,13 @@ device	urtwn: ether, ifnet, arp, wlan, firmload
 attach	urtwn at usbdevif
 file	dev/usb/if_urtwn.c              urtwn
 
+# Realtek RTL8811CU/RTL8821CU 802.11ac (rtw88 family)
+# ("rtw88" cannot be a device name: config(1) rejects base names that end
+# in a digit, hence the USB-style "rtw88u".)
+device	rtw88u: ether, ifnet, arp, wlan, firmload
+attach	rtw88u at usbdevif
+file	dev/usb/if_rtw88.c		rtw88u
+
 # Realtek RTL8187/RTL8187B 802.11b/g USB wireless adapter
 device	urtw: ether, ifnet, arp, wlan
 attach	urtw at usbdevif
