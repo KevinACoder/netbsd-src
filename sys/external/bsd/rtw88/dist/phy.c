@@ -1813,10 +1813,27 @@ void rtw_phy_cfg_mac(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 }
 EXPORT_SYMBOL(rtw_phy_cfg_mac);
 
+/* bring-up probe: find the entry after which the switchable domain dies */
+static unsigned int rtw88_bb_probe, rtw88_agc_probe, rtw88_rf_probe;
+static bool rtw88_domain_dark;
+
+static void rtw88_domain_probe(struct rtw_dev *rtwdev, const char *what,
+			       unsigned int n)
+{
+	if (rtw88_domain_dark)
+		return;
+	if (rtw_read8(rtwdev, 0x290) != 0xea)
+		return;
+	rtw88_domain_dark = true;
+	rtw_err(rtwdev, "DOMAIN DARK after %u %s entries\n", what, n);
+}
+
 void rtw_phy_cfg_agc(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 		     u32 addr, u32 data)
 {
 	rtw_write32(rtwdev, addr, data);
+	if ((rtw88_agc_probe++ & 0x7f) == 0)
+		rtw88_domain_probe(rtwdev, "agc", rtw88_agc_probe - 1);
 }
 EXPORT_SYMBOL(rtw_phy_cfg_agc);
 
@@ -1837,6 +1854,8 @@ void rtw_phy_cfg_bb(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 		udelay(1);
 	else
 		rtw_write32(rtwdev, addr, data);
+	if ((rtw88_bb_probe++ & 0x7f) == 0)
+		rtw88_domain_probe(rtwdev, "bb", rtw88_bb_probe - 1);
 }
 EXPORT_SYMBOL(rtw_phy_cfg_bb);
 
@@ -1849,6 +1868,8 @@ void rtw_phy_cfg_rf(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 		usleep_range(100, 110);
 	} else {
 		rtw_write_rf(rtwdev, tbl->rf_path, addr, RFREG_MASK, data);
+		if ((rtw88_rf_probe++ & 0x7f) == 0)
+			rtw88_domain_probe(rtwdev, "rf", rtw88_rf_probe - 1);
 		udelay(1);
 	}
 }

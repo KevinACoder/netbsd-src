@@ -143,6 +143,7 @@ rtw88_usb_from_dev(struct rtw_dev *rtwdev)
 int	rtw88_usb_attach(struct rtw88_chip *, struct usbd_interface *);
 void	rtw88_usb_detach(struct rtw88_chip *);
 const struct rtw_hci_ops *rtw88_usb_get_ops(void);
+void	rtw88_usb_dbg_dump(struct rtw_dev *);
 void	rtw88_trace_arm(unsigned int);
 
 /* rtw88_chip.c: runs on the rtw88 workqueue, feeding the net80211 driver */

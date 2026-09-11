@@ -162,7 +162,7 @@ rtw88_chip_start(struct rtw88_chip *chip)
 	int error;
 
 	rtw_info(rtwdev, "chip start begin\n");
-	rtw88_trace_arm(1500);
+	rtw88_trace_arm(0);
 	mutex_lock(&rtwdev->mutex);
 	error = rtw_core_start(rtwdev);
 	mutex_unlock(&rtwdev->mutex);
@@ -179,6 +179,7 @@ rtw88_chip_start(struct rtw88_chip *chip)
 	 */
 	rtw_info(rtwdev, "fw state: MCUFW_CTRL 0x%08x HMETFR 0x%02x\n",
 	    rtw_read32(rtwdev, REG_MCUFW_CTRL), rtw_read8(rtwdev, REG_HMETFR));
+	rtw88_usb_dbg_dump(rtwdev);
 	rtw88_trace_arm(150);
 	chip->started = true;
 	return 0;

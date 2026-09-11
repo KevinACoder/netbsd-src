@@ -94,6 +94,12 @@ static unsigned int rtw88_trace_left;
 static unsigned int rtw88_rx_dbg;
 static unsigned int rtw88_tx_dbg;
 static unsigned int rtw88_tx_nobuf;
+/* Per-pipe submit/complete pairing and a hex dump of the first transmitted
+ * descriptors, to be compared byte-for-byte with the Linux lane. */
+static unsigned int rtw88_tx_sub[RTW88_TX_EP_MAX];
+static unsigned int rtw88_tx_comp[RTW88_TX_EP_MAX];
+static unsigned int rtw88_tx_dump;
+static unsigned int rtw88_rsvd_probe;
 
 static void
 rtw88_trace(const char *fmt, ...)
@@ -351,6 +357,8 @@ rtw88_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 		printf("rtw88dbg tx done #%u: ep %d status %d\n",
 		    rtw88_tx_dbg, tx->ep, status);
 	rtw88_tx_dbg++;
+	if (tx->ep >= 0 && tx->ep < RTW88_TX_EP_MAX)
+		rtw88_tx_comp[tx->ep]++;
 
 	if (tx->skb != NULL) {
 		rtw88_skb_free(tx->skb);
@@ -401,6 +409,31 @@ rtw88_usb_tx_submit(struct rtw88_usb *usb)
 
 			memcpy(tx->buf, skb->data, skb->len);
 			tx->skb = skb;
+
+			rtw88_tx_sub[i]++;
+			/*
+			 * Dump BEFORE usbd_transfer(): the completion callback
+			 * can run synchronously inside usbd_transfer and free
+			 * the skb, so nothing owned by the skb may be touched
+			 * afterwards (the usbd buffer itself stays valid).
+			 */
+			if (rtw88_tx_dump < 3) {
+				const uint8_t *p = tx->buf;
+				unsigned int len = skb->len;
+				unsigned int n;
+
+				printf("rtw88dbg tx dump #%u: pipe %d len %u\n",
+				    rtw88_tx_dump, i, len);
+				for (n = 0; n < 48; n++)
+					printf("%02x%s", p[n],
+					    (n % 16 == 15) ? "\n" : " ");
+				printf("rtw88dbg tx dump #%u data:",
+				    rtw88_tx_dump);
+				for (n = 48; n < len && n < 80; n++)
+					printf(" %02x", p[n]);
+				printf("\n");
+				rtw88_tx_dump++;
+			}
 
 			usbd_setup_xfer(tx->xfer, tx, tx->buf, skb->len,
 			    USBD_FORCE_SHORT_XFER, RTW88_TX_TIMEOUT,
@@ -508,6 +541,20 @@ rtw88_usb_write_data_rsvd_page(struct rtw_dev *rtwdev, u8 *buf, u32 size)
 	const struct rtw_chip_info *chip = rtwdev->chip;
 	struct rtw_tx_pkt_info pkt_info = {0};
 
+	/*
+	 * Bring-up probe: 0x290 lives in the switchable register domain.
+	 * Reads of 0xea mean the domain went dark; sample it periodically
+	 * during the firmware download to find the step that kills it.
+	 * From page 57 on, arm the register trace so the download tail,
+	 * the download end flow and mac_init land in the serial ring.
+	 */
+	if ((rtw88_rsvd_probe++ & 0x0f) == 0 &&
+	    rtw_read8(rtwdev, REG_RXDMA_MODE) == 0xea)
+		printf("rtw88dbg domain dark at rsvd page #%u\n",
+		    rtw88_rsvd_probe - 1);
+	if (rtw88_rsvd_probe == 57)
+		rtw88_trace_arm(500);
+
 	pkt_info.tx_pkt_size = size;
 	pkt_info.qsel = TX_DESC_QSEL_BEACON;
 	pkt_info.offset = chip->tx_pkt_desc_sz;
@@ -523,6 +570,9 @@ rtw88_usb_write_data_h2c(struct rtw_dev *rtwdev, u8 *buf, u32 size)
 
 	pkt_info.tx_pkt_size = size;
 	pkt_info.qsel = TX_DESC_QSEL_H2C;
+
+	rtw_info(rtwdev, "h2c packet %u bytes, 0x290=0x%02x\n", size,
+	    rtw_read8(rtwdev, REG_RXDMA_MODE));
 
 	return rtw88_usb_write_data(rtwdev, &pkt_info, buf);
 }
@@ -609,6 +659,17 @@ rtw88_usb_start(struct rtw_dev *rtwdev)
 	for (i = 0; i < RTW88_RX_XFER_NUM; i++)
 		rtw88_usb_rx_submit(&usb->rx[i]);
 
+	/* H2C queue pointers right after RX arming, before general_info and
+	 * phydm_info are pushed over bulk OUT; the chip-start dump repeats
+	 * them so a delta tells whether the device took the packets. */
+	rtw_info(rtwdev,
+	    "h2cq pre-gi: head 0x%08x tail 0x%08x read 0x%08x info 0x%02x pktw 0x%08x pktr 0x%08x\n",
+	    rtw_read32(rtwdev, REG_H2C_HEAD), rtw_read32(rtwdev, REG_H2C_TAIL),
+	    rtw_read32(rtwdev, REG_H2C_READ_ADDR),
+	    rtw_read8(rtwdev, REG_H2C_INFO),
+	    rtw_read32(rtwdev, REG_H2C_PKT_WRITEADDR),
+	    rtw_read32(rtwdev, REG_H2C_PKT_READADDR));
+
 	return 0;
 }
 
@@ -637,6 +698,10 @@ rtw88_usb_interface_cfg(struct rtw_dev *rtwdev)
 	struct rtw88_usb *usb = rtw88_usb_from_dev(rtwdev);
 	u8 rxdma, burst_size;
 
+	/* bring-up probe: domain health right before the mac-init tail */
+	rtw_info(rtwdev, "interface_cfg entry: 0x290=0x%02x\n",
+	    rtw_read8(rtwdev, REG_RXDMA_MODE));
+
 	rxdma = BIT_DMA_BURST_CNT | BIT_DMA_MODE;
 
 	if (usb->udev->ud_speed == USB_SPEED_HIGH)
@@ -648,6 +713,9 @@ rtw88_usb_interface_cfg(struct rtw_dev *rtwdev)
 
 	rtw_write8(rtwdev, REG_RXDMA_MODE, rxdma);
 	rtw_write16_set(rtwdev, REG_TXDMA_OFFSET_CHK, BIT_DROP_DATA_EN);
+
+	rtw_info(rtwdev, "interface_cfg exit: 0x290=0x%02x\n",
+	    rtw_read8(rtwdev, REG_RXDMA_MODE));
 }
 
 static void
@@ -708,6 +776,98 @@ rtw88_usb_get_ops(void)
 {
 
 	return &rtw88_usb_ops;
+}
+
+/*
+ * Bring-up forensics, called by the chip-start glue right after the firmware
+ * handshake: per-pipe TX pairing counters plus every register the mac-init
+ * chain programs, to be diffed against the Linux lane's debugfs read_reg.
+ */
+void
+rtw88_usb_dbg_dump(struct rtw_dev *rtwdev)
+{
+	struct rtw_fifo_conf *fifo = &rtwdev->fifo;
+	unsigned int i;
+
+	for (i = 0; i < RTW88_TX_EP_MAX; i++)
+		printf("rtw88dbg pipe %u: submitted %u completed %u\n",
+		    i, rtw88_tx_sub[i], rtw88_tx_comp[i]);
+
+	rtw_info(rtwdev,
+	    "fifo host side: boundary %u pg %u acq %u h2cq 0x%x fwtx 0x%x\n",
+	    fifo->rsvd_boundary, fifo->rsvd_pg_num, fifo->acq_pg_num,
+	    fifo->rsvd_h2cq_addr, fifo->rsvd_fw_txbuf_addr);
+
+	rtw_info(rtwdev,
+	    "h2cq: head 0x%08x tail 0x%08x read 0x%08x info 0x%02x pktw 0x%08x pktr 0x%08x csr 0x%08x\n",
+	    rtw_read32(rtwdev, REG_H2C_HEAD), rtw_read32(rtwdev, REG_H2C_TAIL),
+	    rtw_read32(rtwdev, REG_H2C_READ_ADDR),
+	    rtw_read8(rtwdev, REG_H2C_INFO),
+	    rtw_read32(rtwdev, REG_H2C_PKT_WRITEADDR),
+	    rtw_read32(rtwdev, REG_H2C_PKT_READADDR),
+	    rtw_read32(rtwdev, REG_H2CQ_CSR));
+
+	rtw_info(rtwdev,
+	    "regs: CR 0x%08x pqmap 0x%04x rxff_bndy 0x%08x llt 0x%08x offset_chk 0x%08x\n",
+	    rtw_read32(rtwdev, REG_CR), rtw_read16(rtwdev, REG_TXDMA_PQ_MAP),
+	    rtw_read32(rtwdev, REG_RXFF_BNDY),
+	    rtw_read32(rtwdev, REG_AUTO_LLT_V1),
+	    rtw_read32(rtwdev, REG_TXDMA_OFFSET_CHK));
+
+	rtw_info(rtwdev,
+	    "regs: fpage_ctrl2 0x%08x txdma_status 0x%08x rxdma_status 0x%08x rxdma_mode 0x%02x\n",
+	    rtw_read32(rtwdev, REG_FIFOPAGE_CTRL_2),
+	    rtw_read32(rtwdev, REG_TXDMA_STATUS),
+	    rtw_read32(rtwdev, REG_RXDMA_STATUS),
+	    rtw_read8(rtwdev, REG_RXDMA_MODE));
+
+	rtw_info(rtwdev,
+	    "regs: fpage_info %04x %04x %04x %04x %04x\n",
+	    rtw_read16(rtwdev, REG_FIFOPAGE_INFO_1),
+	    rtw_read16(rtwdev, REG_FIFOPAGE_INFO_2),
+	    rtw_read16(rtwdev, REG_FIFOPAGE_INFO_3),
+	    rtw_read16(rtwdev, REG_FIFOPAGE_INFO_4),
+	    rtw_read16(rtwdev, REG_FIFOPAGE_INFO_5));
+
+	rtw_info(rtwdev,
+	    "regs: fwhw_txq 0x%08x bcnq_bdyny 0x%04x bcnq1_bdyny 0x%04x rxagg 0x%04x drvinfo_sz 0x%02x\n",
+	    rtw_read32(rtwdev, REG_FWHW_TXQ_CTRL),
+	    rtw_read16(rtwdev, REG_BCNQ_BDNY_V1),
+	    rtw_read16(rtwdev, REG_BCNQ1_BDNY_V1),
+	    rtw_read16(rtwdev, REG_RXDMA_AGG_PG_TH),
+	    rtw_read8(rtwdev, REG_RX_DRVINFO_SZ));
+
+	rtw_info(rtwdev,
+	    "regs: rcr 0x%08x sys_status1+1 0x%02x 0x10c3 0x%02x mcufw 0x%08x hmetfr 0x%02x\n",
+	    rtw_read32(rtwdev, REG_RCR),
+	    rtw_read8(rtwdev, REG_SYS_STATUS1 + 1),
+	    rtw_read8(rtwdev, 0x10c3),
+	    rtw_read32(rtwdev, REG_MCUFW_CTRL),
+	    rtw_read8(rtwdev, REG_HMETFR));
+
+	rtw_info(rtwdev,
+	    "regs: dmem_con 0x%08x rsv_ctrl 0x%02x sys_func_en 0x%02x cr_ext3 0x%02x\n",
+	    rtw_read32(rtwdev, REG_CPU_DMEM_CON),
+	    rtw_read8(rtwdev, REG_RSV_CTRL),
+	    rtw_read8(rtwdev, REG_SYS_FUNC_EN),
+	    rtw_read8(rtwdev, REG_CR_EXT + 3));
+
+	/*
+	 * Write/readback probe on an off-section register: separates "domain
+	 * dark (reads filler, writes void)" from "alive but unprogrammed".
+	 */
+	{
+		uint8_t saved, before, after;
+
+		saved = rtw_read8(rtwdev, REG_RXDMA_MODE);
+		rtw_write8(rtwdev, REG_RXDMA_MODE, 0x55);
+		before = rtw_read8(rtwdev, REG_RXDMA_MODE);
+		rtw_write8(rtwdev, REG_RXDMA_MODE, saved);
+		after = rtw_read8(rtwdev, REG_RXDMA_MODE);
+		rtw_info(rtwdev,
+		    "probe 0x290: saved 0x%02x w0x55->r 0x%02x restore->r 0x%02x\n",
+		    saved, before, after);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -831,7 +991,7 @@ rtw88_usb_attach(struct rtw88_chip *chip, struct usbd_interface *iface)
 	int i, ret;
 
 	/* Bring-up instrumentation: trace writes, firmware and state changes. */
-	rtw_debug_mask |= RTW_DBG_USB | RTW_DBG_FW | RTW_DBG_STATE;
+	rtw_debug_mask |= RTW_DBG_USB;
 
 	usb->rtwdev = rtwdev;
 	netbsd_mutex_init(&usb->reg_mtx);
