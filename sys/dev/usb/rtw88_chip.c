@@ -146,6 +146,9 @@ rtw88_chip_attach(struct usbd_device *udev, struct usbd_interface *iface,
 	memcpy(info->fw_version, chip->hw->wiphy->fw_version,
 	    sizeof(info->fw_version));
 	info->efuse_valid = is_valid_ether_addr(rtwdev->efuse.addr);
+	/* chip->info is an embedded copy; keep it in sync so the chip-side
+	 * code (MACID0 programming) sees the real address. */
+	chip->info = *info;
 
 	rtw_info(rtwdev, "RTL8821CU ready (firmware %s)\n",
 	    chip->hw->wiphy->fw_version);
@@ -213,6 +216,30 @@ rtw88_chip_start(struct rtw88_chip *chip)
 
 		for (i = 0; i < 6; i++)		/* ETHER_ADDR_LEN */
 			rtw_write8(rtwdev, 0x0610 + i, lladdr[i]);
+	}
+
+	/* Linux add_interface(): no beacon function on an unlinked port. */
+	rtw_write8_mask(rtwdev, REG_BCN_CTRL,
+	    BIT_EN_BCN_FUNCTION | BIT_DIS_TSF_UDT, 0);
+
+	/*
+	 * Bring-up: verify the filter registers actually took the writes
+	 * (the USB vendor read path does not decode every register).
+	 */
+	{
+		uint8_t rb[6];
+		int i;
+
+		for (i = 0; i < 6; i++)
+			rb[i] = rtw_read8(rtwdev, 0x0610 + i);
+		printf("rtw88dbg macid0 rb %02x:%02x:%02x:%02x:%02x:%02x "
+		    "bcn_ctrl 0x%02x flt mgmt 0x%04x ctrl 0x%04x data "
+		    "0x%04x\n",
+		    rb[0], rb[1], rb[2], rb[3], rb[4], rb[5],
+		    rtw_read8(rtwdev, REG_BCN_CTRL),
+		    rtw_read16(rtwdev, REG_RXFLTMAP0),
+		    rtw_read16(rtwdev, REG_RXFLTMAP1),
+		    rtw_read16(rtwdev, REG_RXFLTMAP2));
 	}
 
 	/*
@@ -423,8 +450,16 @@ rtw88_chip_set_callbacks(struct rtw88_chip *chip, void *ctx,
 void
 rtw88_chip_set_assoc(struct rtw88_chip *chip, const uint8_t *bssid, bool assoc)
 {
+	struct rtw_dev *rtwdev = &chip->rtwdev;
 
 	chip->assoc = assoc;
+	/* PORT_SET_NET_TYPE / beacon function: managed+beacon once linked,
+	 * unlinked-no-beacon otherwise, like Linux's bss_info_changed. */
+	rtw_write32_mask(rtwdev, 0x0100, 0x30000,
+	    assoc ? RTW_NET_MGD_LINKED : RTW_NET_NO_LINK);
+	if (assoc)
+		rtw_write8_mask(rtwdev, REG_BCN_CTRL,
+		    BIT_EN_BCN_FUNCTION, BIT_EN_BCN_FUNCTION);
 	rtw88_mac80211_set_assoc(chip->hw, bssid, assoc);
 	rtw88_mac80211_set_sta(chip->hw, bssid, assoc);
 }
@@ -443,9 +478,6 @@ rtw88_chip_set_bssid(struct rtw88_chip *chip, const uint8_t *bssid)
 	 */
 	for (i = 0; i < 6; i++)		/* ETHER_ADDR_LEN */
 		rtw_write8(rtwdev, 0x0618 + i, bssid[i]);
-
-	/* PORT_SET_NET_TYPE: net type = managed/station (REG_CR 16-17). */
-	rtw_write32_mask(rtwdev, 0x0100, 0x30000, RTW_NET_MGD_LINKED);
 }
 
 bool
