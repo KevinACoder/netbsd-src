@@ -313,6 +313,9 @@ rtw88_bringup_task(void *arg)
 	memcpy(ifp->if_xname, device_xname(sc->sc_dev), IFNAMSIZ);
 
 	if_initialize(ifp);
+	if (sc->sc_info.efuse_valid)
+		if_set_sadl(ifp, sc->sc_info.mac_addr, IEEE80211_ADDR_LEN,
+		    false);
 	ieee80211_ifattach(ic);
 
 	/* override default methods */
@@ -335,6 +338,13 @@ rtw88_bringup_task(void *arg)
 
 	ifp->if_percpuq = if_percpuq_create(ifp);
 	if_register(ifp);
+
+	if (sc->sc_info.efuse_valid) {
+		if_set_sadl(ifp, sc->sc_info.mac_addr, IEEE80211_ADDR_LEN,
+		    false);
+		memcpy(ic->ic_myaddr, sc->sc_info.mac_addr,
+		    IEEE80211_ADDR_LEN);
+	}
 
 	if (sc->sc_info.efuse_valid)
 		aprint_normal_dev(sc->sc_dev, "Ethernet address %s\n",
