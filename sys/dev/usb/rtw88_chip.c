@@ -411,11 +411,24 @@ rtw88_chip_rx_work(struct work_struct *w)
 			if (skb_len > max_skb_len ||
 			    (u32)(rx_desc - rx_skb->data) + skb_len >
 			    rx_skb->len) {
-				if (rtw88_bad_pkt_dbg < 30)
-					rtw_dbg(rtwdev, RTW_DBG_USB,
-					    "skipping bad packet (%u) at off %u\n",
-					    skb_len,
+				if (rtw88_bad_pkt_dbg < 30) {
+					const uint8_t *p = rx_desc;
+					unsigned int n;
+
+					rtw_warn(rtwdev,
+					    "bad packet: skb_len %u len %u "
+					    "drvinfo %u shift %u c2h %d "
+					    "xfer %u off %u\n",
+					    skb_len, pkt_stat.pkt_len,
+					    pkt_stat.drv_info_sz,
+					    pkt_stat.shift, pkt_stat.is_c2h,
+					    rx_skb->len,
 					    (u32)(rx_desc - rx_skb->data));
+					for (n = 0; n < 16; n++)
+						printf("%02x%s", p[n],
+						    (n % 16 == 15) ?
+						    "\n" : " ");
+				}
 				rtw88_bad_pkt_dbg++;
 				break;
 			}

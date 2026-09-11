@@ -620,9 +620,6 @@ rtw88_usb_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 
 	usbd_get_xfer_status(xfer, NULL, NULL, &len, NULL);
 
-	/* Bring-up instrumentation: are bulk IN transfers completing? */
-	if (len > 0 && (rtw88_rx_dbg < 30 || (rtw88_rx_dbg % 500) == 0))
-		printf("rtw88dbg rx #%u: %u bytes\n", rtw88_rx_dbg, len);
 	if (len > 0)
 		rtw88_rx_dbg++;
 
@@ -723,6 +720,14 @@ rtw88_usb_dynamic_rx_agg(struct rtw_dev *rtwdev, bool enable)
 {
 	u8 size, timeout;
 	u16 val16;
+
+	/*
+	 * Bring-up: keep RX aggregation off.  With agg on (size 3 / timeout
+	 * 32) the device hands us cut fragments whenever the timeout flushes
+	 * mid-frame, and our demux drops those - enough to lose AUTH/ASSOC
+	 * responses.  One whole packet per transfer instead.
+	 */
+	enable = false;
 
 	switch (rtwdev->chip->id) {
 	case RTW_CHIP_TYPE_8822C:
