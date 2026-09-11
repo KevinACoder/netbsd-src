@@ -70,6 +70,37 @@
 #include <sys/queue.h>
 #include <lib/libkern/libkern.h>
 
+/*
+ * The imported driver picks little-endian bitfield layouts (phy_cond
+ * branches, tx power index diffs) with the Linux-style __LITTLE_ENDIAN
+ * macro, which NetBSD never defines - NetBSD spells it _LITTLE_ENDIAN
+ * (sys/endian.h).  Bridge the two, or every #ifdef __LITTLE_ENDIAN
+ * struct lays out as big-endian: the phy table condition tiles then
+ * parse as config pairs and get WRITTEN to the chip (e.g. entry
+ * 0x40000000 truncates to vendor register 0x0000 = REG_SYS_CTRL = 0,
+ * which kills the MAC clocks and with them the whole switchable
+ * register domain).
+ */
+#if _BYTE_ORDER == _LITTLE_ENDIAN
+#ifndef __LITTLE_ENDIAN
+#define	__LITTLE_ENDIAN	1234
+#endif
+#ifndef __BIG_ENDIAN
+#define	__BIG_ENDIAN	4321
+#endif
+#else
+#ifndef __BIG_ENDIAN
+#define	__BIG_ENDIAN	4321
+#endif
+#endif
+#ifndef __BYTE_ORDER
+#if defined(__LITTLE_ENDIAN) && _BYTE_ORDER == _LITTLE_ENDIAN
+#define	__BYTE_ORDER	__LITTLE_ENDIAN
+#else
+#define	__BYTE_ORDER	__BIG_ENDIAN
+#endif
+#endif
+
 /* ------------------------------------------------------------------ */
 /* basic types                                                         */
 /* ------------------------------------------------------------------ */

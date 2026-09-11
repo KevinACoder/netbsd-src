@@ -53,3 +53,9 @@ options 	MEMORY_DISK_IS_ROOT
 options 	MEMORY_DISK_ROOT_SIZE=9216	# 9216 * 512 = 4608 KiB (ramdisk.fs + iwm fw)
 options 	MEMORY_DISK_RBFLAGS=RB_SINGLE	# single-user: no device needed
 no options 	MEMORY_DISK_DYNAMIC		# fixed layout, mdsetimage format
+
+# rtw88 bring-up: 1ms ticks.  Every MAC register access is a vendor control
+# transfer that rounds to one tick (10ms at HZ=100); the BB/AGC table load
+# then stretches to ~13s and the switchable register domain goes dark
+# mid-table.  Pace the control path like Linux instead.
+options 	HZ=1000

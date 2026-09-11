@@ -59,6 +59,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 /* Bring-up instrumentation: demuxed rx packet counter. */
 static unsigned int rtw88_rx_pkt_dbg;
+static unsigned int rtw88_bad_pkt_dbg;
 
 static void
 rtw88_chip_setup_device(struct rtw88_chip *chip, device_t dev)
@@ -118,6 +119,10 @@ rtw88_chip_attach(struct usbd_device *udev, struct usbd_interface *iface,
 	rtw_info(rtwdev, "chip id %u, cut %u, sys_cfg 0x%08x\n",
 	    rtwdev->chip->id, rtwdev->hal.cut_version,
 	    rtwdev->hal.chip_version);
+	rtw_info(rtwdev,
+	    "phy cond: rfe %u (full 0x%04x) pkg %u, intf usb\n",
+	    rtwdev->efuse.rfe_option, rtwdev->efuse.rfe_option_full,
+	    rtwdev->hal.pkg_type);
 
 	error = rtw_register_hw(rtwdev, chip->hw);
 	if (error != 0) {
@@ -406,8 +411,12 @@ rtw88_chip_rx_work(struct work_struct *w)
 			if (skb_len > max_skb_len ||
 			    (u32)(rx_desc - rx_skb->data) + skb_len >
 			    rx_skb->len) {
-				rtw_dbg(rtwdev, RTW_DBG_USB,
-				    "skipping bad packet (%u)\n", skb_len);
+				if (rtw88_bad_pkt_dbg < 30)
+					rtw_dbg(rtwdev, RTW_DBG_USB,
+					    "skipping bad packet (%u) at off %u\n",
+					    skb_len,
+					    (u32)(rx_desc - rx_skb->data));
+				rtw88_bad_pkt_dbg++;
 				break;
 			}
 			if (pkt_stat.pkt_len <= FCS_LEN && !pkt_stat.is_c2h) {
