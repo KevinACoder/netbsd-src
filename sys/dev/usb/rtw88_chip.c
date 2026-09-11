@@ -455,6 +455,36 @@ rtw88_chip_rx_work(struct work_struct *w)
 				size_t flen;
 
 				skb_pull(skb, pkt_offset);
+				/*
+				 * Bring-up: print management frames so the
+				 * AUTH/ASSOC handshake is observable.
+				 */
+				if (skb->len >= 2) {
+					uint16_t fc =
+					    le16toh(*(uint16_t *)skb->data);
+
+					if ((fc & 0x0c) == 0 && /* mgmt */
+					    rtw88_rx_pkt_dbg < 60) {
+						static const char *st[] =
+						    {"assoc-req", "assoc-resp",
+						     "reassoc-req",
+						     "reassoc-resp",
+						     "probe-req",
+						     "probe-resp",
+						     "?6", "?7", "beacon",
+						     "?9", "disassoc", "auth",
+						     "deauth", "action",
+						     "?14", "?15"};
+
+						printf("rtw88dbg rx mgmt %s "
+						    "len %u\n",
+						    st[(fc >> 4) & 0xf],
+						    skb->len);
+						rtw88_rx_pkt_dbg++;
+					}
+				}
+
+				skb_pull(skb, pkt_offset);
 				rtw_rx_stats(rtwdev,
 				    rtw88_mac80211_vif(hw), skb);
 
