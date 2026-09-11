@@ -1,0 +1,45 @@
+$NetBSD$
+
+Realtek rtw88 (RTL8811CU/RTL8821CU family) chip logic, imported for the
+NetBSD USB driver (`rtw88u`, sys/dev/usb/if_rtw88.c).
+
+Origin and licence
+------------------
+
+Imported from the out-of-tree lwfinger/rtw88 clone that was verified on
+this board by the Linux lane
+(doc/rk3568-itx-wiki/runs/20260911-linux-rtl8821au/):
+
+    https://github.com/lwfinger/rtw88.git
+    commit a56bcd26e770257612a0803249cbd4095fc6feca (2026-05-21)
+
+Every file below carries "SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause"
+and the Realtek copyright notice; they are used here under the
+BSD-3-Clause option, exactly as FreeBSD does for the same code
+(os/freebsd/src/sys/contrib/dev/rtw88).  The imported files are
+unmodified; the NetBSD-side glue lives in ../netbsd/.
+
+Status
+------
+
+Import only, staged for the driver port: these files are not yet compiled
+into a kernel (no file entries reference them yet).  The closure needed to
+drive an 8821CU over USB is:
+
+    main.c main.h util.c util.h tx.c tx.h rx.c rx.h mac.c mac.h
+    phy.c phy.h coex.c coex.h efuse.c efuse.h fw.c fw.h ps.c ps.h
+    sec.c sec.h bf.c bf.h regd.c regd.h sar.c sar.h
+    hci.h reg.h wow.h led.h sdio.h debug.h debug.c
+    rtw8821c.c rtw8821c.h rtw8821c_table.c rtw8821c_table.h
+
+Deliberately not imported:
+
+  * mac80211.c, usb.c   - the Linux cfg80211/mac80211 integration and the
+                          Linux URB transport; NetBSD gets its own net80211
+                          glue and a usbdi(9) transport instead.
+  * pci.c, sdio.c       - other buses, not needed for the USB dongle.
+  * wow.c, led.c        - optional in Linux (CONFIG_PM / CONFIG_RTW88_LEDS);
+                          the header stubs are enough.
+  * compiler.h, bitfield.h - Linux-only shims without the dual licence;
+                          NetBSD provides its own equivalents.
+  * convert_firmware.c  - host-side firmware tool.
