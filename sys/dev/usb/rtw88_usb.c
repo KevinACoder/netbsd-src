@@ -353,7 +353,7 @@ rtw88_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	struct rtw88_tx_xfer *tx = priv;
 	struct rtw88_usb *usb = tx->usb;
 
-	if (rtw88_tx_dbg < 10)
+	if (rtw88_tx_dbg < 60)
 		printf("rtw88dbg tx done #%u: ep %d status %d\n",
 		    rtw88_tx_dbg, tx->ep, status);
 	rtw88_tx_dbg++;

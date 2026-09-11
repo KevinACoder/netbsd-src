@@ -420,6 +420,11 @@ rtw88_rx_frame(void *ctx, const uint8_t *data, size_t len, int rssi)
 
 	if (sc->sc_dying || len == 0)
 		return;
+	if (len > IEEE80211_MAX_LEN) {
+		/* not a frame net80211 could ever accept: device garbage */
+		if_statinc(ifp, if_ierrors);
+		return;
+	}
 
 	MGETHDR(m, M_DONTWAIT, MT_DATA);
 	if (m == NULL) {
@@ -428,7 +433,11 @@ rtw88_rx_frame(void *ctx, const uint8_t *data, size_t len, int rssi)
 	}
 	MCLAIM(m, &sc->sc_ec.ec_rx_mowner);
 	if (len > MHLEN) {
-		MCLGET(m, M_DONTWAIT);
+		if (len > MCLBYTES) {
+			MEXTMALLOC(m, len, M_DONTWAIT);
+		} else {
+			MCLGET(m, M_DONTWAIT);
+		}
 		if (!(m->m_flags & M_EXT)) {
 			m_freem(m);
 			if_statinc(ifp, if_ierrors);

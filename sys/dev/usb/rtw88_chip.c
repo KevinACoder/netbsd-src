@@ -57,9 +57,21 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include "rtw88var.h"
 
+/*
+ * Longest frame net80211 can ever want (no HT: 802.11's 2346-byte MPDU).
+ * Kept local: chip.c must not include sys/net80211, the shadow mac80211
+ * headers collide with it.
+ */
+#define	RTW88_RX_FRAME_MAX	2346
+
 /* Bring-up instrumentation: demuxed rx packet counter. */
 static unsigned int rtw88_rx_pkt_dbg;
 static unsigned int rtw88_bad_pkt_dbg;
+static unsigned int rtw88_tx_mgmt_dbg;
+static unsigned int rtw88_tx_probe_dbg;
+static unsigned int rtw88_rx_bcn_dbg;
+static unsigned int rtw88_rx_mgmt_dbg;
+static unsigned int rtw88_txpwr_dbg;
 
 static void
 rtw88_chip_setup_device(struct rtw88_chip *chip, device_t dev)
@@ -187,6 +199,29 @@ rtw88_chip_start(struct rtw88_chip *chip)
 	rtw88_usb_dbg_dump(rtwdev);
 	rtw88_trace_arm(150);
 	chip->started = true;
+
+	/*
+	 * Program the interface address into MACID0 (port 0, like Linux's
+	 * rtw_vif_port_config with PORT_SET_MAC_ADDR).  The RX "accept
+	 * unicast to me" filter matches against this register; left at the
+	 * power-on default it discards every unicast response (probe/auth)
+	 * while broadcast frames still pass.
+	 */
+	{
+		const uint8_t *lladdr = rtw88_chip_mac_addr(chip);
+		int i;
+
+		for (i = 0; i < 6; i++)		/* ETHER_ADDR_LEN */
+			rtw_write8(rtwdev, 0x0610 + i, lladdr[i]);
+	}
+
+	/*
+	 * Tune to channel 1 right away: net80211 only asks for a channel
+	 * once it starts scanning, leaving the radio on the firmware's
+	 * power-on default until then.  This also exercises/prints the
+	 * TX power programming path at a predictable time.
+	 */
+	rtw88_chip_set_channel(chip, 1);
 	return 0;
 }
 
@@ -243,6 +278,26 @@ rtw88_chip_set_channel(struct rtw88_chip *chip, unsigned int chan)
 	rtw_set_channel(rtwdev);
 	mutex_unlock(&rtwdev->mutex);
 
+	/*
+	 * Bring-up: the computed TX power indices.  If the efuse power
+	 * tables were mis-parsed these are garbage and the radio is
+	 * effectively mute even though every USB transaction succeeds.
+	 */
+	if (rtw88_txpwr_dbg < 40) {
+		printf("rtw88dbg chan %u txpwr A: 1M 0x%02x 2M 0x%02x "
+		    "5.5M 0x%02x 11M 0x%02x 6M 0x%02x 54M 0x%02x "
+		    "MCS7 0x%02x\n",
+		    chan,
+		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE1M],
+		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE2M],
+		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE5_5M],
+		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE11M],
+		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE6M],
+		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE54M],
+		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATEMCS7]);
+		rtw88_txpwr_dbg++;
+	}
+
 	rtw_dbg(rtwdev, RTW_DBG_STATE, "channel %u (%u MHz)\n", chan,
 	    c->center_freq);
 	return 0;
@@ -283,6 +338,36 @@ rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 	m_freem(m);
 
 	hdr = (struct ieee80211_hdr *)skb->data;
+
+	/*
+	 * NetBSD net80211 has no mgd_prepare_tx(); run the Linux equivalent
+	 * (RF calibration before the first management TX after tuning) here,
+	 * or the AUTH/ASSOC frames go out on an uncalibrated radio.
+	 */
+	if (is_mgmt)
+		rtw_chip_prepare_tx(rtwdev);
+
+	/* Bring-up: observe the AUTH/ASSOC handshake going out.  Probe
+	 * requests are printed for the first few only, they arrive in
+	 * bursts that would spend the budget of the interesting frames. */
+	if (is_mgmt) {
+		unsigned int sub = (le16_to_cpu(hdr->frame_control) >> 4) & 0xf;
+
+		if (sub == 4) {			/* probe-req */
+			if (rtw88_tx_probe_dbg < 3) {
+				printf("rtw88dbg tx probe-req len %zu\n",
+				    len);
+				rtw88_tx_probe_dbg++;
+			}
+		} else if (rtw88_tx_mgmt_dbg < 100) {
+			printf("rtw88dbg tx mgmt sub %u fc 0x%04x -> "
+			    "%02x:%02x:%02x:%02x:%02x:%02x len %zu\n",
+			    sub, le16_to_cpu(hdr->frame_control),
+			    hdr->addr1[0], hdr->addr1[1], hdr->addr1[2],
+			    hdr->addr1[3], hdr->addr1[4], hdr->addr1[5], len);
+			rtw88_tx_mgmt_dbg++;
+		}
+	}
 
 	pkt_info.tx_pkt_size = len;
 	pkt_info.offset = rtwdev->chip->tx_pkt_desc_sz;
@@ -453,38 +538,69 @@ rtw88_chip_rx_work(struct work_struct *w)
 				    skb);
 			} else {
 				size_t flen;
+				uint16_t fc;
 
 				skb_pull(skb, pkt_offset);
+
+				/*
+				 * Sanity gate: the device can emit runs of
+				 * garbage descriptors, so never hand a run
+				 * of random bytes to net80211 -- a bogus
+				 * length corrupts kernel memory downstream.
+				 */
+				if (skb->len < 16 ||
+				    skb->len > RTW88_RX_FRAME_MAX) {
+					if (rtw88_bad_pkt_dbg < 30)
+						rtw_dbg(rtwdev, RTW_DBG_USB,
+						    "dropping garbage frame "
+						    "(len %u)\n", skb->len);
+					rtw88_bad_pkt_dbg++;
+					rtw88_skb_free(skb);
+					goto next;
+				}
+				fc = le16toh(*(uint16_t *)skb->data);
+				if ((fc & 0x0003) != 0) {
+					if (rtw88_bad_pkt_dbg < 30)
+						rtw_dbg(rtwdev, RTW_DBG_USB,
+						    "dropping frame with fc "
+						    "0x%04x (len %u)\n", fc,
+						    skb->len);
+					rtw88_bad_pkt_dbg++;
+					rtw88_skb_free(skb);
+					goto next;
+				}
+
 				/*
 				 * Bring-up: print management frames so the
-				 * AUTH/ASSOC handshake is observable.
+				 * AUTH/ASSOC handshake is observable.  The
+				 * per-class caps keep beacon noise from
+				 * spending the budget of the interesting
+				 * subtypes.
 				 */
-				if (skb->len >= 2) {
-					uint16_t fc =
-					    le16toh(*(uint16_t *)skb->data);
+				if ((fc & 0x0c) == 0) { /* mgmt */
+					static const char *st[] =
+					    {"assoc-req", "assoc-resp",
+					     "reassoc-req",
+					     "reassoc-resp",
+					     "probe-req",
+					     "probe-resp",
+					     "?6", "?7", "beacon",
+					     "?9", "disassoc", "auth",
+					     "deauth", "action",
+					     "?14", "?15"};
+					unsigned int sub = (fc >> 4) & 0xf;
+					unsigned int *ctr = sub == 8 ?
+					    &rtw88_rx_bcn_dbg :
+					    &rtw88_rx_mgmt_dbg;
 
-					if ((fc & 0x0c) == 0 && /* mgmt */
-					    rtw88_rx_pkt_dbg < 60) {
-						static const char *st[] =
-						    {"assoc-req", "assoc-resp",
-						     "reassoc-req",
-						     "reassoc-resp",
-						     "probe-req",
-						     "probe-resp",
-						     "?6", "?7", "beacon",
-						     "?9", "disassoc", "auth",
-						     "deauth", "action",
-						     "?14", "?15"};
-
+					if (*ctr < (sub == 8 ? 30 : 100)) {
 						printf("rtw88dbg rx mgmt %s "
 						    "len %u\n",
-						    st[(fc >> 4) & 0xf],
-						    skb->len);
-						rtw88_rx_pkt_dbg++;
+						    st[sub], skb->len);
+						(*ctr)++;
 					}
 				}
 
-				skb_pull(skb, pkt_offset);
 				rtw_rx_stats(rtwdev,
 				    rtw88_mac80211_vif(hw), skb);
 
