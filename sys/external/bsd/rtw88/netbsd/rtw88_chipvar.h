@@ -66,6 +66,7 @@ int	rtw88_chip_tx(struct rtw88_chip *, struct mbuf *, bool);
 void	rtw88_chip_set_callbacks(struct rtw88_chip *, void *, rtw88_rx_cb_t,
 	    rtw88_scan_cb_t);
 void	rtw88_chip_set_assoc(struct rtw88_chip *, const uint8_t *, bool);
+void	rtw88_chip_set_bssid(struct rtw88_chip *, const uint8_t *);
 bool	rtw88_chip_ready(const struct rtw88_chip *);
 const uint8_t *rtw88_chip_mac_addr(const struct rtw88_chip *);
 

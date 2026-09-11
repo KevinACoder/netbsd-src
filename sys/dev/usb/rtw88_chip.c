@@ -429,6 +429,25 @@ rtw88_chip_set_assoc(struct rtw88_chip *chip, const uint8_t *bssid, bool assoc)
 	rtw88_mac80211_set_sta(chip->hw, bssid, assoc);
 }
 
+void
+rtw88_chip_set_bssid(struct rtw88_chip *chip, const uint8_t *bssid)
+{
+	struct rtw_dev *rtwdev = &chip->rtwdev;
+	int i;
+
+	/*
+	 * Program the port-0 BSSID filter (like Linux's PORT_SET_BSSID)
+	 * before the AUTH exchange: the firmware matches received frames
+	 * against this register once management state starts moving, and
+	 * leaves it at the power-on default otherwise.
+	 */
+	for (i = 0; i < 6; i++)		/* ETHER_ADDR_LEN */
+		rtw_write8(rtwdev, 0x0618 + i, bssid[i]);
+
+	/* PORT_SET_NET_TYPE: net type = managed/station (REG_CR 16-17). */
+	rtw_write32_mask(rtwdev, 0x0100, 0x30000, RTW_NET_MGD_LINKED);
+}
+
 bool
 rtw88_chip_ready(const struct rtw88_chip *chip)
 {

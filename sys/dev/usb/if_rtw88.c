@@ -590,9 +590,17 @@ rtw88_newstate_cb(void *arg)
 	case IEEE80211_S_AUTH:
 	case IEEE80211_S_ASSOC:
 	case IEEE80211_S_RUN:
-		if (ostate != nstate)
+		if (ostate != nstate) {
 			rtw88_chip_set_channel(sc->sc_chip,
 			    ieee80211_chan2ieee(ic, ic->ic_curchan));
+			/*
+			 * The BSSID filter and station net-type must be
+			 * programmed before the AUTH exchange, like Linux's
+			 * bss_info_changed does before mgd_prepare_tx.
+			 */
+			rtw88_chip_set_bssid(sc->sc_chip,
+			    ic->ic_bss->ni_bssid);
+		}
 		if (nstate == IEEE80211_S_RUN)
 			rtw88_chip_set_assoc(sc->sc_chip, ic->ic_bss->ni_bssid,
 			    true);
