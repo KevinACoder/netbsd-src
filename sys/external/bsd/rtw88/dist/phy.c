@@ -1813,34 +1813,10 @@ void rtw_phy_cfg_mac(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 }
 EXPORT_SYMBOL(rtw_phy_cfg_mac);
 
-/*
- * Bring-up probe: after every bb/agc/rf table entry, read 0x290 (lives in the
- * switchable register domain).  The first read that returns the 0xea filler
- * latches the killer entry; the chip-start dump prints it.  No printing here:
- * the walk must keep going so the post-mortem is complete.
- */
-unsigned int rtw88_dark_kind, rtw88_dark_n;
-unsigned int rtw88_dark_addr, rtw88_dark_data;
-
-
-static void rtw88_domain_probe(struct rtw_dev *rtwdev, unsigned int kind,
-			       u32 addr, u32 data)
-{
-
-	if (rtw88_dark_kind != 0)
-		return;
-	if (rtw_read8(rtwdev, 0x290) != 0xea)
-		return;
-	rtw88_dark_kind = kind;
-	rtw88_dark_addr = addr;
-	rtw88_dark_data = data;
-}
-
 void rtw_phy_cfg_agc(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 		     u32 addr, u32 data)
 {
 	rtw_write32(rtwdev, addr, data);
-	rtw88_domain_probe(rtwdev, 2, addr, data);
 }
 EXPORT_SYMBOL(rtw_phy_cfg_agc);
 
@@ -1861,7 +1837,6 @@ void rtw_phy_cfg_bb(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 		udelay(1);
 	else
 		rtw_write32(rtwdev, addr, data);
-	rtw88_domain_probe(rtwdev, 1, addr, data);
 }
 EXPORT_SYMBOL(rtw_phy_cfg_bb);
 
@@ -1874,7 +1849,6 @@ void rtw_phy_cfg_rf(struct rtw_dev *rtwdev, const struct rtw_table *tbl,
 		usleep_range(100, 110);
 	} else {
 		rtw_write_rf(rtwdev, tbl->rf_path, addr, RFREG_MASK, data);
-		rtw88_domain_probe(rtwdev, 3, addr, data);
 		udelay(1);
 	}
 }

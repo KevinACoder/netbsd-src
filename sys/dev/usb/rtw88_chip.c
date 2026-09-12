@@ -64,17 +64,6 @@ __KERNEL_RCSID(0, "$NetBSD$");
  */
 #define	RTW88_RX_FRAME_MAX	2346
 
-/* Bring-up instrumentation: demuxed rx packet counter. */
-static unsigned int rtw88_rx_pkt_dbg;
-static unsigned int rtw88_bad_pkt_dbg;
-static unsigned int rtw88_tx_mgmt_dbg;
-static unsigned int rtw88_tx_probe_dbg;
-static unsigned int rtw88_rx_bcn_dbg;
-static unsigned int rtw88_rx_mgmt_dbg;
-static unsigned int rtw88_txpwr_dbg;
-static unsigned int rtw88_tx_data_dbg;
-static unsigned int rtw88_rx_data_dbg;
-
 static void
 rtw88_chip_setup_device(struct rtw88_chip *chip, device_t dev)
 {
@@ -183,8 +172,7 @@ rtw88_chip_start(struct rtw88_chip *chip)
 	struct rtw_dev *rtwdev = &chip->rtwdev;
 	int error;
 
-	rtw_info(rtwdev, "chip start begin\n");
-	rtw88_trace_arm(0);
+	rtw_dbg(rtwdev, RTW_DBG_STATE, "chip start begin\n");
 	mutex_lock(&rtwdev->mutex);
 	error = rtw_core_start(rtwdev);
 	mutex_unlock(&rtwdev->mutex);
@@ -192,17 +180,7 @@ rtw88_chip_start(struct rtw88_chip *chip)
 		rtw_err(rtwdev, "failed to start the chip (%d)\n", error);
 		return error;
 	}
-	rtw88_trace_arm(0);
-	rtw_info(rtwdev, "chip start done\n");
-	/*
-	 * Bring-up probes: the firmware asserts BIT_WINTINI_RDY and friends
-	 * in REG_MCUFW_CTRL while booting; REG_HMETFR shows whether the H2C
-	 * mailboxes are free (bits clear) or still owned by the firmware.
-	 */
-	rtw_info(rtwdev, "fw state: MCUFW_CTRL 0x%08x HMETFR 0x%02x\n",
-	    rtw_read32(rtwdev, REG_MCUFW_CTRL), rtw_read8(rtwdev, REG_HMETFR));
-	rtw88_usb_dbg_dump(rtwdev);
-	rtw88_trace_arm(150);
+	rtw_dbg(rtwdev, RTW_DBG_STATE, "chip start done\n");
 	chip->started = true;
 
 	/*
@@ -228,40 +206,21 @@ rtw88_chip_start(struct rtw88_chip *chip)
 	rtw_write8_mask(rtwdev, REG_BCN_CTRL, 0xff, BIT_EN_BCN_FUNCTION);
 
 	/*
-	 * Bring-up probe: force the RX "accept all" bit so no unicast frame can
-	 * be discarded by the address filter (MACID0/BSSID).  If AUTH/probe
-	 * responses appear with this set but not without it, the blocker is the
-	 * port-0 address filter; otherwise the AUTH never made it onto the air.
-	 * REMOVE before finishing.
+	 * Accept every frame regardless of the port-0 address filter.
+	 *
+	 * With the Linux RCR (AB|AM|APM, no AAP) the adapter associates but the
+	 * firmware then drops the AP's unicast replies to us -- AUTH responses
+	 * included -- so the supplicant times out and loops: scan, associate,
+	 * never complete.  AAP sidesteps the filter until the port/MACID, AID
+	 * and RXFLTMAP programming is brought in line with Linux; that alignment
+	 * is the follow-up.  Remove this once it lands.
 	 */
 	rtw_write32_set(rtwdev, REG_RCR, BIT_AAP);
 
 	/*
-	 * Bring-up: verify the filter registers actually took the writes
-	 * (the USB vendor read path does not decode every register).
-	 */
-	{
-		uint8_t rb[6];
-		int i;
-
-		for (i = 0; i < 6; i++)
-			rb[i] = rtw_read8(rtwdev, 0x0610 + i);
-		printf("rtw88dbg macid0 rb %02x:%02x:%02x:%02x:%02x:%02x "
-		    "bcn_ctrl 0x%02x nettype 0x%08x flt mgmt 0x%04x ctrl 0x%04x "
-		    "data 0x%04x\n",
-		    rb[0], rb[1], rb[2], rb[3], rb[4], rb[5],
-		    rtw_read8(rtwdev, REG_BCN_CTRL),
-		    rtw_read32(rtwdev, 0x0100),
-		    rtw_read16(rtwdev, REG_RXFLTMAP0),
-		    rtw_read16(rtwdev, REG_RXFLTMAP1),
-		    rtw_read16(rtwdev, REG_RXFLTMAP2));
-	}
-
-	/*
 	 * Tune to channel 1 right away: net80211 only asks for a channel
 	 * once it starts scanning, leaving the radio on the firmware's
-	 * power-on default until then.  This also exercises/prints the
-	 * TX power programming path at a predictable time.
+	 * power-on default until then.
 	 */
 	rtw88_chip_set_channel(chip, 1);
 	return 0;
@@ -320,26 +279,6 @@ rtw88_chip_set_channel(struct rtw88_chip *chip, unsigned int chan)
 	rtw_set_channel(rtwdev);
 	mutex_unlock(&rtwdev->mutex);
 
-	/*
-	 * Bring-up: the computed TX power indices.  If the efuse power
-	 * tables were mis-parsed these are garbage and the radio is
-	 * effectively mute even though every USB transaction succeeds.
-	 */
-	if (rtw88_txpwr_dbg < 40) {
-		printf("rtw88dbg chan %u txpwr A: 1M 0x%02x 2M 0x%02x "
-		    "5.5M 0x%02x 11M 0x%02x 6M 0x%02x 54M 0x%02x "
-		    "MCS7 0x%02x\n",
-		    chan,
-		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE1M],
-		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE2M],
-		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE5_5M],
-		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE11M],
-		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE6M],
-		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATE54M],
-		    rtwdev->hal.tx_pwr_tbl[0][DESC_RATEMCS7]);
-		rtw88_txpwr_dbg++;
-	}
-
 	rtw_dbg(rtwdev, RTW_DBG_STATE, "channel %u (%u MHz)\n", chan,
 	    c->center_freq);
 	return 0;
@@ -395,20 +334,9 @@ rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 	if (is_mgmt) {
 		unsigned int sub = (le16_to_cpu(hdr->frame_control) >> 4) & 0xf;
 
-		if (sub == 4) {			/* probe-req */
-			if (rtw88_tx_probe_dbg < 3) {
-				printf("rtw88dbg tx probe-req len %zu\n",
-				    len);
-				rtw88_tx_probe_dbg++;
-			}
-		} else if (rtw88_tx_mgmt_dbg < 100) {
-			printf("rtw88dbg tx mgmt sub %u fc 0x%04x -> "
-			    "%02x:%02x:%02x:%02x:%02x:%02x len %zu\n",
-			    sub, le16_to_cpu(hdr->frame_control),
-			    hdr->addr1[0], hdr->addr1[1], hdr->addr1[2],
-			    hdr->addr1[3], hdr->addr1[4], hdr->addr1[5], len);
-			rtw88_tx_mgmt_dbg++;
-		}
+		if (sub != 4)
+			rtw_dbg(rtwdev, RTW_DBG_TX, "mgmt sub %u fc 0x%04x len %zu\n",
+			    sub, le16_to_cpu(hdr->frame_control), len);
 	}
 
 	pkt_info.tx_pkt_size = len;
@@ -432,7 +360,14 @@ rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 		pkt_info.rate = DESC_RATE1M;
 	} else {
 		pkt_info.qsel = TX_DESC_QSEL_TID0;	/* best effort */
-		pkt_info.rate = DESC_RATE54M;
+		/*
+		 * No rate control in this port, so transmit at a rate the link
+		 * budget can actually carry: 54M left most data frames
+		 * unacknowledged, which shows up as the AP retrying its own
+		 * frames to us and ping replies arriving several times over.
+		 * 6M keeps ~9dB more margin; rate adaptation is the follow-up.
+		 */
+		pkt_info.rate = DESC_RATE6M;
 	}
 
 	error = rtw_hci_tx_write(rtwdev, &pkt_info, skb);
@@ -448,18 +383,6 @@ rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 int
 rtw88_chip_tx(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 {
-
-	/* Bring-up: does the data path (ARP/DHCP/ping) reach the driver? */
-	if (!is_mgmt && rtw88_tx_data_dbg < 40) {
-		const uint8_t *p = mtod(m, const uint8_t *);
-		size_t len = m->m_pkthdr.len;
-		uint16_t fc = len >= 2 ? (uint16_t)(p[0] | (p[1] << 8)) : 0;
-
-		printf("rtw88dbg tx data #%u len %zu fc 0x%04x dst "
-		    "%02x:%02x:%02x:%02x:%02x:%02x\n", rtw88_tx_data_dbg,
-		    len, fc, p[4], p[5], p[6], p[7], p[8], p[9]);
-		rtw88_tx_data_dbg++;
-	}
 
 	return rtw88_chip_tx_frame(chip, m, is_mgmt);
 }
@@ -579,40 +502,19 @@ rtw88_chip_rx_work(struct work_struct *w)
 			rtw_rx_query_rx_desc(rtwdev, rx_desc, rx_buf, &pkt_stat,
 			    &rx_status);
 
-			/* Bring-up instrumentation: what does the demux see? */
-			if (rtw88_rx_pkt_dbg < 30)
-				printf("rtw88dbg rxpkt #%u: len %u drvinfo %u "
-				    "shift %u c2h %d rssi %d\n", rtw88_rx_pkt_dbg,
-				    pkt_stat.pkt_len, pkt_stat.drv_info_sz,
-				    pkt_stat.shift, pkt_stat.is_c2h,
-				    pkt_stat.rssi);
-			rtw88_rx_pkt_dbg++;
-
 			pkt_offset = pkt_desc_sz + pkt_stat.drv_info_sz +
 			    pkt_stat.shift;
 			skb_len = pkt_stat.pkt_len + pkt_offset;
 			if (skb_len > max_skb_len ||
 			    (u32)(rx_desc - rx_skb->data) + skb_len >
 			    rx_skb->len) {
-				if (rtw88_bad_pkt_dbg < 30) {
-					const uint8_t *p = rx_desc;
-					unsigned int n;
-
-					rtw_warn(rtwdev,
-					    "bad packet: skb_len %u len %u "
-					    "drvinfo %u shift %u c2h %d "
-					    "xfer %u off %u\n",
-					    skb_len, pkt_stat.pkt_len,
-					    pkt_stat.drv_info_sz,
-					    pkt_stat.shift, pkt_stat.is_c2h,
-					    rx_skb->len,
-					    (u32)(rx_desc - rx_skb->data));
-					for (n = 0; n < 16; n++)
-						printf("%02x%s", p[n],
-						    (n % 16 == 15) ?
-						    "\n" : " ");
-				}
-				rtw88_bad_pkt_dbg++;
+				rtw_dbg(rtwdev, RTW_DBG_USB,
+				    "bad packet: skb_len %u len %u drvinfo %u "
+				    "shift %u c2h %d xfer %u off %u\n",
+				    skb_len, pkt_stat.pkt_len,
+				    pkt_stat.drv_info_sz, pkt_stat.shift,
+				    pkt_stat.is_c2h, rx_skb->len,
+				    (u32)(rx_desc - rx_skb->data));
 				break;
 			}
 			if (pkt_stat.pkt_len <= FCS_LEN && !pkt_stat.is_c2h) {
@@ -648,71 +550,19 @@ rtw88_chip_rx_work(struct work_struct *w)
 				 */
 				if (skb->len < 16 ||
 				    skb->len > RTW88_RX_FRAME_MAX) {
-					if (rtw88_bad_pkt_dbg < 30)
-						rtw_dbg(rtwdev, RTW_DBG_USB,
-						    "dropping garbage frame "
-						    "(len %u)\n", skb->len);
-					rtw88_bad_pkt_dbg++;
+					rtw_dbg(rtwdev, RTW_DBG_USB,
+					    "dropping garbage frame (len %u)\n",
+					    skb->len);
 					rtw88_skb_free(skb);
 					goto next;
 				}
 				fc = le16toh(*(uint16_t *)skb->data);
 				if ((fc & 0x0003) != 0) {
-					if (rtw88_bad_pkt_dbg < 30)
-						rtw_dbg(rtwdev, RTW_DBG_USB,
-						    "dropping frame with fc "
-						    "0x%04x (len %u)\n", fc,
-						    skb->len);
-					rtw88_bad_pkt_dbg++;
+					rtw_dbg(rtwdev, RTW_DBG_USB,
+					    "dropping frame with fc 0x%04x "
+					    "(len %u)\n", fc, skb->len);
 					rtw88_skb_free(skb);
 					goto next;
-				}
-
-				/*
-				 * Bring-up: print management frames so the
-				 * AUTH/ASSOC handshake is observable.  The
-				 * per-class caps keep beacon noise from
-				 * spending the budget of the interesting
-				 * subtypes.
-				 */
-				if ((fc & 0x0c) == 0) { /* mgmt */
-					static const char *st[] =
-					    {"assoc-req", "assoc-resp",
-					     "reassoc-req",
-					     "reassoc-resp",
-					     "probe-req",
-					     "probe-resp",
-					     "?6", "?7", "beacon",
-					     "?9", "disassoc", "auth",
-					     "deauth", "action",
-					     "?14", "?15"};
-					unsigned int sub = (fc >> 4) & 0xf;
-					unsigned int *ctr = sub == 8 ?
-					    &rtw88_rx_bcn_dbg :
-					    &rtw88_rx_mgmt_dbg;
-
-					if (*ctr < (sub == 8 ? 30 : 100)) {
-						printf("rtw88dbg rx mgmt %s "
-						    "len %u\n",
-						    st[sub], skb->len);
-						(*ctr)++;
-					}
-				} else if ((fc & 0x0c) == 0x08) {
-					/*
-					 * Bring-up: data frames.  If the AP answers
-					 * our ARP this is the frame that carries the
-					 * reply; log enough to tell "AP never sent
-					 * it" apart from "net80211 failed to
-					 * decrypt what arrived".
-					 */
-					if (rtw88_rx_data_dbg < 40) {
-						printf("rtw88dbg rx data len %u "
-						    "fc 0x%04x prot %u rssi %d\n",
-						    skb->len, fc,
-						    (fc & 0x4000) ? 1 : 0,
-						    pkt_stat.rssi);
-						rtw88_rx_data_dbg++;
-					}
 				}
 
 				rtw_rx_stats(rtwdev,
