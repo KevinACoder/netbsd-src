@@ -630,14 +630,15 @@ rtw88_usb_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	usbd_get_xfer_status(xfer, NULL, NULL, &len, NULL);
 
 	/*
-	 * Linux's rtw_usb_read_port_complete() rejects completions shorter than
-	 * a receive descriptor (24 bytes).  Feed those to the demux and it
-	 * reads the descriptor out of whatever happened to be in the buffer,
-	 * then walks the rest of the transfer as if it were packets -- exactly
-	 * the "skipping short packet / bad packet at off 0" storm.  Drop them
-	 * like Linux does.
+	 * Linux's rtw_usb_read_port_complete() rejects transfers that are
+	 * shorter than a receive descriptor or that fill the whole buffer.
+	 * A short transfer means the demux would read the descriptor out of
+	 * stray bytes; a full-buffer transfer means a packet was split across
+	 * URBs, so the demux would walk a truncated run and lose the packets
+	 * behind it.  Both produce the "skipping short packet / bad packet"
+	 * storm, so drop them exactly like Linux does.
 	 */
-	if (len < RTW88_RX_MIN_LEN) {
+	if (len < RTW88_RX_MIN_LEN || len >= RTW88_RX_BUFSZ) {
 		rtw88_usb_rx_submit(rx);
 		return;
 	}
