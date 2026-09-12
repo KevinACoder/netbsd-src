@@ -59,6 +59,8 @@
 #define	RTW88_TX_BUFSZ		(16 * 1024)
 #define	RTW88_RX_XFER_NUM	2
 #define	RTW88_RX_BUFSZ		32768
+/* shortest bulk-IN transfer Linux hands to the demux (one rx descriptor) */
+#define	RTW88_RX_MIN_LEN	24
 #define	RTW88_TX_TIMEOUT	5000	/* ms */
 
 struct rtw88_rx_xfer {

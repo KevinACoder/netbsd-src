@@ -491,6 +491,7 @@ rtw88_start(struct ifnet *ifp)
 			is_mgmt = true;
 		} else if (ic->ic_state == IEEE80211_S_RUN) {
 			struct ether_header *eh;
+			struct ieee80211_frame *wh;
 
 			IFQ_POLL(&ifp->if_snd, m);
 			if (m == NULL)
@@ -507,6 +508,24 @@ rtw88_start(struct ifnet *ifp)
 
 			if ((m = ieee80211_encap(ic, m, ni)) == NULL) {
 				if_statinc(ifp, if_oerrors);
+				ieee80211_free_node(ni);
+				continue;
+			}
+
+			/*
+			 * ieee80211_encap() only builds the 802.11 header, sets
+			 * the Protected bit and reserves room for the crypto
+			 * header; a software-crypto driver has to finish the
+			 * encapsulation itself (see ieee80211_output.c).  Without
+			 * this the frame leaves with Protected set but no CCMP
+			 * header/MIC, so the AP discards every data frame -- the
+			 * "association succeeds, ping never answers" symptom.
+			 */
+			wh = mtod(m, struct ieee80211_frame *);
+			if ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0 &&
+			    ieee80211_crypto_encap(ic, ni, m) == NULL) {
+				if_statinc(ifp, if_oerrors);
+				m_freem(m);
 				ieee80211_free_node(ni);
 				continue;
 			}

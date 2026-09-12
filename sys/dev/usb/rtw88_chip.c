@@ -73,6 +73,7 @@ static unsigned int rtw88_rx_bcn_dbg;
 static unsigned int rtw88_rx_mgmt_dbg;
 static unsigned int rtw88_txpwr_dbg;
 static unsigned int rtw88_tx_data_dbg;
+static unsigned int rtw88_rx_data_dbg;
 
 static void
 rtw88_chip_setup_device(struct rtw88_chip *chip, device_t dev)
@@ -695,6 +696,22 @@ rtw88_chip_rx_work(struct work_struct *w)
 						    "len %u\n",
 						    st[sub], skb->len);
 						(*ctr)++;
+					}
+				} else if ((fc & 0x0c) == 0x08) {
+					/*
+					 * Bring-up: data frames.  If the AP answers
+					 * our ARP this is the frame that carries the
+					 * reply; log enough to tell "AP never sent
+					 * it" apart from "net80211 failed to
+					 * decrypt what arrived".
+					 */
+					if (rtw88_rx_data_dbg < 40) {
+						printf("rtw88dbg rx data len %u "
+						    "fc 0x%04x prot %u rssi %d\n",
+						    skb->len, fc,
+						    (fc & 0x4000) ? 1 : 0,
+						    pkt_stat.rssi);
+						rtw88_rx_data_dbg++;
 					}
 				}
 
