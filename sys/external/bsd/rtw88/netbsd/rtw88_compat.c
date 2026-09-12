@@ -116,6 +116,20 @@ rtw88_skb_queue_tail(struct sk_buff_head *q, struct sk_buff *skb)
 	q->qlen++;
 }
 
+void
+rtw88_skb_queue_head(struct sk_buff_head *q, struct sk_buff *skb)
+{
+	struct sk_buff *head = (struct sk_buff *)q;
+	struct sk_buff *first = head->next;
+
+	skb->next = first;
+	skb->prev = head;
+	skb->list = q;
+	first->prev = skb;
+	head->next = skb;
+	q->qlen++;
+}
+
 struct sk_buff *
 rtw88_skb_dequeue(struct sk_buff_head *q)
 {

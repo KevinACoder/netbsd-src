@@ -76,6 +76,7 @@ struct rtw88_tx_xfer {
 	struct sk_buff		*skb;
 	struct rtw88_usb	*usb;
 	int			ep;
+	volatile int		done;	/* completion seen, waiting for tx_mtx */
 	TAILQ_ENTRY(rtw88_tx_xfer) next;
 };
 

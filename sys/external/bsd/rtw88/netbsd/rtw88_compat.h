@@ -1397,6 +1397,7 @@ void	*rtw88_skb_alloc(unsigned int size, gfp_t gfp);
 void	rtw88_skb_free(struct sk_buff *);
 void	rtw88_skb_queue_init(struct sk_buff_head *);
 void	rtw88_skb_queue_tail(struct sk_buff_head *, struct sk_buff *);
+void	rtw88_skb_queue_head(struct sk_buff_head *, struct sk_buff *);
 struct sk_buff *rtw88_skb_dequeue(struct sk_buff_head *);
 void	rtw88_skb_unlink(struct sk_buff *, struct sk_buff_head *);
 void	rtw88_skb_queue_purge(struct sk_buff_head *);
@@ -1413,6 +1414,7 @@ void	rtw88_skb_queue_purge(struct sk_buff_head *);
 #define	skb_queue_head_init(q)	rtw88_skb_queue_init(q)
 #define	skb_queue_tail(q, skb)	rtw88_skb_queue_tail((q), (skb))
 #define	__skb_queue_tail(q, skb) rtw88_skb_queue_tail((q), (skb))
+#define	skb_queue_head(q, skb)	rtw88_skb_queue_head((q), (skb))
 #define	skb_dequeue(q)		rtw88_skb_dequeue(q)
 #define	__skb_dequeue(q)	rtw88_skb_dequeue(q)
 #define	skb_unlink(skb, q)	rtw88_skb_unlink((skb), (q))

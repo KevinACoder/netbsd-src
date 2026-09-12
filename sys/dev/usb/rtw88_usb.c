@@ -312,7 +312,15 @@ rtw88_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	if (status == USBD_STALLED)
 		usbd_clear_endpoint_stall_async(tx->pipe);
 
-	TAILQ_INSERT_TAIL(&usb->tx_free[tx->ep], tx, next);
+	/*
+	 * This runs in the USB completion context, which must not touch the
+	 * free list: rtw88_usb_tx_submit() walks it from a thread under
+	 * tx_mtx, and an unsynchronised TAILQ insert there loses entries --
+	 * after which a pipe reports "no free tx buffer" forever and every
+	 * data frame handed to it is dropped.  Flag it and let the worker
+	 * (which holds tx_mtx, and can sleep) put it back.
+	 */
+	tx->done = 1;
 	rtw88_work_enqueue(&usb->tx_work);
 }
 
@@ -323,6 +331,16 @@ rtw88_usb_tx_submit(struct rtw88_usb *usb)
 
 	mutex_enter(&usb->tx_mtx);
 
+	/* Return the transfers whose completion arrived since the last pass. */
+	for (i = 0; i < RTW88_TX_XFER_NUM; i++) {
+		struct rtw88_tx_xfer *tx = &usb->tx[i];
+
+		if (tx->done) {
+			tx->done = 0;
+			TAILQ_INSERT_TAIL(&usb->tx_free[tx->ep], tx, next);
+		}
+	}
+
 	for (i = 0; i < usb->n_tx_pipe; i++) {
 		struct sk_buff *skb;
 		struct rtw88_tx_xfer *tx;
@@ -331,14 +349,20 @@ rtw88_usb_tx_submit(struct rtw88_usb *usb)
 		while ((skb = rtw88_skb_dequeue(&usb->tx_queue[i])) != NULL) {
 			tx = TAILQ_FIRST(&usb->tx_free[i]);
 			if (tx == NULL) {
+				/*
+				 * Every buffer of this pipe is in flight: put the
+				 * frame back and try again when one completes.  It
+				 * used to be dropped here, which silently ate every
+				 * data frame once a pipe stalled.
+				 */
 				if (rtw88_tx_nobuf < 3) {
 					rtw_err(usb->rtwdev,
 					    "%s: no free tx buffer on pipe %d\n",
 					    __func__, i);
 					rtw88_tx_nobuf++;
 				}
-				rtw88_skb_free(skb);
-				continue;
+				rtw88_skb_queue_head(&usb->tx_queue[i], skb);
+				break;
 			}
 			TAILQ_REMOVE(&usb->tx_free[i], tx, next);
 
