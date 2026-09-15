@@ -30,51 +30,51 @@
  */
 
 /*
- * Interface between the net80211 driver (if_rtw89.c) and the imported chip
- * code plus its usbdi(9) transport.  Nothing from the dist/ tree leaks
- * through here, so if_rtw89.c can include sys/net80211 without collisions.
+ * Driver-side state shared by if_rtw89.c (net80211 front end) and
+ * rtw89_chip.c (chip glue).  Neither net80211 nor dist headers may be
+ * included here: the front end cannot see the shadow mac80211 types and
+ * the chip glue cannot see net80211's (they collide by name).
  */
 
-#ifndef _RTW89_CHIPVAR_H_
-#define _RTW89_CHIPVAR_H_
+#ifndef _RTW89VAR_H_
+#define _RTW89VAR_H_
 
 #include <sys/types.h>
-#include <sys/stdint.h>
 #include <sys/device.h>
+
 #include <dev/usb/usbdi.h>
 
-struct rtw89_chip;
-struct rtw89_usb_softc;
-struct rtw89_hci_ops;
-struct mbuf;
+/*
+ * The compat `struct device' (rtw89_compat.h): a name carrier the core
+ * keeps in rtwdev->dev.  Including the compat header here is safe for
+ * both consumers -- the shadow mac80211 types live in rtw89_mac80211.h,
+ * which neither if_rtw89.c nor rtw89_chip.c may mix with net80211.
+ */
+#include "rtw89_compat.h"
 
-struct rtw89_hw_info {
-	uint8_t		mac_addr[6];
-	bool		efuse_valid;
-	uint8_t		fw_format;
+struct rtw89_dev;		/* dist core (core.h), opaque here */
+struct rtw89_usb_softc;		/* transport, opaque here */
+struct ieee80211_hw;		/* compat shadow */
+
+
+/*
+ * The chip handle: the rtw89_dev the core allocated, the stable compat
+ * `struct device' the core keeps in rtwdev->dev (it must outlive the hw
+ * private allocation, which happens later and requests firmware through
+ * the device), and the identity the efuse read produced.
+ */
+struct rtw89_chip {
+	struct rtw89_dev	*rtwdev;
+	struct device		hostdev;	/* compat device carrier */
+
+	uint8_t			mac_addr[6];
+	bool			efuse_valid;
+	uint8_t			fw_format;
+
+	/* RX delivery (set by if_rtw89 via rtw89_chip_set_callbacks) */
+	void			*rx_arg;
+	void			(*rx_cb)(void *, const uint8_t *, size_t,
+				    int);
 };
 
-typedef void (*rtw89_rx_cb_t)(void *, const uint8_t *, size_t, int);
-
-/* usbdi transport (dev/usb/rtw89_usb.c) */
-const struct rtw89_hci_ops *rtw89_usb_get_ops(void);
-int	rtw89_usb_attach(struct rtw89_usb_softc *, device_t,
-	    struct usbd_device *, struct usbd_interface *);
-void	rtw89_usb_detach(struct rtw89_usb_softc *);
-
-/* chip glue (dev/usb/rtw89_chip.c); runs the imported core.  Attach
- * allocates the chip handle (NULL on failure); detach consumes it. */
-struct rtw89_chip *rtw89_chip_attach(device_t, struct usbd_device *,
-	    struct usbd_interface *);
-void	rtw89_chip_detach(struct rtw89_chip *);
-int	rtw89_chip_start(struct rtw89_chip *);
-void	rtw89_chip_stop(struct rtw89_chip *);
-int	rtw89_chip_set_channel(struct rtw89_chip *, unsigned int);
-int	rtw89_chip_tx(struct rtw89_chip *, struct mbuf *, bool);
-void	rtw89_chip_set_callbacks(struct rtw89_chip *, void *,
-	    rtw89_rx_cb_t);
-bool	rtw89_chip_ready(const struct rtw89_chip *);
-const uint8_t *rtw89_chip_mac_addr(const struct rtw89_chip *,
-	    struct rtw89_hw_info *);
-
-#endif /* _RTW89_CHIPVAR_H_ */
+#endif /* _RTW89VAR_H_ */
