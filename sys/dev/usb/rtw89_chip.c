@@ -157,6 +157,20 @@ rtw89_chip_attach(device_t dev, struct usbd_device *udev,
 	}
 	chip->rtwdev = rtwdev;
 
+	if (rtwdev->fw.req.firmware == NULL) {
+		/*
+		 * Early format recognition failed: firmware(9) is not
+		 * reachable yet (no root).  Bail so the frontend retry loop
+		 * tries again after mountroot -- downloading with a NULL
+		 * image cannot work.
+		 */
+		aprint_debug_dev(dev, "attach: firmware not reachable yet\n");
+		rtw89_free_ieee80211_hw(rtwdev);
+		chip->rtwdev = NULL;
+		kmem_free(chip, sizeof(*chip));
+		return NULL;
+	}
+
 	usb = (struct rtw89_usb_softc *)rtwdev->priv;
 	memset(usb, 0, sizeof(*usb));
 	usb->rtwdev = rtwdev;
@@ -170,6 +184,7 @@ rtw89_chip_attach(device_t dev, struct usbd_device *udev,
 	rtwdev->hci.dle_type = udev->ud_speed == USB_SPEED_SUPER ?
 	    RTW89_HCI_DLE_TYPE_USB3 : RTW89_HCI_DLE_TYPE_USB2;
 
+	aprint_normal_dev(dev, "attach: transport\n");
 	error = rtw89_usb_attach(usb, dev, udev, iface);
 	if (error != 0)
 		goto out_fail;
@@ -181,18 +196,22 @@ rtw89_chip_attach(device_t dev, struct usbd_device *udev,
 	 * (>= 10 ms) per the Linux lab_c2h_wall A/B evidence, which the
 	 * compat register helpers implement.
 	 */
+	aprint_normal_dev(dev, "attach: core_init\n");
 	error = rtw89_core_init(rtwdev);
 	if (error != 0) {
 		aprint_error_dev(dev, "core init failed: %d\n", error);
 		goto out_fail;
 	}
+	aprint_normal_dev(dev, "attach: core_init done\n");
 
+	aprint_normal_dev(dev, "attach: chip_info_setup\n");
 	error = rtw89_chip_info_setup(rtwdev);
 	if (error != 0) {
 		aprint_error_dev(dev, "chip info setup failed: %d\n", error);
 		goto out_fail;
 	}
 
+	aprint_normal_dev(dev, "attach: core_register\n");
 	error = rtw89_core_register(rtwdev);
 	if (error != 0) {
 		aprint_error_dev(dev, "core register failed: %d\n", error);

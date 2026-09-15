@@ -56,6 +56,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/callout.h>
 #include <sys/mutex.h>
 #include <sys/pmf.h>
+#include <sys/kthread.h>
 
 #include <net/if.h>
 #include <net/if_arp.h>
@@ -225,10 +226,22 @@ rtw89_attach(device_t parent, device_t self, void *aux)
 	 * that retries until the firmware is reachable, then register
 	 * with net80211; the interface simply does not exist until then.
 	 */
+	/*
+	 * Bring-up must NOT run on the compat worker: the firmware download
+	 * waits for TX completions whose slot-return work is serviced by
+	 * that same worker (self-deadlock).  A dedicated thread keeps the
+	 * worker free for the completion path.
+	 */
 	rtw89_workqueue_ready();
-	if (rtw89_call_async(rtw89_bringup_task, sc) != 0) {
-		aprint_error_dev(self, "cannot schedule chip bring-up\n");
-		return;
+	{
+		lwp_t *lwp;
+		int err = kthread_create(PRI_NONE, 0,
+		    NULL, rtw89_bringup_task, sc, &lwp, "rtw89probe");
+		if (err != 0) {
+			aprint_error_dev(self,
+			    "cannot start the bring-up thread (%d)\n", err);
+			return;
+		}
 	}
 
 	pmf_device_register(self, NULL, NULL);
@@ -241,11 +254,11 @@ rtw89_bringup_task(void *arg)
 	struct rtw89_softc *sc = arg;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &sc->sc_ec.ec_if;
-	int attempt, i, error;
+	int attempt, i;
 
-	for (attempt = 0; attempt < 40; attempt++) {
+	for (attempt = 0; attempt < 120; attempt++) {
 		if (sc->sc_dying)
-			return;
+			kthread_exit(0);
 		sc->sc_chip = rtw89_chip_attach(sc->sc_dev, sc->sc_udev,
 		    sc->sc_iface);
 		if (sc->sc_chip != NULL)
@@ -255,7 +268,7 @@ rtw89_bringup_task(void *arg)
 	}
 	if (sc->sc_chip == NULL) {
 		aprint_error_dev(sc->sc_dev, "failed to bring up the chip\n");
-		return;
+		kthread_exit(0);
 	}
 	rtw89_chip_set_callbacks(sc->sc_chip, sc, rtw89_rx_frame);
 	rtw89_chip_mac_addr(sc->sc_chip, &sc->sc_info);
@@ -323,6 +336,10 @@ rtw89_bringup_task(void *arg)
 	if_register(ifp);
 
 	if (sc->sc_info.efuse_valid) {
+		/* if_register() clears the stale lladdr set earlier: set it
+		 * again now that the interface is live (rtw88 same). */
+		if_set_sadl(ifp, sc->sc_info.mac_addr, IEEE80211_ADDR_LEN,
+		    false);
 		memcpy(ic->ic_myaddr, sc->sc_info.mac_addr,
 		    IEEE80211_ADDR_LEN);
 		aprint_normal_dev(sc->sc_dev, "Ethernet address %s\n",

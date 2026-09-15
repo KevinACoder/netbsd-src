@@ -597,7 +597,23 @@ int
 ieee80211_register_hw(struct ieee80211_hw *hw)
 {
 
-	/* the net80211 registration is done by if_rtw89.c */
+	/*
+	 * The net80211 registration is done by if_rtw89.c.  What the glue
+	 * must replicate here is cfg80211's behaviour at wiphy
+	 * registration: the current core regulatory domain ("00", world)
+	 * is applied synchronously, which invokes the driver's
+	 * reg_notifier.  Without it rtwdev->regulatory.regd stays NULL
+	 * and the driver's later regulatory paths fault.
+	 */
+	if (hw != NULL && hw->wiphy != NULL && hw->wiphy->reg_notifier != NULL) {
+		struct regulatory_request req;
+
+		memset(&req, 0, sizeof(req));
+		req.alpha2[0] = '0';
+		req.alpha2[1] = '0';
+		req.initiator = NL80211_REGDOM_SET_BY_CORE;
+		hw->wiphy->reg_notifier(hw->wiphy, &req);
+	}
 	return 0;
 }
 

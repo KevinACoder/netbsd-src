@@ -106,7 +106,7 @@ static const struct {
 	{ RTW89_DMA_ACH3, 5 },
 	{ RTW89_DMA_B0MG, 2 },
 	{ RTW89_DMA_B0HI, 2 },
-	{ RTW89_DMA_H2C, 8 },
+	{ RTW89_DMA_H2C, 1 }, /* experiment: serialise H2C */
 };
 
 #define	RTW89_USB_CH_MAX	RTW89_DMA_CH_NUM
@@ -123,6 +123,10 @@ struct rtw89_usb_softc {
 	__le32			usb_data[RTW89_USB_VENQT_MAX_BUF];
 	unsigned int		usb_data_idx;
 	unsigned int		io_errors;
+	unsigned int		tx_errprints;
+	unsigned int		tx_frames;	/* handed to USB */
+	unsigned int		tx_completes;	/* completed callbacks */
+	unsigned int		tx_kicks;	/* kick_off calls */
 	bool			detaching;
 	bool			xfers_inited;
 

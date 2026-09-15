@@ -505,6 +505,25 @@ rtw89_usb_tx_submit(struct rtw89_usb_softc *sc)
 			memcpy(slot->buf, skb->data, skb->len);
 			slot->skb = skb;
 			ch->busy++;
+			sc->tx_frames++;
+			if (dma == RTW89_TXCH_CH12 && sc->tx_frames == 1) {
+				/* GT (FreeBSD/Linux): dword0 = 0x000c0000 */
+				const uint8_t *p8 = slot->buf;
+				printf("rtw89usb: CH12 frame0 %u bytes:"
+				    " %02x %02x %02x %02x %02x %02x %02x %02x"
+				    " %02x %02x %02x %02x %02x %02x %02x %02x"
+				    " %02x %02x %02x %02x %02x %02x %02x %02x"
+				    " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				    (unsigned)skb->len,
+				    p8[0], p8[1], p8[2], p8[3],
+				    p8[4], p8[5], p8[6], p8[7],
+				    p8[8], p8[9], p8[10], p8[11],
+				    p8[12], p8[13], p8[14], p8[15],
+				    p8[16], p8[17], p8[18], p8[19],
+				    p8[20], p8[21], p8[22], p8[23],
+				    p8[24], p8[25], p8[26], p8[27],
+				    p8[28], p8[29], p8[30], p8[31]);
+			}
 			usbd_setup_xfer(slot->xfer, slot, slot->buf, skb->len,
 			    0, USBD_NO_TIMEOUT, rtw89_usb_txeof);
 			usbd_transfer(slot->xfer);
@@ -533,6 +552,14 @@ rtw89_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	 * The submit path owns the free lists, so hand the slot back
 	 * there.  sc->tx_mtx is never taken from this callback.
 	 */
+	if (status != USBD_NORMAL_COMPLETION && sc->tx_errprints++ < 20) {
+		uint32_t alen = 0;
+
+		usbd_get_xfer_status(xfer, NULL, NULL, &alen, NULL);
+		printf("rtw89usb: BULK OUT err ch=%u status=%d len=%u\n",
+		    slot->ch_dma, status, alen);
+	}
+	sc->tx_completes++;
 	slot->done_status = status;
 	slot->done = true;
 	if (sc->rtwdev != NULL)
@@ -544,6 +571,10 @@ rtw89_usb_tx_kick_off(struct rtw89_dev *rtwdev, u8 txch)
 {
 	struct rtw89_usb_softc *sc = (struct rtw89_usb_softc *)rtwdev->priv;
 
+	if (txch == RTW89_TXCH_CH12 && sc->tx_kicks++ % 32 == 0)
+		printf("rtw89usb: kick#%u sent=%u done=%u\n",
+		    sc->tx_kicks - 1, sc->tx_frames, sc->tx_completes);
+
 	/*
 	 * Submit in the caller's context: the firmware download queues
 	 * hundreds of frames back to back and the chip code reads status
@@ -551,6 +582,25 @@ rtw89_usb_tx_kick_off(struct rtw89_dev *rtwdev, u8 txch)
 	 * their way before the caller continues.
 	 */
 	rtw89_usb_tx_submit(sc);
+
+	/*
+	 * The H2C channel is single-slotted (serialised): with a deep
+	 * inflight window the WCPU accepted only the first frame and the
+	 * rest of the pipeline stalled, so the firmware download never
+	 * finished.  Wait here for this frame's bulk OUT completion
+	 * before the download loop hands over the next one.  The
+	 * completion callback still only marks the slot; the worker
+	 * returns it under the lock.
+	 */
+	if (txch == RTW89_TXCH_CH12) {
+		unsigned int target = sc->tx_completes + 1;
+		int i;
+
+		for (i = 0; i < 1000 && sc->tx_completes < target; i++)
+			kpause("rtw89h2c", false, 1, NULL);
+		if (sc->tx_completes < target && sc->tx_errprints++ < 5)
+			printf("rtw89usb: H2C frame completion timeout\n");
+	}
 }
 
 static u32
@@ -683,6 +733,8 @@ rtw89_usb_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 
 	if (status != USBD_NORMAL_COMPLETION) {
 		/* keep the pipe alive; the chip recovers on re-arming */
+		if (sc->tx_errprints++ < 20)
+			printf("rtw89usb: BULK IN status=%d\n", status);
 		goto resubmit;
 	}
 
