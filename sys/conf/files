@@ -1347,6 +1347,10 @@ include "external/bsd/dwc2/conf/files.dwc2"
 #
 include "external/bsd/rtw88/files.rtw88"
 
+# Realtek rtw89 (RTL8851BU USB)
+#
+include "external/bsd/rtw89/files.rtw89"
+
 # SD Host controller
 device	sdhc: sdmmcbus
 file	dev/sdmmc/sdhc.c		sdhc			needs-flag

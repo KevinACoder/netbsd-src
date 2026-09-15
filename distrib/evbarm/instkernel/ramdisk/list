@@ -96,3 +96,9 @@ COPY	${NETBSDSRCDIR}/external/intel-fw-public/iwl7260/dist/iwlwifi-7260-17.ucode
 # RK3568 lab: rtw88(4) firmware for the Realtek RTL8821CU USB dongle.
 # rtw88 loads <fwdir>/if_rtw88/rtw8821c_fw.bin the same way.
 COPY	${NETBSDSRCDIR}/external/realtek/rtw88/dist/rtw8821c_fw.bin	libdata/firmware/if_rtw88/rtw8821c_fw.bin
+
+# RK3568 lab: rtw89(4) firmware for the Realtek RTL8851BU USB dongle.
+# The driver tries rtw8851b_fw-1.bin (format 1, with element segments)
+# first and falls back to rtw8851b_fw.bin (fw.c iterates fw_format_max..0).
+COPY	${NETBSDSRCDIR}/external/realtek/rtw89/dist/rtw8851b_fw-1.bin	libdata/firmware/if_rtw89/rtw8851b_fw-1.bin
+COPY	${NETBSDSRCDIR}/external/realtek/rtw89/dist/rtw8851b_fw.bin	libdata/firmware/if_rtw89/rtw8851b_fw.bin

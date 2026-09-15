@@ -10,3 +10,4 @@
 ./libdata/firmware	type=dir
 ./libdata/firmware/if_iwm	type=dir
 ./libdata/firmware/if_rtw88	type=dir
+./libdata/firmware/if_rtw89	type=dir

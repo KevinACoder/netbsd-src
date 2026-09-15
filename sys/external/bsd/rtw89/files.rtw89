@@ -1,0 +1,80 @@
+#	$NetBSD$
+#
+# Realtek rtw89 chip logic for the RTL8851BU (USB), imported from the
+# dual-licensed (GPL-2.0 OR BSD-3-Clause) mainline rtw89 tree via the lab's
+# FreeBSD snapshot (see dist/README).  The dist files are used unmodified;
+# netbsd/ supplies the Linux API shapes they compile against and the kernel
+# glue they run on.
+#
+# The files carry the rtw89u attribute (the device defined in
+# dev/usb/files.usb) so that they are only built into kernels with the
+# driver, and CPPFLAGS.rtw89u gives them the two private include
+# directories: netbsd/ first, because it provides linux/*.h and
+# net/mac80211.h, then dist/ for the chip headers.
+
+makeoptions	rtw89u	"CPPFLAGS.rtw89u"+="-I$S/external/bsd/rtw89/netbsd"
+makeoptions	rtw89u	"CPPFLAGS.rtw89u"+="-I$S/external/bsd/rtw89/dist"
+
+# CONFIG_RTW89_DEBUGMSG compiles debug.c's rtw89_debug() logging in, like
+# the FreeBSD lane.  CONFIG_RTW89_DEBUGFS / CONFIG_RTW89_WOW / CONFIG_ACPI
+# stay off: debugfs, wow.c and acpi.c are not imported.
+makeoptions	rtw89u	"CPPFLAGS.rtw89u"+="-DCONFIG_RTW89_DEBUGMSG"
+
+# The snapshot carries #if defined(__linux__) / #elif defined(__FreeBSD__)
+# splits (FreeBSD lab edits) with no #else: on NetBSD neither macro is
+# defined and the parameter lists orphan.  Take the Linux branch, which is
+# the semantics the port implements, without touching dist.
+makeoptions	rtw89u	"CPPFLAGS.rtw89u"+="-D__linux__=1"
+
+# The imported code casts away const and volatile in a few spots; those
+# warnings are not actionable here (the files are used unmodified).
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-cast-qual"
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-discarded-qualifiers"
+# the Linux sources do arithmetic on void pointers
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-pointer-arith"
+# read-modify-write helpers trip the uninitialised-use analysis
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-maybe-uninitialized"
+# the Linux tree does not build with -Wshadow; the imported sources reuse
+# shadowing names in a few rfk/ser helpers
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-shadow"
+# the Linux print formats (%llu on u64) do not match NetBSD LP64 types
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-format"
+# Linux branches of the lab snapshot leave a few bring-up-only helpers
+# and locals unused
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-unused-variable"
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-unused-function"
+makeoptions	rtw89u	"CWARNFLAGS.rtw89u"+="-Wno-address"
+
+# compat layer (sk_buff, workqueue, completion, firmware(9), mac80211 stubs)
+file	external/bsd/rtw89/netbsd/rtw89_compat.c	rtw89u
+file	external/bsd/rtw89/netbsd/rtw89_acpi_stub.c	rtw89u
+
+# imported chip logic, used as-is (BE-gen shared layers included: 8851B is
+# a BE-generation chip and needs mac_be/phy_be/efuse_be)
+file	external/bsd/rtw89/dist/rtw89_core.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_chan.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_mac80211.c		rtw89u
+file	external/bsd/rtw89/dist/rtw89_mac.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_mac_be.c		rtw89u
+file	external/bsd/rtw89/dist/rtw89_phy.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_phy_be.c		rtw89u
+file	external/bsd/rtw89/dist/rtw89_fw.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_cam.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_efuse.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_efuse_be.c		rtw89u
+file	external/bsd/rtw89/dist/rtw89_regd.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_sar.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_coex.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_ps.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_ser.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_util.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_debug.c			rtw89u
+file	external/bsd/rtw89/dist/rtw89_rtw8851b.c		rtw89u
+file	external/bsd/rtw89/dist/rtw89_rtw8851b_rfk.c		rtw89u
+file	external/bsd/rtw89/dist/rtw89_rtw8851b_rfk_table.c	rtw89u
+file	external/bsd/rtw89/dist/rtw89_rtw8851b_table.c	rtw89u
+file	external/bsd/rtw89/dist/rtw89_rtw8851bu.c		rtw89u
+
+# usbdi(9) transport and the chip/net80211 glue
+file	dev/usb/rtw89_usb.c				rtw89u
+file	dev/usb/rtw89_chip.c				rtw89u
