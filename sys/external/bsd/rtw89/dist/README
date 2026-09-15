@@ -1,0 +1,39 @@
+$NetBSD$
+
+rtw89 -- Realtek 802.11ax driver, RTL8851BU subset for the NetBSD
+native port (rtw89u).
+
+Imported from the lab's FreeBSD snapshot at
+os/freebsd/src/sys/contrib/dev/rtw89 (initial import based on
+linux.git 028ef9c96e96, tag v7.0; lab commit 7ffebcdb702d).  The
+snapshot already carries the lab fix RTW8851B_FW_FORMAT_MAX=1
+(rtw8851b.c:29) so fw loading tries rtw8851b_fw-1.bin (format 1,
+with element segments) first, matching the Linux ground truth.
+
+License: every file is dual-licensed "GPL-2.0 OR BSD-3-Clause"
+(SPX-DX header in each file), so a native import under
+sys/external/bsd is permitted, same as the rtw88 precedent.
+
+Included (23 .c): core chan mac80211 mac mac_be phy phy_be fw cam
+efuse efuse_be regd sar coex ps ser util debug + rtw8851b{,_rfk,
+_rfk_table,_table,_bu}.  mac_be/phy_be/efuse_be are the BE-gen
+shared layers required by RTL8851B.
+
+Excluded: pci*/acpi/wow .c files, all rtw8852*/rtw8922* chips and
+their tables, and the Linux-URB-based usb.c (the NetBSD usbdi
+transport lives in sys/dev/usb/rtw89_usb.c, translated from the
+FreeBSD native transport).  Headers pci.h/acpi.h/wow.h are kept:
+they are in the include closure of core.h and only define types.
+
+The .c file names carry an rtw89_ prefix (rtw89_core.c etc.): NetBSD
+kernel objects are named by basename in the compile directory, and the
+rtw88 lane in the same kernel would otherwise overwrite core.o, mac.o,
+fw.o, coex.o ...  Contents are untouched; header names are unchanged
+(the sources' quoted includes still resolve).
+
+The `#if defined(__FreeBSD__)` blocks from the FreeBSD snapshot are
+left in place verbatim: they compile out on NetBSD (which never
+defines __FreeBSD__), and the guarded Linux-side code is exactly
+what we want.  RTW89_LAB_* blocks are likewise inert (never defined
+here).  The dist code is otherwise unmodified and must stay so --
+NetBSD glue lives in ../netbsd.
