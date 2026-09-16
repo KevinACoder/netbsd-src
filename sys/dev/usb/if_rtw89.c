@@ -605,12 +605,16 @@ rtw89_newstate_cb(void *arg)
 		 */
 		rtw89_chip_set_channel(sc->sc_chip,
 		    ieee80211_chan2ieee(ic, ic->ic_curchan));
+		if (ostate != IEEE80211_S_SCAN)
+			rtw89_chip_scan(sc->sc_chip, true);
 		callout_schedule(&sc->sc_scan_to, hz / 5);
 		break;
 
 	case IEEE80211_S_AUTH:
 	case IEEE80211_S_ASSOC:
 	case IEEE80211_S_RUN:
+		if (ostate == IEEE80211_S_SCAN)
+			rtw89_chip_scan(sc->sc_chip, false);
 		if (ostate != nstate) {
 			rtw89_chip_set_channel(sc->sc_chip,
 			    ieee80211_chan2ieee(ic, ic->ic_curchan));
@@ -626,6 +630,8 @@ rtw89_newstate_cb(void *arg)
 		break;
 
 	case IEEE80211_S_INIT:
+		if (ostate == IEEE80211_S_SCAN)
+			rtw89_chip_scan(sc->sc_chip, false);
 		break;
 	}
 	splx(s);
@@ -669,6 +675,7 @@ rtw89_init(struct ifnet *ifp)
 	struct ieee80211com *ic = &sc->sc_ic;
 	int error, s;
 
+	aprint_normal_dev(sc->sc_dev, "init: flags 0x%x\n", ifp->if_flags);
 	if (sc->sc_dying)
 		return ENXIO;
 
@@ -676,6 +683,7 @@ rtw89_init(struct ifnet *ifp)
 	rtw89_stop(ifp, 0);
 
 	if (sc->sc_chip == NULL) {
+		aprint_normal_dev(sc->sc_dev, "init: no chip\n");
 		splx(s);
 		return ENXIO;
 	}
@@ -695,6 +703,8 @@ rtw89_init(struct ifnet *ifp)
 	else
 		ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 	splx(s);
+	aprint_normal_dev(sc->sc_dev, "init done: flags 0x%x\n",
+	    ifp->if_flags);
 	return 0;
 }
 
@@ -730,11 +740,33 @@ rtw89_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 
 	switch (cmd) {
 	case SIOCSIFFLAGS:
-		if ((ifp->if_flags & IFF_UP) != 0) {
-			if ((ifp->if_flags & IFF_RUNNING) == 0)
-				error = rtw89_init(ifp);
-		} else if ((ifp->if_flags & IFF_RUNNING) != 0)
-			rtw89_stop(ifp, 0);
+		aprint_normal_dev(sc->sc_dev,
+		    "ioctl SIOCSIFFLAGS: flags 0x%x\n", ifp->if_flags);
+		if (sc->sc_dying) {
+			error = EIO;
+			break;
+		}
+		/*
+		 * The top-level ifioctl() forwards this to the driver with
+		 * ifp->if_flags still unchanged: the common layer must run
+		 * first to apply ifr_flags (and the UP transition), as
+		 * if_rtw88.c does.
+		 */
+		if ((error = ifioctl_common(ifp, cmd, data)) != 0)
+			break;
+		switch (ifp->if_flags & (IFF_UP | IFF_RUNNING)) {
+		case IFF_RUNNING:
+			rtw89_stop(ifp, 1);
+			break;
+		case IFF_UP:
+			error = rtw89_init(ifp);
+			break;
+		default:
+			break;
+		}
+		aprint_normal_dev(sc->sc_dev,
+		    "ioctl SIOCSIFFLAGS done: flags 0x%x error %d\n",
+		    ifp->if_flags, error);
 		break;
 
 	default:

@@ -581,25 +581,38 @@ rtw89_usb_tx_kick_off(struct rtw89_dev *rtwdev, u8 txch)
 	 * registers right after an H2C frame, so the frames must be on
 	 * their way before the caller continues.
 	 */
-	rtw89_usb_tx_submit(sc);
-
-	/*
-	 * The H2C channel is single-slotted (serialised): with a deep
-	 * inflight window the WCPU accepted only the first frame and the
-	 * rest of the pipeline stalled, so the firmware download never
-	 * finished.  Wait here for this frame's bulk OUT completion
-	 * before the download loop hands over the next one.  The
-	 * completion callback still only marks the slot; the worker
-	 * returns it under the lock.
-	 */
 	if (txch == RTW89_TXCH_CH12) {
+		/*
+		 * Read the completion target BEFORE the submit: a fast
+		 * completion (a live firmware acks H2Cs in a few ms) can
+		 * bump tx_completes between submit and the read, and the
+		 * wait below would then block for the next frame's
+		 * completion -- one full second per H2C.
+		 */
 		unsigned int target = sc->tx_completes + 1;
-		int i;
 
-		for (i = 0; i < 1000 && sc->tx_completes < target; i++)
-			kpause("rtw89h2c", false, 1, NULL);
-		if (sc->tx_completes < target && sc->tx_errprints++ < 5)
-			printf("rtw89usb: H2C frame completion timeout\n");
+		rtw89_usb_tx_submit(sc);
+
+		/*
+		 * The H2C channel is single-slotted (serialised): with a
+		 * deep inflight window the WCPU accepted only the first
+		 * frame and the rest of the pipeline stalled.  The
+		 * completion callback still only marks the slot; the
+		 * worker returns it under the lock.
+		 */
+		if ((int)(sc->tx_completes - target) < 0) {
+			int i;
+
+			for (i = 0; i < 1000 &&
+			    (int)(sc->tx_completes - target) < 0; i++)
+				kpause("rtw89h2c", false, 1, NULL);
+			if ((int)(sc->tx_completes - target) < 0 &&
+			    sc->tx_errprints++ < 5)
+				printf("rtw89usb: H2C frame completion "
+				    "timeout\n");
+		}
+	} else {
+		rtw89_usb_tx_submit(sc);
 	}
 }
 

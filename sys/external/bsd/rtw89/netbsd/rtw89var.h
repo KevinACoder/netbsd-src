@@ -71,6 +71,13 @@ struct rtw89_chip {
 	bool			efuse_valid;
 	uint8_t			fw_format;
 
+	/* the attach sequence (pwr_on, firmware download, chip info)
+	 * completed: the WCPU is running and must not be re-initialised */
+	bool			fw_ready;
+
+	/* the shadow vif is bound to the core (ops->add_interface done) */
+	bool			vif_added;
+
 	/* RX delivery (set by if_rtw89 via rtw89_chip_set_callbacks) */
 	void			*rx_arg;
 	void			(*rx_cb)(void *, const uint8_t *, size_t,

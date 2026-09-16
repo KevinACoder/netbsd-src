@@ -6,8 +6,9 @@
 IMAGE=		ramdisk.fs
 # RK3568 lab: grown from 3072k to fit the iwm 7260 firmware COPY'd in
 # from the workspace (see list); keep in sync with MEMORY_DISK_ROOT_SIZE
-# in sys/arch/evbarm/conf/RK3568_MFS (9216 sectors = 4608 KiB).
-IMAGESIZE=	4608k
+# in sys/arch/evbarm/conf/RK3568_MFS (16384 sectors = 8192 KiB; the two
+# rtw8851b firmware images need 2.5MB on top of the iwm ucode).
+IMAGESIZE=	8192k
 MAKEFS_FLAGS+=	-f 15
 
 WARNS=		1

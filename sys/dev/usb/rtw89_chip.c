@@ -75,6 +75,21 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include "rtw89_chipvar.h"
 #include "rtw89_usbvar.h"
 
+/*
+ * The shadow mac80211 drv_priv[] areas back the imported rtw89 structures
+ * (vif_to_rtwvif()/sta_to_rtwsta() cast them, including one links_inst[]
+ * entry of the MLO-reworked v7.0 shapes).  Keep the sizes honest at
+ * compile time -- only this file sees both the dist and the shadow types.
+ */
+CTASSERT(sizeof(struct rtw89_vif) + sizeof(struct rtw89_vif_link) <=
+    sizeof(((struct ieee80211_vif *)0)->drv_priv));
+CTASSERT(sizeof(struct rtw89_sta) + sizeof(struct rtw89_sta_link) <=
+    sizeof(((struct ieee80211_sta *)0)->drv_priv));
+CTASSERT(sizeof(struct rtw89_txq) <=
+    sizeof(((struct ieee80211_txq *)0)->drv_priv));
+CTASSERT(sizeof(struct rtw89_chanctx_cfg) <=
+    sizeof(((struct ieee80211_chanctx_ctx *)0)->drv_priv));
+
 /* ------------------------------------------------------------------ */
 /* RX delivery: compat ieee80211_rx_napi() hands frames over here      */
 /* ------------------------------------------------------------------ */
@@ -227,6 +242,7 @@ rtw89_chip_attach(device_t dev, struct usbd_device *udev,
 	ether_addr_copy(chip->mac_addr, rtwdev->efuse.addr);
 	chip->efuse_valid = is_valid_ether_addr(chip->mac_addr);
 	chip->fw_format = rtwdev->fw.fw_format;
+	chip->fw_ready = true;
 
 	/* RX delivery: compat ieee80211_rx_napi() lands on our handler */
 	rtw89_chip_instance = chip;
@@ -275,18 +291,120 @@ rtw89_chip_detach(struct rtw89_chip *chip)
 /* start/stop (firmware download lives in core_start)                  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The shadow mac80211 never dispatches ops->add_interface on its own;
+ * the call below is what mac80211 would do after ops->start when the
+ * interface comes up.  It builds the rtwvif in the vif drv_priv[]
+ * (mac_id, port, link instance) and sends the class 8/6/5 H2Cs -- with
+ * zero class-9 (FW_OFLD) traffic on this path.  Without the binding,
+ * every rtw89_core_tx_write() fails with -ENOLINK and the channel and
+ * scan paths see no vif.
+ */
+static int
+rtw89_vif_add(struct rtw89_chip *chip)
+{
+	struct rtw89_dev *rtwdev = chip->rtwdev;
+	struct ieee80211_hw *hw = rtwdev->hw;
+	struct ieee80211_vif *vif;
+	int error;
+
+	vif = rtw89_mac80211_vif(hw);
+	rtw89_mac80211_set_mac(hw, chip->mac_addr);
+
+	error = rtwdev->ops->add_interface(hw, vif);
+	if (error != 0) {
+		rtw89_err(rtwdev, "add_interface failed: %d\n", error);
+		return error;
+	}
+
+	chip->vif_added = true;
+	return 0;
+}
+
+static void
+rtw89_vif_remove(struct rtw89_chip *chip)
+{
+	struct rtw89_dev *rtwdev = chip->rtwdev;
+	struct ieee80211_hw *hw = rtwdev->hw;
+
+	if (!chip->vif_added)
+		return;
+	chip->vif_added = false;
+	rtwdev->ops->remove_interface(hw, rtw89_mac80211_vif(hw));
+}
+
 int
 rtw89_chip_start(struct rtw89_chip *chip)
 {
+	struct rtw89_dev *rtwdev = chip->rtwdev;
+	int error;
 
-	return rtw89_core_start(chip->rtwdev);
+	if (chip->fw_ready) {
+		/*
+		 * chip_info_setup() (attach) left the WCPU running, but the
+		 * Linux ops->start() contract enters with the chip powered
+		 * off -- its probe ends with mac_pwr_off().  Power off here
+		 * so core_start()'s firmware download gets a clean boot (a
+		 * download pushed onto the live firmware stalls).  The
+		 * re-download runs slowly over USB (~0.2-2 s/frame), but
+		 * completes; the CMAC/sys init in core_start is mandatory
+		 * -- without it rtw89_mac_check_mac_en() rejects every vif
+		 * step with -EFAULT.
+		 */
+		rtw89_mac_pwr_off(rtwdev);
+		chip->fw_ready = false;
+	}
+
+	error = rtw89_core_start(rtwdev);
+	if (error != 0)
+		return error;
+
+	/* mac80211's ifup order: ops->start(), then add_interface */
+	if (!chip->vif_added) {
+		error = rtw89_vif_add(chip);
+		if (error != 0)
+			return error;
+	}
+	return 0;
 }
 
 void
 rtw89_chip_stop(struct rtw89_chip *chip)
 {
 
+	/* mac80211's ifdown order: remove_interface, then ops->stop */
+	rtw89_vif_remove(chip);
 	rtw89_core_stop(chip->rtwdev);
+}
+
+/* ------------------------------------------------------------------ */
+/* soft scan enter/leave                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The Linux mac80211 soft-scan brackets: scanning=true enables the
+ * beacon-IE-based RX frequency correction on the chip, LPS/EDCCA are
+ * parked, and the addr cam is refreshed.  mac_addr must be non-NULL
+ * (upstream ether_copy()s it): use the vif address, as mac80211 does.
+ */
+int
+rtw89_chip_scan(struct rtw89_chip *chip, bool on)
+{
+	struct rtw89_dev *rtwdev = chip->rtwdev;
+	struct ieee80211_hw *hw = rtwdev->hw;
+	struct ieee80211_vif *vif;
+
+	if (!chip->vif_added) {
+		rtw89_err(rtwdev, "scan: vif not bound\n");
+		return ENXIO;
+	}
+
+	vif = rtw89_mac80211_vif(hw);
+	if (on)
+		rtwdev->ops->sw_scan_start(hw, vif, vif->addr);
+	else
+		rtwdev->ops->sw_scan_complete(hw, vif);
+	return 0;
 }
 
 bool
@@ -358,22 +476,61 @@ rtw89_chip_set_channel(struct rtw89_chip *chip, unsigned int chan)
 }
 
 /* ------------------------------------------------------------------ */
-/* TX (mbuf -> core; full station wiring lands with M2/M3)             */
+/* TX (mbuf -> skb -> rtw89_core_tx_write)                             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The net80211 front end hands over complete 802.11 frames (no FCS,
+ * same convention mac80211 uses).  During soft scan only management
+ * frames arrive here (probe requests); data frames stay gated until
+ * the station binding lands (M4).  chip_tx() always consumes the mbuf.
+ */
 int
 rtw89_chip_tx(struct rtw89_chip *chip, struct mbuf *m, bool is_mgmt)
 {
 	struct rtw89_dev *rtwdev = chip->rtwdev;
+	struct ieee80211_hw *hw = rtwdev->hw;
+	struct ieee80211_tx_info *info;
+	struct ieee80211_vif *vif;
+	struct sk_buff *skb;
+	size_t len = m->m_pkthdr.len;
+	int qsel;
+	int ret;
+
+	if (!is_mgmt || !chip->vif_added || len == 0 ||
+	    len > RTW89_USB_TX_BUFSZ) {
+		m_freem(m);
+		return 0;
+	}
+
+	/* the HCI tx_write skb_push()es the txdesc: headroom is required */
+	skb = alloc_skb(len + hw->extra_tx_headroom, GFP_ATOMIC);
+	if (skb == NULL) {
+		m_freem(m);
+		return 0;
+	}
+	skb_reserve(skb, hw->extra_tx_headroom);
+	m_copydata(m, 0, len, skb_put(skb, len));
 
 	/*
-	 * core_tx_write() needs bound rtwvif/rtwsta state (drv_priv),
-	 * which only exists once the add-interface/add-station paths of
-	 * the shadow mac80211 are wired (M2 soft scan, M3 association).
-	 * Until then there is no legitimate transmitter.
+	 * No REQ_TX_STATUS for now: the firmware TX-report path is a
+	 * known grey zone on USB and net80211 scanning needs no
+	 * per-frame status.
 	 */
-	(void)rtwdev;
-	(void)is_mgmt;
+	vif = rtw89_mac80211_vif(hw);
+	info = IEEE80211_SKB_CB(skb);
+	info->flags = 0;
+	info->control.vif = vif;
+	info->control.sta = NULL;
+
+	ret = rtw89_core_tx_write(rtwdev, vif, NULL, skb, &qsel);
+	if (ret != 0) {
+		ieee80211_free_txskb(hw, skb);
+		m_freem(m);
+		return 0;
+	}
+
+	rtw89_core_tx_kick_off(rtwdev, (u8)qsel);
 	m_freem(m);
 	return 0;
 }

@@ -71,6 +71,7 @@ int	rtw89_chip_start(struct rtw89_chip *);
 void	rtw89_chip_stop(struct rtw89_chip *);
 int	rtw89_chip_set_channel(struct rtw89_chip *, unsigned int);
 int	rtw89_chip_tx(struct rtw89_chip *, struct mbuf *, bool);
+int	rtw89_chip_scan(struct rtw89_chip *, bool);
 void	rtw89_chip_set_callbacks(struct rtw89_chip *, void *,
 	    rtw89_rx_cb_t);
 bool	rtw89_chip_ready(const struct rtw89_chip *);
