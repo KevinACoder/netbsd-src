@@ -58,6 +58,7 @@ struct ieee80211_hw *rtw89_mac80211_alloc(void *);
 void	rtw89_mac80211_free(struct ieee80211_hw *);
 struct ieee80211_vif *rtw89_mac80211_vif(struct ieee80211_hw *);
 struct ieee80211_sta *rtw89_mac80211_sta(struct ieee80211_hw *);
+void	rtw89_mac80211_set_mac(struct ieee80211_hw *, const uint8_t *);
 void	rtw89_mac80211_set_sta(struct ieee80211_hw *, const uint8_t *, bool);
 void	rtw89_mac80211_set_assoc(struct ieee80211_hw *, const uint8_t *, bool);
 /*

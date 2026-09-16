@@ -1713,8 +1713,13 @@ struct sk_buff {
 	void		*dev;		/* struct device * */
 	void		*sk;
 
-	/* mac80211 control/status block */
-	unsigned long	cb[48 / sizeof(unsigned long)];
+	/*
+	 * mac80211 control/status block.  Must hold the largest of
+	 * struct ieee80211_tx_info (with its driver_data[]) and
+	 * struct ieee80211_rx_status -- the dist code writes both
+	 * through IEEE80211_SKB_CB()/IEEE80211_SKB_RXCB().
+	 */
+	unsigned long	cb[192 / sizeof(unsigned long)];
 } __aligned(4);
 
 #define	skb_queue_empty(q)	((q)->qlen == 0)

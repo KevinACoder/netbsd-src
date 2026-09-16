@@ -559,6 +559,12 @@ rtw89_mac80211_vif(struct ieee80211_hw *hw)
 
 	ctx->vif_valid = true;
 	ctx->vif.type = NL80211_IFTYPE_STATION;
+	/*
+	 * Non-MLD single-link convention: link_conf[0] is the embedded
+	 * bss_conf.  Without it the chip code's link_conf lookups miss
+	 * (rtw89_mac_port_cfg_bcn_psr_rpt et al).
+	 */
+	ctx->vif.link_conf[0] = &ctx->vif.bss_conf;
 	return &ctx->vif;
 }
 
@@ -581,16 +587,30 @@ rtw89_mac80211_set_sta(struct ieee80211_hw *hw, const u8 *addr, bool valid)
 }
 
 void
+rtw89_mac80211_set_mac(struct ieee80211_hw *hw, const u8 *addr)
+{
+	struct rtw89_mac80211_ctx *ctx = rtw89_mac80211_ctx(hw);
+
+	ether_addr_copy(ctx->vif.addr, addr);
+	ether_addr_copy(ctx->vif.bss_conf.addr, addr);
+}
+
+void
 rtw89_mac80211_set_assoc(struct ieee80211_hw *hw, const u8 *bssid, bool assoc)
 {
 	struct rtw89_mac80211_ctx *ctx = rtw89_mac80211_ctx(hw);
 
+	/*
+	 * STA semantics: vif->addr stays our own MAC (set with
+	 * rtw89_mac80211_set_mac()); only the BSSID slots move.
+	 */
 	ctx->vif_valid = true;
 	ctx->vif.cfg.assoc = assoc;
 	ctx->vif.bss_conf.assoc = assoc;
-	ether_addr_copy(ctx->vif.addr, bssid);
-	ether_addr_copy(ctx->vif.bss_conf.bssid, bssid);
-	ctx->vif.bss_conf.basic_rates = 0x01;	/* 1 Mb/s, legacy only */
+	if (bssid) {
+		ether_addr_copy(ctx->vif.cfg.ap_addr, bssid);
+		ether_addr_copy(ctx->vif.bss_conf.bssid, bssid);
+	}
 }
 
 int

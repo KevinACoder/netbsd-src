@@ -1139,7 +1139,8 @@ struct ieee80211_vif {
 		u32	power_type;
 	} cfg;
 	struct ieee80211_txq	*txq;
-	u8			drv_priv[128] __aligned(sizeof(void *));
+	/* holds struct_size_t(struct rtw89_vif, links_inst, 1): 632 + 968 */
+	u8			drv_priv[1600] __aligned(sizeof(void *));
 };
 
 struct ieee80211_he_cap_elem {
@@ -1232,7 +1233,8 @@ struct ieee80211_link_sta {
 	struct ieee80211_sta_vht_cap vht_cap;
 	struct ieee80211_sta_he_cap he_cap;
 	struct ieee80211_sta_eht_cap eht_cap;
-	u8			drv_priv[64] __aligned(sizeof(void *));
+	/* holds struct rtw89_sta_link (see CTASSERTs in rtw89_chip.c) */
+	u8			drv_priv[512] __aligned(sizeof(void *));
 };
 
 struct ieee80211_sta {
@@ -1249,7 +1251,8 @@ struct ieee80211_sta {
 	struct ieee80211_txq	*txq[IEEE80211_NUM_TIDS];
 	u8			supp_rates[IEEE80211_NUM_BANDS];
 	struct ieee80211_link_sta deflink;
-	u8			drv_priv[128] __aligned(sizeof(void *));
+	/* holds struct_size_t(struct rtw89_sta, links_inst, 1): 304 + 568 */
+	u8			drv_priv[880] __aligned(sizeof(void *));
 };
 
 struct ieee80211_txq {
@@ -1257,7 +1260,7 @@ struct ieee80211_txq {
 	u8			tid;
 	struct ieee80211_sta	*sta;
 	struct ieee80211_vif	*vif;
-	u8			drv_priv[64] __aligned(sizeof(void *));
+	u8			drv_priv[128] __aligned(sizeof(void *));
 };
 
 struct ieee80211_tx_info {
@@ -2059,7 +2062,8 @@ struct station_info {
 
 struct ieee80211_chanctx_ctx {
 	struct ieee80211_chanctx_conf conf;
-	u8			drv_priv[32] __aligned(sizeof(void *));
+	/* holds struct rtw89_chanctx_cfg (see CTASSERTs in rtw89_chip.c) */
+	u8			drv_priv[128] __aligned(sizeof(void *));
 };
 
 /*
