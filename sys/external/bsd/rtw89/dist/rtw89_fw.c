@@ -7902,12 +7902,19 @@ void rtw89_fw_c2h_irqsafe(struct rtw89_dev *rtwdev, struct sk_buff *c2h)
 	rtw89_fw_c2h_parse_attr(c2h);
 #ifdef RTW89_LAB_USB
 	/* RK3568 lab: which C2Hs actually reach dispatch (vs the transport's
-	 * 'c' tag) and, for DONE_ACK, the acked H2C identity from w2. */
-	rtw89_usb_lab_tr('C',
-	    (attr->category & 0x3) | ((attr->class & 0x3f) << 2) |
-	    ((attr->func & 0xff) << 8) | ((u32)(c2h->data[10] & 0xff) << 16) |
-	    ((u32)(c2h->data[11] & 0xff) << 24),
-	    attr->len, c2h->len);
+	 * 'c tag') and, for DONE_ACK, the acked H2C identity from w2.  The
+	 * data[10]/[11] peek needs at least 12 payload bytes -- a stalled/
+	 * reset device can deliver shorter descriptors. */
+	if (attr->len >= 12)
+		rtw89_usb_lab_tr('C',
+		    (attr->category & 0x3) | ((attr->class & 0x3f) << 2) |
+		    ((attr->func & 0xff) << 8) | ((u32)(c2h->data[10] & 0xff) << 16) |
+		    ((u32)(c2h->data[11] & 0xff) << 24),
+		    attr->len, c2h->len);
+	else
+		rtw89_usb_lab_tr('c', (attr->category & 0x3) |
+		    ((attr->class & 0x3f) << 2) | ((attr->func & 0xff) << 8),
+		    attr->len, c2h->len);
 #endif
 	if (!rtw89_fw_c2h_chk_atomic(rtwdev, c2h))
 		goto enqueue;

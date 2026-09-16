@@ -126,7 +126,8 @@ struct rtw89_usb_softc {
 	unsigned int		tx_errprints;
 	unsigned int		tx_frames;	/* handed to USB */
 	unsigned int		tx_completes;	/* completed callbacks */
-	unsigned int		tx_kicks;	/* kick_off calls */
+	unsigned int		tx_kicks;
+	unsigned int		rx_errprints;
 	bool			detaching;
 	bool			xfers_inited;
 
@@ -135,6 +136,11 @@ struct rtw89_usb_softc {
 	void			*rx_buf[RTW89_USB_RX_XFERS];
 	struct sk_buff_head	rx_queue;
 	struct work_struct	rx_work;
+	bool			rx_armed;	/* ops_start() re-entrancy:
+						 * attach arms once; core_start's
+						 * hci_start must not double-queue
+						 * the same xfers (usbdi has no
+						 * duplicate-submit protection) */
 
 	uint8_t			pipe_in;
 	uint8_t			bulkout_ep[RTW89_MAX_BULKOUT_NUM];

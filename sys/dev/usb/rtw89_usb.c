@@ -746,8 +746,16 @@ rtw89_usb_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 
 	if (status != USBD_NORMAL_COMPLETION) {
 		/* keep the pipe alive; the chip recovers on re-arming */
-		if (sc->tx_errprints++ < 20)
+		if (sc->rx_errprints++ < 20)
 			printf("rtw89usb: BULK IN status=%d\n", status);
+		if (status == USBD_STALLED)
+			/*
+			 * Fire the async CLEAR_FEATURE(ENDPOINT_HALT) so a
+			 * later re-submit can succeed; until then resubmits
+			 * just re-STALL (softint context, so use the async
+			 * variant).
+			 */
+			usbd_clear_endpoint_stall_async(sc->rx_pipe);
 		goto resubmit;
 	}
 
@@ -814,6 +822,16 @@ rtw89_usb_ops_start(struct rtw89_dev *rtwdev)
 
 	if (!sc->xfers_inited)
 		return 0;
+
+	/*
+	 * core_start() calls hci_start on every ifup, but the RX xfers were
+	 * already armed at attach: NetBSD usbdi queues a re-submitted xfer
+	 * again without any duplicate protection, which corrupts the pipe
+	 * queue (phantom completions, double aborts).
+	 */
+	if (sc->rx_armed)
+		return 0;
+	sc->rx_armed = true;
 
 	/* Arm the bulk IN pipe: firmware C2H replies arrive from here on. */
 	for (i = 0; i < RTW89_USB_RX_XFERS; i++) {
