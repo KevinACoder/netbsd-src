@@ -77,5 +77,10 @@ void	rtw89_chip_set_callbacks(struct rtw89_chip *, void *,
 bool	rtw89_chip_ready(const struct rtw89_chip *);
 const uint8_t *rtw89_chip_mac_addr(const struct rtw89_chip *,
 	    struct rtw89_hw_info *);
+/* The wiphy mutex serialises chip start/stop against the state machine and
+ * the C2H full-handlers (mac80211 contract).  The shadow mac80211 types are
+ * invisible to the front end, hence these helpers. */
+void	rtw89_chip_wiphy_lock(struct rtw89_chip *);
+void	rtw89_chip_wiphy_unlock(struct rtw89_chip *);
 
 #endif /* _RTW89_CHIPVAR_H_ */

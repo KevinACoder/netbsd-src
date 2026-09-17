@@ -309,7 +309,14 @@ typedef struct {
 #define	refcount_dec_and_test(r)					\
 	(atomic_dec_32_nv((volatile unsigned int *)&(r)->counter) == 0)
 
-#define	lockdep_assert_wiphy(w)		do { } while (0)
+/*
+ * mac80211's contract: ops->start/stop and every wiphy_work (C2H handling
+ * among others) run under the wiphy mutex.  The port takes it in the chip
+ * start/stop glue, the net80211 state callback and the wiphy_work
+ * trampoline; mutex_owned() is only meaningful under LOCKDEBUG.
+ */
+#define	lockdep_assert_wiphy(w)						\
+	KASSERT(mutex_owned(&(w)->wiphy_mtx))
 
 /*
  * struct_size()/flex_array_size(): our allocations use the size-header

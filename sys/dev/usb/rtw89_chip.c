@@ -90,6 +90,8 @@ CTASSERT(sizeof(struct rtw89_txq) <=
 CTASSERT(sizeof(struct rtw89_chanctx_cfg) <=
     sizeof(((struct ieee80211_chanctx_ctx *)0)->drv_priv));
 
+static int	rtw89_chip_start_locked(struct rtw89_chip *);
+
 /* ------------------------------------------------------------------ */
 /* RX delivery: compat ieee80211_rx_napi() hands frames over here      */
 /* ------------------------------------------------------------------ */
@@ -343,6 +345,30 @@ int
 rtw89_chip_start(struct rtw89_chip *chip)
 {
 	struct rtw89_dev *rtwdev = chip->rtwdev;
+	struct wiphy *wiphy = rtwdev->hw->wiphy;
+	int error;
+
+	/*
+	 * mac80211 serialises ops->start()/stop() with the wiphy mutex and
+	 * the dist asserts it (lockdep_assert_wiphy in core_start/stop).
+	 * Held here, it keeps the C2H full-handlers (c2h_work and friends on
+	 * the rtw89 worker) out of the power cycle, pipe reset and firmware
+	 * re-download below -- the M2 rounds D/E corruption and the
+	 * 2026-09-17 boot3 panic all raced inside this window.  The atomic
+	 * C2H completers (H2C acks) stay lock-free on purpose: core_start
+	 * sleeps waiting for them while holding this lock.  Callers must
+	 * not hold splnet across this function.
+	 */
+	wiphy_lock(wiphy);
+	error = rtw89_chip_start_locked(chip);
+	wiphy_unlock(wiphy);
+	return error;
+}
+
+static int
+rtw89_chip_start_locked(struct rtw89_chip *chip)
+{
+	struct rtw89_dev *rtwdev = chip->rtwdev;
 	int error;
 
 	if (chip->fw_ready) {
@@ -389,10 +415,28 @@ rtw89_chip_start(struct rtw89_chip *chip)
 void
 rtw89_chip_stop(struct rtw89_chip *chip)
 {
+	struct wiphy *wiphy = chip->rtwdev->hw->wiphy;
 
+	/* see rtw89_chip_start() for the locking contract */
+	wiphy_lock(wiphy);
 	/* mac80211's ifdown order: remove_interface, then ops->stop */
 	rtw89_vif_remove(chip);
 	rtw89_core_stop(chip->rtwdev);
+	wiphy_unlock(wiphy);
+}
+
+void
+rtw89_chip_wiphy_lock(struct rtw89_chip *chip)
+{
+
+	wiphy_lock(chip->rtwdev->hw->wiphy);
+}
+
+void
+rtw89_chip_wiphy_unlock(struct rtw89_chip *chip)
+{
+
+	wiphy_unlock(chip->rtwdev->hw->wiphy);
 }
 
 /* ------------------------------------------------------------------ */

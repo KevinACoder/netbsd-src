@@ -1447,16 +1447,21 @@ cfg80211_ssid_eq(struct cfg80211_ssid *a, struct cfg80211_ssid *b)
 /* rtw89 (v7.0 snapshot) extensions                                    */
 /* ------------------------------------------------------------------ */
 
-/* RCU plumbing: rcu_read_lock() is a no-op (see rtw89_compat.h), so a
- * "call_rcu" callback runs immediately; there is no grace period to
- * wait for because no reader can hold a reference. */
+/* RCU plumbing: there are no read-side critical sections (rcu_read_lock()
+ * is a no-op), which makes an immediate free a use-after-free: the dist
+ * frees wait/tx-wait objects with kfree_rcu() while rtw89_complete_cond on
+ * the rtw89 worker can still hold the raw pointer.  The frees are drained
+ * FIFO on that same worker instead (see rtw89_defer_free in compat.c). */
 struct rcu_head {
 	void			*next;
 	void			(*func)(struct rcu_head *);
 };
 
-#define	kfree_rcu(p, member)	kfree(p)
-#define	call_rcu(h, f)		do { (f)((h)); } while (0)
+void	rtw89_defer_free(void *);
+void	rtw89_defer_call_rcu(struct rcu_head *, void (*)(struct rcu_head *));
+
+#define	kfree_rcu(p, member)	rtw89_defer_free(p)
+#define	call_rcu(h, f)		rtw89_defer_call_rcu((h), (f))
 
 /* Dummy net_device: the napi plumbing wants something to hold on to. */
 struct net_device;

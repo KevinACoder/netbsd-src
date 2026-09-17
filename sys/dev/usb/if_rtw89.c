@@ -608,6 +608,14 @@ rtw89_newstate_cb(void *arg)
 
 	aprint_normal_dev(sc->sc_dev, "newstate: %d -> %d\n", ostate, nstate);
 
+	/*
+	 * The chip glue below sleeps and must not interleave with
+	 * rtw89_chip_start()/stop() (mac80211 runs the state machine under
+	 * the wiphy mutex); this runs on the rtw89 worker at IPL0, so take
+	 * the same lock the chip start/stop paths take.
+	 */
+	rtw89_chip_wiphy_lock(sc->sc_chip);
+
 	s = splnet();
 	callout_stop(&sc->sc_scan_to);
 
@@ -653,6 +661,8 @@ rtw89_newstate_cb(void *arg)
 	splx(s);
 
 	sc->sc_newstate(ic, nstate, sc->sc_cmd_arg);
+
+	rtw89_chip_wiphy_unlock(sc->sc_chip);
 }
 
 static void
@@ -695,22 +705,27 @@ rtw89_init(struct ifnet *ifp)
 	if (sc->sc_dying)
 		return ENXIO;
 
-	s = splnet();
 	rtw89_stop(ifp, 0);
 
 	if (sc->sc_chip == NULL) {
 		aprint_normal_dev(sc->sc_dev, "init: no chip\n");
-		splx(s);
 		return ENXIO;
 	}
+	/*
+	 * The chip path sleeps for real (wiphy mutex, H2C waits, kpause
+	 * polls), so it must run at IPL0: rtw89_chip_start() takes sleeping
+	 * locks, and holding splnet across it also parked this thread in
+	 * kpause for up to ~10 s per timed-out H2C.  rtw89_stop() above
+	 * manages its own short splnet section.
+	 */
 	if ((error = rtw89_chip_start(sc->sc_chip)) != 0) {
 		aprint_error_dev(sc->sc_dev, "failed to start the chip (%d)\n",
 		    error);
-		splx(s);
 		return error;
 	}
 	sc->sc_chip_started = true;
 
+	s = splnet();
 	ifp->if_flags &= ~IFF_OACTIVE;
 	ifp->if_flags |= IFF_RUNNING;
 
@@ -770,6 +785,12 @@ rtw89_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 		 */
 		if ((error = ifioctl_common(ifp, cmd, data)) != 0)
 			break;
+		/*
+		 * The down/up paths take sleeping locks and sleep for real
+		 * (see rtw89_init); drop back to IPL0 for them and re-raise
+		 * for the common tail below.
+		 */
+		splx(s);
 		switch (ifp->if_flags & (IFF_UP | IFF_RUNNING)) {
 		case IFF_RUNNING:
 			rtw89_stop(ifp, 1);
@@ -780,6 +801,7 @@ rtw89_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 		default:
 			break;
 		}
+		s = splnet();
 		aprint_normal_dev(sc->sc_dev,
 		    "ioctl SIOCSIFFLAGS done: flags 0x%x error %d\n",
 		    ifp->if_flags, error);

@@ -100,6 +100,9 @@ rtw89_skb_queue_init(struct sk_buff_head *q)
 	q->next = (struct sk_buff *)q;
 	q->prev = (struct sk_buff *)q;
 	q->qlen = 0;
+	/* Linux's skb_queue_head_init() inits the lock; the c2h_queue take
+	 * it via spin_lock_irqsave (a passive mutex here). */
+	spin_lock_init(&q->lock);
 }
 
 void
@@ -186,6 +189,10 @@ static kmutex_t rtw89_pending_mtx;
 static bool rtw89_worker_started;
 static bool rtw89_ready;
 
+/* deferred kfree_rcu()/call_rcu() drain (defined below) */
+static struct work_struct rtw89_rcu_work;
+static void	rtw89_rcu_work_cb(struct work_struct *);
+
 static void
 rtw89_workqueue_worker(void *arg)
 {
@@ -232,6 +239,7 @@ rtw89_workqueue_ready(void)
 		return;
 	rtw89_ready = true;
 	netbsd_spin_mutex_init(&rtw89_pending_mtx);
+	INIT_WORK(&rtw89_rcu_work, rtw89_rcu_work_cb);
 
 	error = kthread_create(PRI_NONE, 0, NULL, rtw89_workqueue_worker,
 	    NULL, &lwp, "rtw89wq");
@@ -304,6 +312,98 @@ rtw89_work_enqueue_safe(struct work_struct *w)
 	SIMPLEQ_INSERT_TAIL(&rtw89_pending, item, wi_entry);
 	mutex_exit(&rtw89_pending_mtx);
 	wakeup(&rtw89_pending);
+}
+
+/* ------------------------------------------------------------------ */
+/* deferred kfree_rcu / call_rcu                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * There is no real RCU here (rcu_read_lock() is a no-op), so an immediate
+ * free breaks the dist's lifetime contract: rtw89_wait_for_cond_eval's
+ * timeout path frees the wait response while rtw89_complete_cond on the
+ * worker may still hold the raw pointer (2026-09-17 boot3 corruption).
+ * The single rtw89 worker restores the grace period: every completer runs
+ * in a work item queued before the free item (FIFO), and a completer that
+ * runs later re-reads the NULLed pointer.
+ */
+struct rtw89_rcu_item {
+	bool				is_cb;
+	void				*p;
+	void				(*cb)(struct rcu_head *);
+	struct rcu_head			*head;
+	SIMPLEQ_ENTRY(rtw89_rcu_item)	ri_entry;
+};
+
+static SIMPLEQ_HEAD(, rtw89_rcu_item) rtw89_rcu_pending =
+    SIMPLEQ_HEAD_INITIALIZER(rtw89_rcu_pending);
+static struct work_struct rtw89_rcu_work;
+
+static void
+rtw89_rcu_work_cb(struct work_struct *wk)
+{
+	struct rtw89_rcu_item *ri;
+
+	for (;;) {
+		mutex_enter(&rtw89_pending_mtx);
+		ri = SIMPLEQ_FIRST(&rtw89_rcu_pending);
+		if (ri != NULL)
+			SIMPLEQ_REMOVE_HEAD(&rtw89_rcu_pending, ri_entry);
+		mutex_exit(&rtw89_pending_mtx);
+		if (ri == NULL)
+			break;
+		if (ri->is_cb)
+			ri->cb(ri->head);
+		else
+			kfree(ri->p);
+		kmem_free(ri, sizeof(*ri));
+	}
+}
+
+void
+rtw89_defer_free(void *p)
+{
+	struct rtw89_rcu_item *ri;
+
+	if (!rtw89_worker_started) {
+		/* no worker yet: no C2H completer can exist to race with */
+		kfree(p);
+		return;
+	}
+	ri = kmem_alloc(sizeof(*ri), KM_NOSLEEP);
+	if (ri == NULL) {
+		/* leak rather than corrupt: a completer may still hold p */
+		return;
+	}
+	ri->is_cb = false;
+	ri->p = p;
+	mutex_enter(&rtw89_pending_mtx);
+	SIMPLEQ_INSERT_TAIL(&rtw89_rcu_pending, ri, ri_entry);
+	mutex_exit(&rtw89_pending_mtx);
+	rtw89_work_enqueue(&rtw89_rcu_work);
+}
+
+void
+rtw89_defer_call_rcu(struct rcu_head *h, void (*cb)(struct rcu_head *))
+{
+	struct rtw89_rcu_item *ri;
+
+	if (!rtw89_worker_started) {
+		cb(h);
+		return;
+	}
+	ri = kmem_alloc(sizeof(*ri), KM_NOSLEEP);
+	if (ri == NULL) {
+		/* leak rather than corrupt */
+		return;
+	}
+	ri->is_cb = true;
+	ri->cb = cb;
+	ri->head = h;
+	mutex_enter(&rtw89_pending_mtx);
+	SIMPLEQ_INSERT_TAIL(&rtw89_rcu_pending, ri, ri_entry);
+	mutex_exit(&rtw89_pending_mtx);
+	rtw89_work_enqueue(&rtw89_rcu_work);
 }
 
 void
@@ -946,7 +1046,21 @@ rtw89_wiphy_work_trampoline(struct work_struct *w)
 
 	if (ww->cancelled || ww->func == NULL)
 		return;
-	ww->func(ww->wiphy, ww);
+	/*
+	 * mac80211 runs wiphy_work under the wiphy mutex, and the dist
+	 * relies on it (lockdep_assert_wiphy in core start/stop, C2H work
+	 * and coex) to keep the full C2H handlers from interleaving with
+	 * ops->start()/stop() on the ioctl thread.  The atomic C2H
+	 * completers (H2C acks) deliberately run outside, or a core_start
+	 * sleeping on an H2C while holding the lock would deadlock.
+	 */
+	if (ww->wiphy != NULL)
+		wiphy_lock(ww->wiphy);
+	/* a cancel that arrived while queued takes effect once we hold it */
+	if (!ww->cancelled && ww->func != NULL)
+		ww->func(ww->wiphy, ww);
+	if (ww->wiphy != NULL)
+		wiphy_unlock(ww->wiphy);
 }
 
 void
