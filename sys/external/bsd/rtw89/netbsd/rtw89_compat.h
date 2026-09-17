@@ -1383,7 +1383,10 @@ static __always_inline __unused void
 usleep_range(unsigned long lo, unsigned long hi)
 {
 	(void)hi;
-	kpause("rtw89slp", false, MAX(1, (int)mstohz((unsigned int)lo)), NULL);
+	/* lo is microseconds: kpause() ticks are mstohz(us / 1000), clamped
+	 * to one tick (HZ=1000 here, so sub-millisecond sleeps are ~1ms). */
+	kpause("rtw89slp", false,
+	    MAX(1, (int)mstohz((unsigned int)(lo / 1000))), NULL);
 }
 
 static __always_inline __unused void
