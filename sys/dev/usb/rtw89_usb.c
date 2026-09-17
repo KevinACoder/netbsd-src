@@ -724,9 +724,10 @@ rtw89_usb_rx_work_cb(struct work_struct *work)
 			}
 
 			if (rtw89_usb_rx_demux_dbg < 20) {
-				printf("rtw89usb: rx pkt #%u size=%u "
+				printf("rtw89usb: rx pkt #%u type=%u size=%u "
 				    "off=%u rem=%d: %02x %02x %02x %02x\n",
 				    rtw89_usb_rx_demux_dbg,
+				    desc_info.pkt_type,
 				    desc_info.pkt_size, pkt_offset, remaining,
 				    pkt_ptr[pkt_offset], pkt_ptr[pkt_offset + 1],
 				    pkt_ptr[pkt_offset + 2],

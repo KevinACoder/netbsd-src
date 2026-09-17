@@ -404,7 +404,37 @@ rtw89_chip_stop(struct rtw89_chip *chip)
  * beacon-IE-based RX frequency correction on the chip, LPS/EDCCA are
  * parked, and the addr cam is refreshed.  mac_addr must be non-NULL
  * (upstream ether_copy()s it): use the vif address, as mac80211 does.
+ *
+ * mac80211 would normally widen the MAC receive filter for the scan
+ * window via configure_filter(FIF_BCN_PRBRESP_PROMISC) -- dead code
+ * behind this port's net80211 bridge.  Do it here instead, mirroring
+ * the exact bit set upstream clears (hw scan start does the same):
+ * DEFAULT_AX_RX_FLTR keeps A_A1_MATCH|A_BC|A_BCN_CHK_EN set, which
+ * makes the MAC engine drop every beacon from an unknown BSSID before
+ * it reaches USB (C2H rides a separate path, which is why the radio
+ * looks alive while nothing is heard).
  */
+static unsigned int rtw89_chip_rxfltr_dbg;
+
+static void
+rtw89_chip_scan_rx_fltr(struct rtw89_dev *rtwdev, bool widen)
+{
+	const u32 scan_bits = B_AX_A_A1_MATCH | B_AX_A_BC | B_AX_A_BCN_CHK_EN;
+	u32 reg, rx_fltr = rtwdev->hal.rx_fltr;
+
+	if (widen)
+		rx_fltr &= ~scan_bits;
+	if (rtw89_chip_rxfltr_dbg < 4) {
+		reg = rtw89_mac_reg_by_idx(rtwdev,
+		    rtwdev->chip->mac_def->rx_fltr, RTW89_MAC_0);
+		printf("rtw89usb: scan rx_fltr %s ce20 %08x -> %08x\n",
+		    widen ? "widen" : "restore", rtw89_read32(rtwdev, reg),
+		    rx_fltr);
+		rtw89_chip_rxfltr_dbg++;
+	}
+	rtw89_mac_set_rx_fltr(rtwdev, RTW89_MAC_0, rx_fltr);
+}
+
 int
 rtw89_chip_scan(struct rtw89_chip *chip, bool on)
 {
@@ -418,10 +448,13 @@ rtw89_chip_scan(struct rtw89_chip *chip, bool on)
 	}
 
 	vif = rtw89_mac80211_vif(hw);
-	if (on)
+	if (on) {
 		rtwdev->ops->sw_scan_start(hw, vif, vif->addr);
-	else
+		rtw89_chip_scan_rx_fltr(rtwdev, true);
+	} else {
+		rtw89_chip_scan_rx_fltr(rtwdev, false);
 		rtwdev->ops->sw_scan_complete(hw, vif);
+	}
 	return 0;
 }
 
@@ -456,6 +489,8 @@ rtw89_chip_mac_addr(const struct rtw89_chip *chip,
  * port keeps the firmware awake).  The channel number maps into the
  * shadow wiphy's band tables, which the core filled at register time.
  */
+static unsigned int rtw89_chip_ch_dbg;
+
 int
 rtw89_chip_set_channel(struct rtw89_chip *chip, unsigned int chan)
 {
@@ -463,6 +498,7 @@ rtw89_chip_set_channel(struct rtw89_chip *chip, unsigned int chan)
 	struct wiphy *wiphy = rtwdev->hw->wiphy;
 	struct ieee80211_channel *c = NULL;
 	unsigned int band, i;
+	int ret;
 
 	for (band = 0; band < NUM_NL80211_BANDS && c == NULL; band++) {
 		struct ieee80211_supported_band *sband = wiphy->bands[band];
@@ -490,7 +526,21 @@ rtw89_chip_set_channel(struct rtw89_chip *chip, unsigned int chan)
 
 	rtw89_config_entity_chandef(rtwdev, RTW89_CHANCTX_0,
 	    &rtwdev->hw->conf.chandef);
-	return rtw89_set_channel(rtwdev);
+	ret = rtw89_set_channel(rtwdev);
+
+	/*
+	 * Diagnostics: RF18 (CFGCH) low byte must track `chan` after each
+	 * tune.  INV_RF_DATA or a stuck value means the RF bus or the
+	 * entity chandef failed silently.
+	 */
+	if (rtw89_chip_ch_dbg < 32) {
+		u32 rf18 = rtw89_read_rf(rtwdev, RF_PATH_A, 0x18, RFREG_MASK);
+
+		printf("rtw89usb: set_channel %u ret=%d rf18=%08x ch=%u\n",
+		    chan, ret, rf18, rf18 & 0xff);
+		rtw89_chip_ch_dbg++;
+	}
+	return ret;
 }
 
 /* ------------------------------------------------------------------ */
