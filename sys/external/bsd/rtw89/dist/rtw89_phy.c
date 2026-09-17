@@ -1814,6 +1814,11 @@ static void rtw89_phy_init_reg(struct rtw89_dev *rtwdev,
 		return;
 	}
 
+	/* TEMP bring-up diag (remove after M2): locate a reg-table fault */
+	rtw89_err(rtwdev, "init_reg %p: regs %p n_regs %u hl %u/%u rfe %u cv %u\n",
+		  table, table->regs, table->n_regs, headline_size,
+		  headline_idx, rfe, cv);
+
 	cfg_target = get_phy_target(table->regs[headline_idx].addr);
 	for (i = headline_size; i < table->n_regs; i++) {
 		reg = &table->regs[i];
@@ -1850,8 +1855,14 @@ static void rtw89_phy_init_reg(struct rtw89_dev *rtwdev,
 			}
 			break;
 		default:
-			if (is_matched)
+			if (is_matched) {
+				/* TEMP bring-up diag (remove after M2) */
+				if ((i & 0x3f) == 0)
+					rtw89_err(rtwdev,
+					    "init_reg %p: i=%u reg %p\n",
+					    table, i, reg);
 				config(rtwdev, reg, rf_path, extra_data);
+			}
 			break;
 		}
 	}

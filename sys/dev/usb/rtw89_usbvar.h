@@ -128,6 +128,10 @@ struct rtw89_usb_softc {
 	unsigned int		tx_completes;	/* completed callbacks */
 	unsigned int		tx_kicks;
 	unsigned int		rx_errprints;
+	unsigned int		rx_dbg;		/* bring-up probe counter */
+	unsigned int		rx_drop_full;	/* full-buffer transfers */
+	unsigned int		rx_drop_short;	/* sub-descriptor transfers */
+	unsigned int		rx_drop_overrun; /* demux overrun bailouts */
 	bool			detaching;
 	bool			xfers_inited;
 
@@ -136,11 +140,13 @@ struct rtw89_usb_softc {
 	void			*rx_buf[RTW89_USB_RX_XFERS];
 	struct sk_buff_head	rx_queue;
 	struct work_struct	rx_work;
-	bool			rx_armed;	/* ops_start() re-entrancy:
-						 * attach arms once; core_start's
-						 * hci_start must not double-queue
-						 * the same xfers (usbdi has no
-						 * duplicate-submit protection) */
+	bool			rx_armed;	/* a firmware session is live
+						 * on the bulk IN pipe; set by
+						 * ops_start, cleared by
+						 * ops_stop/xfers_fini so each
+						 * session arms fresh xfers
+						 * (usbdi has no duplicate-
+						 * submit protection) */
 
 	uint8_t			pipe_in;
 	uint8_t			bulkout_ep[RTW89_MAX_BULKOUT_NUM];
@@ -156,5 +162,6 @@ struct rtw89_usb_softc {
 int	rtw89_usb_attach(struct rtw89_usb_softc *, device_t,
 	    struct usbd_device *, struct usbd_interface *);
 void	rtw89_usb_detach(struct rtw89_usb_softc *);
+int	rtw89_usb_pipes_reset(struct rtw89_usb_softc *);
 
 #endif /* _RTW89_USBVAR_H_ */

@@ -191,6 +191,7 @@ rtw89_workqueue_worker(void *arg)
 {
 	struct rtw89_work_item *item;
 	struct work_struct *w;
+	static unsigned int dbg_run;
 
 	for (;;) {
 		mutex_enter(&rtw89_pending_mtx);
@@ -207,6 +208,11 @@ rtw89_workqueue_worker(void *arg)
 
 		w = item->wi_work;
 		kmem_free(item, sizeof(*item));
+
+		if (dbg_run < 30)
+			printf("rtw89: wq run w=%p func=%p queued=%u\n",
+			    (void *)w, (void *)w->wk_func, w->wk_queued),
+			    dbg_run++;
 
 		/* the item may requeue itself from inside wk_func() */
 		w->wk_queued = 0;
@@ -277,11 +283,16 @@ void
 rtw89_work_enqueue_safe(struct work_struct *w)
 {
 	struct rtw89_work_item *item;
+	static unsigned int dbg_enq;
 
 	if (!rtw89_worker_started)
 		return;
-	if (atomic_cas_uint(&w->wk_queued, 0, 1) != 0)
+	if (atomic_cas_uint(&w->wk_queued, 0, 1) != 0) {
+		if (dbg_enq < 20)
+			printf("rtw89: wq skip %p queued=%u\n", (void *)w,
+			    w->wk_queued), dbg_enq++;
 		return;
+	}
 
 	item = kmem_alloc(sizeof(*item), KM_NOSLEEP);
 	if (item == NULL) {

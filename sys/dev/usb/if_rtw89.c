@@ -96,6 +96,7 @@ struct rtw89_softc {
 	int			sc_dying;
 	enum ieee80211_state	sc_cmd_state;
 	int			sc_cmd_arg;
+	unsigned int		sc_rx_dbg;
 };
 
 static const struct usb_devno rtw89_devs[] = {
@@ -347,6 +348,15 @@ rtw89_bringup_task(void *arg)
 	}
 	ieee80211_announce(ic);
 	sc->sc_attached = true;
+
+	/*
+	 * A kthread must never return: on aarch64 lwp_trampoline jumps to
+	 * el0_trap_exit with no trapframe, leaving the LWP running loose
+	 * through the kernel (observed as the rtw89probe thread still
+	 * burning a CPU 12 minutes later, with kernel memory dying under
+	 * concurrent walkers).  Exit explicitly.
+	 */
+	kthread_exit(0);
 }
 
 static int
@@ -414,6 +424,10 @@ rtw89_rx_frame(void *ctx, const uint8_t *data, size_t len, int rssi)
 
 	if (sc->sc_dying || len == 0)
 		return;
+
+	if (sc->sc_rx_dbg++ < 20)
+		aprint_normal_dev(sc->sc_dev, "rx frame %zu bytes fc %02x%02x\n",
+		    len, data[0], data[1]);
 
 	/*
 	 * The core hands frames with the FCS attached (it sets
@@ -591,6 +605,8 @@ rtw89_newstate_cb(void *arg)
 		sc->sc_newstate(ic, nstate, sc->sc_cmd_arg);
 		return;
 	}
+
+	aprint_normal_dev(sc->sc_dev, "newstate: %d -> %d\n", ostate, nstate);
 
 	s = splnet();
 	callout_stop(&sc->sc_scan_to);

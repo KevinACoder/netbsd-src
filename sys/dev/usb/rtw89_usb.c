@@ -90,14 +90,16 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include "rtw89_usbvar.h"
 
 static int	rtw89_usb_tx_write(struct rtw89_dev *,
-		    struct rtw89_core_tx_request *);
+			    struct rtw89_core_tx_request *);
 static void	rtw89_usb_tx_submit(struct rtw89_usb_softc *);
 static void	rtw89_usb_tx_complete_skb(struct rtw89_dev *, uint8_t,
-		    struct sk_buff *, usbd_status);
+			    struct sk_buff *, usbd_status);
 static void	rtw89_usb_tx_work_cb(struct work_struct *);
 static void	rtw89_usb_rx_work_cb(struct work_struct *);
 static void	rtw89_usb_txeof(struct usbd_xfer *, void *, usbd_status);
 static void	rtw89_usb_rxeof(struct usbd_xfer *, void *, usbd_status);
+static int	rtw89_usb_xfers_init(struct rtw89_usb_softc *);
+static void	rtw89_usb_xfers_fini(struct rtw89_usb_softc *);
 
 /*
  * Per-chip USB data: the register addresses and the DMA channel to bulk
@@ -653,6 +655,10 @@ rtw89_usb_check_and_reclaim_tx_resource(struct rtw89_dev *rtwdev, u8 txch)
  * bulk transfers.  Runs on the compat worker so the core's receive path
  * may sleep.
  */
+static unsigned int rtw89_usb_rx_demux_dbg;
+static unsigned int rtw89_usb_rx_work_dbg;
+static unsigned int rtw89_usb_rx_overrun_dbg;
+
 static void
 rtw89_usb_rx_work_cb(struct work_struct *work)
 {
@@ -665,6 +671,11 @@ rtw89_usb_rx_work_cb(struct work_struct *work)
 	u8 *pkt_ptr;
 	u32 pkt_offset, aligned;
 	int remaining, limit;
+
+	if (rtw89_usb_rx_work_dbg < 10)
+		printf("rtw89usb: rx work cb sc=%p rtwdev=%p info=%p\n",
+		    (void *)sc, (void *)rtwdev, (void *)sc->info),
+		    rtw89_usb_rx_work_dbg++;
 
 	if (rtwdev == NULL)
 		return;
@@ -694,11 +705,33 @@ rtw89_usb_rx_work_cb(struct work_struct *work)
 			pkt_offset = desc_info.offset + desc_info.rxd_len;
 			if (remaining <
 			    (int)(pkt_offset + desc_info.pkt_size)) {
+				sc->rx_drop_overrun++;
+				if (rtw89_usb_rx_overrun_dbg < 10) {
+					printf("rtw89usb: rx overrun #%u: "
+					    "off=%u rxd=%u size=%u rem=%d "
+					    "d0=%08x\n",
+					    rtw89_usb_rx_overrun_dbg,
+					    desc_info.offset, desc_info.rxd_len,
+					    desc_info.pkt_size, remaining,
+					    le32dec(pkt_ptr));
+					rtw89_usb_rx_overrun_dbg++;
+				}
 				rtw89_debug(rtwdev, RTW89_DBG_HCI,
 				    "rx packet overruns the transfer "
 				    "(%u + %u > %u)\n", pkt_offset,
 				    desc_info.pkt_size, remaining);
 				break;
+			}
+
+			if (rtw89_usb_rx_demux_dbg < 20) {
+				printf("rtw89usb: rx pkt #%u size=%u "
+				    "off=%u rem=%d: %02x %02x %02x %02x\n",
+				    rtw89_usb_rx_demux_dbg,
+				    desc_info.pkt_size, pkt_offset, remaining,
+				    pkt_ptr[pkt_offset], pkt_ptr[pkt_offset + 1],
+				    pkt_ptr[pkt_offset + 2],
+				    pkt_ptr[pkt_offset + 3]);
+				rtw89_usb_rx_demux_dbg++;
 			}
 
 			skb = rtw89_alloc_skb_for_rx(rtwdev,
@@ -767,8 +800,21 @@ rtw89_usb_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	 * packet across transfers, which the demux would misread --
 	 * drop both.
 	 */
-	if (actlen < RTW89_USB_RX_MIN_LEN || actlen >= RTW89_USB_RX_BUFSZ)
+	if (actlen < RTW89_USB_RX_MIN_LEN) {
+		sc->rx_drop_short++;
 		goto resubmit;
+	}
+	if (actlen >= RTW89_USB_RX_BUFSZ) {
+		sc->rx_drop_full++;
+		goto resubmit;
+	}
+
+	if (sc->rx_dbg < 30) {
+		printf("rtw89usb: rx xfer #%u actlen=%u "
+		    "(full=%u short=%u)\n", sc->rx_dbg, actlen,
+		    sc->rx_drop_full, sc->rx_drop_short);
+		sc->rx_dbg++;
+	}
 
 	skb = alloc_skb(actlen, GFP_ATOMIC);
 	if (skb != NULL) {
@@ -824,10 +870,10 @@ rtw89_usb_ops_start(struct rtw89_dev *rtwdev)
 		return 0;
 
 	/*
-	 * core_start() calls hci_start on every ifup, but the RX xfers were
-	 * already armed at attach: NetBSD usbdi queues a re-submitted xfer
-	 * again without any duplicate protection, which corrupts the pipe
-	 * queue (phantom completions, double aborts).
+	 * Arm the RX xfers once per firmware session.  NetBSD usbdi queues
+	 * a re-submitted xfer again without any duplicate protection, so
+	 * ops_stop/pipes_reset clear rx_armed together with the pipe state
+	 * and every core_start arms freshly created xfers.
 	 */
 	if (sc->rx_armed)
 		return 0;
@@ -847,6 +893,20 @@ rtw89_usb_ops_start(struct rtw89_dev *rtwdev)
 static void
 rtw89_usb_ops_stop(struct rtw89_dev *rtwdev)
 {
+	struct rtw89_usb_softc *sc = (struct rtw89_usb_softc *)rtwdev->priv;
+
+	/*
+	 * core_stop() calls hci_stop: quiesce the bulk IN pipe so no C2H
+	 * from the dying firmware session reaches the core.  Cancelled
+	 * completions return from rxeof without re-arming.  The bulk OUT
+	 * pipes are torn down by the next chip_start()'s pipes_reset()
+	 * (the firmware restart reinitialises its endpoints, so the
+	 * host-side data toggles must not carry across).
+	 */
+	if (sc->rx_armed) {
+		usbd_abort_pipe(sc->rx_pipe);
+		sc->rx_armed = false;
+	}
 }
 
 static void
@@ -1061,7 +1121,7 @@ rtw89_usb_parse_endpoints(struct rtw89_usb_softc *sc)
 	usb_interface_descriptor_t *id;
 	usb_endpoint_descriptor_t *ed;
 	uint8_t num, nout = 0;
-	int j, n;
+	int j;
 
 	id = usbd_get_interface_descriptor(sc->iface);
 	if (id == NULL) {
@@ -1111,13 +1171,19 @@ rtw89_usb_parse_endpoints(struct rtw89_usb_softc *sc)
 	}
 
 	sc->n_out_ep = nout;
+	return 0;
+}
 
-	/*
-	 * Map the DMA channels onto the discovered bulk OUT endpoints
-	 * (endpoint numbers, not interface endpoint indices), and open
-	 * one pipe per channel.  The bulkout_id table is the contrib
-	 * rtw8851b_usb_info map.
-	 */
+/*
+ * Map the DMA channels onto the discovered bulk OUT endpoints (endpoint
+ * numbers, not interface endpoint indices), and open one pipe per
+ * channel.  The bulkout_id table is the contrib rtw8851b_usb_info map.
+ */
+static int
+rtw89_usb_open_bulkout_pipes(struct rtw89_usb_softc *sc)
+{
+	int j, n;
+
 	n = 0;
 	for (j = 0; j < (int)__arraycount(rtw89_usb_ch_map); j++) {
 		struct rtw89_usb_ch *ch =
@@ -1151,14 +1217,159 @@ rtw89_usb_parse_endpoints(struct rtw89_usb_softc *sc)
 	return 0;
 }
 
-int
-rtw89_usb_attach(struct rtw89_usb_softc *sc, device_t dev,
-    struct usbd_device *udev, struct usbd_interface *iface)
+/*
+ * Tear down every pipe and transfer.  Also the first half of
+ * pipes_reset(): aborting completes the in-flight callbacks (CANCELLED
+ * paths in txeof/rxeof), then the xfers are safe to destroy.
+ */
+static void
+rtw89_usb_xfers_fini(struct rtw89_usb_softc *sc)
+{
+	struct rtw89_usb_ch *ch;
+	struct rtw89_usb_tx_slot *slot;
+	uint8_t dma;
+	int i;
+
+	sc->rx_armed = false;
+
+	if (sc->rx_pipe != NULL)
+		usbd_abort_pipe(sc->rx_pipe);
+	for (dma = 0; dma < RTW89_USB_CH_MAX; dma++) {
+		ch = &sc->ch[dma];
+		if (ch->pipe != NULL)
+			usbd_abort_pipe(ch->pipe);
+	}
+
+	mutex_enter(&sc->tx_mtx);
+	for (dma = 0; dma < RTW89_USB_CH_MAX; dma++) {
+		ch = &sc->ch[dma];
+		if (ch->nslots != 0)
+			skb_queue_purge(&ch->queue);
+	}
+	skb_queue_purge(&sc->rx_queue);
+
+	for (dma = 0; dma < RTW89_USB_CH_MAX; dma++) {
+		ch = &sc->ch[dma];
+		while ((slot = TAILQ_FIRST(&ch->inflight)) != NULL) {
+			TAILQ_REMOVE(&ch->inflight, slot, next);
+			if (slot->skb != NULL) {
+				/* frames of the dead firmware session */
+				dev_kfree_skb_any(slot->skb);
+				slot->skb = NULL;
+			}
+			usbd_destroy_xfer(slot->xfer);
+			kmem_free(slot, sizeof(*slot));
+		}
+		while ((slot = TAILQ_FIRST(&ch->free)) != NULL) {
+			TAILQ_REMOVE(&ch->free, slot, next);
+			usbd_destroy_xfer(slot->xfer);
+			kmem_free(slot, sizeof(*slot));
+		}
+		if (ch->pipe != NULL) {
+			usbd_close_pipe(ch->pipe);
+			ch->pipe = NULL;
+		}
+		ch->nslots = 0;
+		ch->busy = 0;
+	}
+	sc->xfers_inited = false;
+	mutex_exit(&sc->tx_mtx);
+
+	for (i = 0; i < RTW89_USB_RX_XFERS; i++) {
+		if (sc->rx_xfer[i] != NULL) {
+			usbd_destroy_xfer(sc->rx_xfer[i]);
+			sc->rx_xfer[i] = NULL;
+		}
+	}
+	if (sc->rx_pipe != NULL) {
+		usbd_close_pipe(sc->rx_pipe);
+		sc->rx_pipe = NULL;
+	}
+}
+
+static int
+rtw89_usb_xfers_init(struct rtw89_usb_softc *sc)
 {
 	struct rtw89_usb_ch *ch;
 	struct rtw89_usb_tx_slot *slot;
 	uint8_t dma;
 	int i, error;
+
+	/* bulk IN pipe + RX transfer ring */
+	error = usbd_open_pipe(sc->iface, sc->pipe_in | UE_DIR_IN,
+	    USBD_EXCLUSIVE_USE, &sc->rx_pipe);
+	if (error != 0) {
+		aprint_error_dev(sc->dev, "%s: cannot open bulk IN pipe (%d)\n",
+		    __func__, error);
+		return error;
+	}
+
+	for (i = 0; i < RTW89_USB_RX_XFERS; i++) {
+		error = usbd_create_xfer(sc->rx_pipe, RTW89_USB_RX_BUFSZ,
+		    USBD_SHORT_XFER_OK, 0, &sc->rx_xfer[i]);
+		if (error != 0)
+			goto out_fini;
+		sc->rx_buf[i] = usbd_get_buffer(sc->rx_xfer[i]);
+	}
+
+	/* one TX slot pool per DMA channel, xfers bound to the channel pipe */
+	error = rtw89_usb_open_bulkout_pipes(sc);
+	if (error != 0)
+		goto out_fini;
+	for (dma = 0; dma < RTW89_USB_CH_MAX; dma++) {
+		ch = &sc->ch[dma];
+		for (i = 0; i < ch->nslots; i++) {
+			slot = kmem_zalloc(sizeof(*slot), KM_SLEEP);
+			error = usbd_create_xfer(ch->pipe, RTW89_USB_TX_BUFSZ,
+			    0, 0, &slot->xfer);
+			if (error != 0) {
+				kmem_free(slot, sizeof(*slot));
+				goto out_fini;
+			}
+			slot->buf = usbd_get_buffer(slot->xfer);
+			slot->sc = sc;
+			slot->ch_dma = dma;
+			TAILQ_INSERT_TAIL(&ch->free, slot, next);
+		}
+	}
+
+	sc->xfers_inited = true;
+	return 0;
+
+out_fini:
+	rtw89_usb_xfers_fini(sc);
+	return error;
+}
+
+/*
+ * Bring every bulk pipe back to a pristine host-side state.  mac_pwr_off
+ * restarts the device firmware, which reinitialises its bulk endpoints
+ * at DATA0; a host-side pipe that carried traffic across that boundary
+ * stays mid-toggle-stream and every transfer crawls -- the second
+ * firmware download ran 0.2-2 s/frame this way, while the attach
+ * download on freshly opened pipes ran ~1 ms/frame.  xhci(4) allocates a
+ * fresh transfer ring and endpoint context in usbd_open_pipe
+ * (xhci_open -> xhci_ring_init + xhci_configure_endpoint), so
+ * close+open re-synchronises both sides of every endpoint.
+ */
+int
+rtw89_usb_pipes_reset(struct rtw89_usb_softc *sc)
+{
+
+	if (!sc->xfers_inited || sc->detaching)
+		return ENXIO;
+
+	rtw89_usb_xfers_fini(sc);
+	return rtw89_usb_xfers_init(sc);
+}
+
+int
+rtw89_usb_attach(struct rtw89_usb_softc *sc, device_t dev,
+    struct usbd_device *udev, struct usbd_interface *iface)
+{
+	struct rtw89_usb_ch *ch;
+	uint8_t dma;
+	int error;
 
 	memset(sc, 0, sizeof(*sc));
 	sc->dev = dev;
@@ -1184,92 +1395,15 @@ rtw89_usb_attach(struct rtw89_usb_softc *sc, device_t dev,
 	if (error != 0)
 		return error;
 
-	/* bulk IN pipe + RX transfer ring */
-	error = usbd_open_pipe(sc->iface, sc->pipe_in | UE_DIR_IN,
-	    USBD_EXCLUSIVE_USE, &sc->rx_pipe);
-	if (error != 0) {
-		aprint_error_dev(dev, "%s: cannot open bulk IN pipe (%d)\n",
-		    __func__, error);
-		return error;
-	}
-
-	for (i = 0; i < RTW89_USB_RX_XFERS; i++) {
-		error = usbd_create_xfer(sc->rx_pipe, RTW89_USB_RX_BUFSZ,
-		    USBD_SHORT_XFER_OK, 0, &sc->rx_xfer[i]);
-		if (error != 0)
-			return error;
-		sc->rx_buf[i] = usbd_get_buffer(sc->rx_xfer[i]);
-	}
-
-	/* one TX slot pool per DMA channel, xfers bound to the channel pipe */
-	for (dma = 0; dma < RTW89_USB_CH_MAX; dma++) {
-		ch = &sc->ch[dma];
-		for (i = 0; i < ch->nslots; i++) {
-			slot = kmem_zalloc(sizeof(*slot), KM_SLEEP);
-			error = usbd_create_xfer(ch->pipe, RTW89_USB_TX_BUFSZ,
-			    0, 0, &slot->xfer);
-			if (error != 0) {
-				kmem_free(slot, sizeof(*slot));
-				return error;
-			}
-			slot->buf = usbd_get_buffer(slot->xfer);
-			slot->sc = sc;
-			slot->ch_dma = dma;
-			TAILQ_INSERT_TAIL(&ch->free, slot, next);
-		}
-	}
-
-	sc->xfers_inited = true;
-	return 0;
+	return rtw89_usb_xfers_init(sc);
 }
 
 void
 rtw89_usb_detach(struct rtw89_usb_softc *sc)
 {
-	struct rtw89_usb_tx_slot *slot;
-	struct rtw89_usb_ch *ch;
-	uint8_t dma;
-	int i;
-
 	sc->detaching = true;
-	sc->xfers_inited = false;
 
-	for (i = 0; i < RTW89_USB_RX_XFERS; i++) {
-		if (sc->rx_xfer[i] == NULL)
-			continue;
-		usbd_destroy_xfer(sc->rx_xfer[i]);
-		sc->rx_xfer[i] = NULL;
-	}
-	if (sc->rx_pipe != NULL) {
-		usbd_abort_pipe(sc->rx_pipe);
-		usbd_close_pipe(sc->rx_pipe);
-		sc->rx_pipe = NULL;
-	}
-
-	mutex_enter(&sc->tx_mtx);
-	for (dma = 0; dma < RTW89_USB_CH_MAX; dma++) {
-		ch = &sc->ch[dma];
-		skb_queue_purge(&ch->queue);
-		if (ch->pipe != NULL)
-			usbd_abort_pipe(ch->pipe);
-		while ((slot = TAILQ_FIRST(&ch->inflight)) != NULL) {
-			TAILQ_REMOVE(&ch->inflight, slot, next);
-			usbd_destroy_xfer(slot->xfer);
-			kmem_free(slot, sizeof(*slot));
-		}
-		while ((slot = TAILQ_FIRST(&ch->free)) != NULL) {
-			TAILQ_REMOVE(&ch->free, slot, next);
-			usbd_destroy_xfer(slot->xfer);
-			kmem_free(slot, sizeof(*slot));
-		}
-		if (ch->pipe != NULL) {
-			usbd_close_pipe(ch->pipe);
-			ch->pipe = NULL;
-		}
-		ch->nslots = 0;
-	}
-	skb_queue_purge(&sc->rx_queue);
-	mutex_exit(&sc->tx_mtx);
+	rtw89_usb_xfers_fini(sc);
 
 	rtw89_work_flush(&sc->tx_work);
 	rtw89_work_flush(&sc->rx_work);

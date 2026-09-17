@@ -186,11 +186,13 @@ rtw89_chip_attach(device_t dev, struct usbd_device *udev,
 		return NULL;
 	}
 
+	/*
+	 * Do NOT touch the softc before rtw89_usb_attach(): it memsets the
+	 * whole struct (which used to wipe the rtwdev backpointer written
+	 * here, leaving every rx_work callback to bail on rtwdev == NULL --
+	 * the reason no C2H packet ever reached the core).
+	 */
 	usb = (struct rtw89_usb_softc *)rtwdev->priv;
-	memset(usb, 0, sizeof(*usb));
-	usb->rtwdev = rtwdev;
-	usb->udev = udev;
-	usb->iface = iface;
 
 	/* the hci vtable must be installed on the rtwdev we keep */
 	rtwdev->hci.ops = rtw89_usb_get_ops();
@@ -203,6 +205,10 @@ rtw89_chip_attach(device_t dev, struct usbd_device *udev,
 	error = rtw89_usb_attach(usb, dev, udev, iface);
 	if (error != 0)
 		goto out_fail;
+
+	usb->rtwdev = rtwdev;
+	usb->udev = udev;
+	usb->iface = iface;
 
 	/*
 	 * core_init brings the core up; chip_info_setup powers the MAC,
@@ -341,19 +347,31 @@ rtw89_chip_start(struct rtw89_chip *chip)
 
 	if (chip->fw_ready) {
 		/*
-		 * chip_info_setup() (attach) left the WCPU running, but the
-		 * Linux ops->start() contract enters with the chip powered
-		 * off -- its probe ends with mac_pwr_off().  Power off here
-		 * so core_start()'s firmware download gets a clean boot (a
-		 * download pushed onto the live firmware stalls).  The
-		 * re-download runs slowly over USB (~0.2-2 s/frame), but
-		 * completes; the CMAC/sys init in core_start is mandatory
-		 * -- without it rtw89_mac_check_mac_en() rejects every vif
-		 * step with -EFAULT.
+		 * Enter with the chip powered off, as the Linux ops->start()
+		 * contract requires: chip_info_setup() ends with mac_pwr_off
+		 * (dist core.c) and core_stop() powers off on the down path.
+		 * The defensive pwr_off covers boots where a previous
+		 * core_start left the WCPU running -- a firmware download
+		 * pushed onto the live firmware stalls.
 		 */
 		rtw89_mac_pwr_off(rtwdev);
 		chip->fw_ready = false;
 	}
+
+	/*
+	 * The firmware restart above reinitialises the device's bulk
+	 * endpoints at DATA0, while the host-side pipes still carry the
+	 * previous session's data-toggle state (the attach download ran on
+	 * these very pipes).  Close and reopen every pipe -- xhci(4)
+	 * allocates a fresh transfer ring and endpoint context on
+	 * usbd_open_pipe -- so the download below starts from matched
+	 * toggles.  With stale pipes the re-download crawled at
+	 * 0.2-2 s/frame and the RF table walk behind it ran on timeouts
+	 * (M2 evidence, rounds D/E).
+	 */
+	error = rtw89_usb_pipes_reset((struct rtw89_usb_softc *)rtwdev->priv);
+	if (error != 0)
+		return error;
 
 	error = rtw89_core_start(rtwdev);
 	if (error != 0)
@@ -485,6 +503,8 @@ rtw89_chip_set_channel(struct rtw89_chip *chip, unsigned int chan)
  * frames arrive here (probe requests); data frames stay gated until
  * the station binding lands (M4).  chip_tx() always consumes the mbuf.
  */
+static unsigned int rtw89_chip_tx_dbg;
+
 int
 rtw89_chip_tx(struct rtw89_chip *chip, struct mbuf *m, bool is_mgmt)
 {
@@ -496,6 +516,16 @@ rtw89_chip_tx(struct rtw89_chip *chip, struct mbuf *m, bool is_mgmt)
 	size_t len = m->m_pkthdr.len;
 	int qsel;
 	int ret;
+
+	if (is_mgmt && rtw89_chip_tx_dbg < 10) {
+		uint8_t fc[2] = { 0, 0 };
+
+		if (len >= 2)
+			m_copydata(m, 0, 2, fc);
+		printf("rtw89usb: mgmt tx %zu bytes fc %02x %02x\n",
+		    len, fc[0], fc[1]);
+		rtw89_chip_tx_dbg++;
+	}
 
 	if (!is_mgmt || !chip->vif_added || len == 0 ||
 	    len > RTW89_USB_TX_BUFSZ) {
