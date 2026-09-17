@@ -1,0 +1,84 @@
+#	$NetBSD$
+#
+#	RK3568 NFS-root lane: same bring-up SoC glue as RK3568_SATA, but the
+#	root filesystem is an NFSv3 export served by the lab host
+#	(/var/lib/rk3568-lab/nfs/os/netbsd/active on 192.168.0.18).
+#
+#	Boot over TFTP + U-Boot booti with no bootargs (aarch64 does not
+#	parse root= from bootargs).  Root selection is a two-part handshake,
+#	all stock upstream code:
+#	  - board/rk3568-netbsd-nfs.dts /chosen/netbsd,booted-mac-address
+#	    pins booted_device to gmac1 (eqos1, fe010000, contract MAC
+#	    02:e4:a5:35:68:01 -- the lab reliable port, KI-003; note NetBSD
+#	    names this eqos1 while FreeBSD calls the same hardware eqos0)
+#	  - NFS_BOOT_BOOTSTATIC supplies client IP/netmask/gateway and the
+#	    "server:/export" root path (the lab router DHCP cannot provide
+#	    option 17 root-path, so plain NFS_BOOT_DHCP would die in
+#	    nfs_boot_getfh with "getfh - no pathname"; bootstatic is tried
+#	    first in nfs_boot_init, DHCP below stays as the fallback)
+#
+#	Transport: the kernel's boot-time portmap/mountd RPCs are UDP-only
+#	(krpc_subr.c), while the NFS data connection defaults to TCP
+#	(SOCK_STREAM unless NFS_BOOT_UDP).  The lab forwards both from the
+#	board-visible 192.168.0.18 into the WSL2 NFS server: TCP portproxy
+#	(111/2049/40001, existing) plus tools/oslab-udp-relay for
+#	111/udp + 40001/udp.  NFS_BOOT_RWSIZE is bumped from GENERIC's 1 KiB
+#	default to 32 KiB.
+#
+#	Everything from GENERIC64 stays enabled ("都打开"), matching
+#	RK3568_MFS/RK3568_SATA so all lanes exercise the same driver matrix.
+
+include	"arch/evbarm/conf/GENERIC64"
+
+# RK3568 bring-up SoC (fixed-rate CRU stub + platform glue)
+options 	SOC_RK3568
+
+# Lab debug lane: keep securelevel permanently insecure so /dev/mem stays
+# usable for GICD-level interrupt debugging (KI-023 work); init(8) raises
+# to level 1 on multi-user otherwise, even with rc.conf securelevel=0.
+options 	INSECURE
+
+# RK3568 SATA / PCIe lanes (NanoEng combo PHY, SATA + PCIe modes).
+# pass 8: fdt default-pass attach order follows the node's phandle
+# value (fdt_get_order), not document order - on this dtb pcie2x1 has a
+# lower phandle than combphy2 and would attach (and fail to find its
+# phy) before the phy controller is registered.  Pin the combphys to
+# pass 8 so all three lanes are registered before the root complexes.
+rkcombphy*	at fdt? pass 8
+
+# RK3568 USB2 PHY (dwc3 xHCI lanes, USB domain bring-up)
+rkusb2phy*	at fdt?
+
+# RK3568 PCIe3 PHY (pcie30phy SRAM firmware) and DWC PCIe hosts.
+# The phy attaches in pass 9 so it registers before the root complexes;
+# the rkdwpcie line stays after rkcombphy (same default pass, fdt
+# children attach in document order and combphy2 must exist first).
+rk30pciephy*	at fdt? pass 9
+rkdwpcie*	at fdt?
+
+# Intel Wireless (802.11ac, PCIe): Dual Band Wireless-AC 7260 in the
+# x4 slot; firmware lives on the root filesystem (pkg/sets), not here.
+iwm*		at pci? dev ? function ?
+
+# iwm firmware-error dumps (iwm_nic_error) and scan trace output.
+options 	IWM_DEBUG
+
+# Onboard I2C devices (i2c0 PMIC, i2c1 battery RTC + power monitor);
+# rkiic/iic/cpufreqdt/rktsadc come in via GENERIC64.
+rk809pmic*	at iic?
+rx8025rtc*	at iic?
+ina3221mon*	at iic?
+
+# --- NFS root boot parameters (see file header).  The client address
+# mirrors the router DHCP contract lease for 02:e4:a5:35:68:01 (a
+# router-side MAC reservation is the long-term fix, see run
+# doc/rk3568-itx-wiki/runs/20260917-netbsd-nfs-root/).
+options 	NFS_BOOT_BOOTSTATIC
+options 	NFS_BOOTSTATIC_MYIP="\"192.168.0.83\""
+options 	NFS_BOOTSTATIC_GWIP="\"192.168.0.1\""
+options 	NFS_BOOTSTATIC_MASK="\"255.255.255.0\""
+options 	NFS_BOOTSTATIC_SERVADDR="\"192.168.0.18\""
+options 	NFS_BOOTSTATIC_SERVER="\"192.168.0.18:/var/lib/rk3568-lab/nfs/os/netbsd/active\""
+
+no options 	NFS_BOOT_RWSIZE
+options 	NFS_BOOT_RWSIZE=32768
