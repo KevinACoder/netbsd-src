@@ -54,3 +54,7 @@ options 	IWM_DEBUG
 rk809pmic*	at iic?
 rx8025rtc*	at iic?
 ina3221mon*	at iic?
+
+# RTL8189FTV SDIO wifi module in the SD slot (fe2b0000); rtw8189f(4) is a
+# clean-room net80211 port of the RTL8188F SDIO silicon (024c:f179).
+rtw8189f*	at sdmmc?

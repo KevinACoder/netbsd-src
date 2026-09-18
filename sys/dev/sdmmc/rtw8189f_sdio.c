@@ -1,0 +1,111 @@
+/*	$NetBSD$	*/
+
+/*-
+ * Copyright (c) 2026 The NetBSD Foundation, Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * SDIO transport for the RTL8189FTV.
+ *
+ * MAC/BB/RF registers live in the "WLAN I/O register" area (DeviceID 8),
+ * the SDIO-local registers in DeviceID 0.  One-byte accesses always go
+ * out as CMD52 (that is also the only reliable form before the MAC is
+ * powered); 2/4-byte accesses use CMD53 incremental transfers, which is
+ * what the vendor driver does and what the power-on self test relies on
+ * (it compares CMD52 byte reads with a CMD53 dword read of REG_CR).
+ */
+
+#include <sys/cdefs.h>
+__KERNEL_RCSID(0, "$NetBSD$");
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/device.h>
+
+#include <dev/sdmmc/sdmmcvar.h>
+#include <dev/sdmmc/sdmmcchip.h>
+
+#include "rtw8189fvar.h"
+
+static uint32_t
+rtw8189f_sdiolocal_addr(uint16_t reg)
+{
+	return (RTW8189F_SDIO_LOCAL_DEVICE_ID << 13) | (reg & RTW8189F_SDIO_LOCAL_MSK);
+}
+
+static uint32_t
+rtw8189f_ioreg_addr(uint32_t addr)
+{
+	return (RTW8189F_WLAN_IOREG_DEVICE_ID << 13) | (addr & RTW8189F_WLAN_IOREG_MSK);
+}
+
+uint8_t
+rtw8189f_sdiolocal_read_1(struct rtw8189f_softc *sc, uint16_t reg)
+{
+	return sdmmc_io_read_1(sc->sc_sf, rtw8189f_sdiolocal_addr(reg));
+}
+
+void
+rtw8189f_sdiolocal_write_1(struct rtw8189f_softc *sc, uint16_t reg,
+    uint8_t val)
+{
+	sdmmc_io_write_1(sc->sc_sf, rtw8189f_sdiolocal_addr(reg), val);
+}
+
+uint8_t
+rtw8189f_mac_read_1(struct rtw8189f_softc *sc, uint32_t addr)
+{
+	return sdmmc_io_read_1(sc->sc_sf, rtw8189f_ioreg_addr(addr));
+}
+
+uint16_t
+rtw8189f_mac_read_2(struct rtw8189f_softc *sc, uint32_t addr)
+{
+	/* sdmmc_io_read_2() issues a CMD53 incremental read. */
+	return sdmmc_io_read_2(sc->sc_sf, rtw8189f_ioreg_addr(addr));
+}
+
+uint32_t
+rtw8189f_mac_read_4(struct rtw8189f_softc *sc, uint32_t addr)
+{
+	return sdmmc_io_read_4(sc->sc_sf, rtw8189f_ioreg_addr(addr));
+}
+
+void
+rtw8189f_mac_write_1(struct rtw8189f_softc *sc, uint32_t addr, uint8_t val)
+{
+	sdmmc_io_write_1(sc->sc_sf, rtw8189f_ioreg_addr(addr), val);
+}
+
+void
+rtw8189f_mac_write_2(struct rtw8189f_softc *sc, uint32_t addr, uint16_t val)
+{
+	sdmmc_io_write_2(sc->sc_sf, rtw8189f_ioreg_addr(addr), val);
+}
+
+void
+rtw8189f_mac_write_4(struct rtw8189f_softc *sc, uint32_t addr, uint32_t val)
+{
+	sdmmc_io_write_4(sc->sc_sf, rtw8189f_ioreg_addr(addr), val);
+}

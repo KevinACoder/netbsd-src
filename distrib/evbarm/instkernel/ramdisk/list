@@ -102,3 +102,8 @@ COPY	${NETBSDSRCDIR}/external/realtek/rtw88/dist/rtw8821c_fw.bin	libdata/firmwar
 # first and falls back to rtw8851b_fw.bin (fw.c iterates fw_format_max..0).
 COPY	${NETBSDSRCDIR}/external/realtek/rtw89/dist/rtw8851b_fw-1.bin	libdata/firmware/if_rtw89/rtw8851b_fw-1.bin
 COPY	${NETBSDSRCDIR}/external/realtek/rtw89/dist/rtw8851b_fw.bin	libdata/firmware/if_rtw89/rtw8851b_fw.bin
+
+# RK3568 lab: rtw8189f(4) firmware for the RTL8189FTV SDIO module.
+# Firmware is the vendor hal8188f_fw.c array_mp_8188f_fw_nic payload
+# (20306 B, sig 0x88f1, fw_ver 0xe).
+COPY	${NETBSDSRCDIR}/external/realtek/rtw8189f/dist/rtw8189f_fw.bin	libdata/firmware/if_rtw8189f/rtw8189f_fw.bin

@@ -266,6 +266,9 @@
 ./libdata/firmware/if_rtw89/Realtek-Firmware-License.txt	base-firmware-root	firmware
 ./libdata/firmware/if_rtw89/rtw8851b_fw-1.bin	base-firmware-root	firmware
 ./libdata/firmware/if_rtw89/rtw8851b_fw.bin	base-firmware-root	firmware
+./libdata/firmware/if_rtw8189f			base-firmware-root
+./libdata/firmware/if_rtw8189f/Realtek-Firmware-License.txt	base-firmware-root	firmware
+./libdata/firmware/if_rtw8189f/rtw8189f_fw.bin	base-firmware-root	firmware
 ./libdata/firmware/if_wpi			base-firmware-root
 ./libdata/firmware/if_wpi/LICENSE.ipw3945-ucode	base-obsolete	obsolete,firmware
 ./libdata/firmware/if_wpi/LICENSE.iwlwifi-3945-ucode	base-firmware-root	firmware

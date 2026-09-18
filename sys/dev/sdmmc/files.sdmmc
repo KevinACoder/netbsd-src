@@ -29,3 +29,11 @@ file	dev/sdmmc/if_bwfm_sdio.c	bwfm_sdio
 # Broadcom SoftMAC SDIO wireless driver
 attach bwi at sdmmc with bwi_sdio
 file	dev/sdmmc/if_bwi_sdio.c		bwi_sdio
+
+# Realtek RTL8189FTV SDIO wireless adapter (RTL8188F silicon)
+defflag	opt_rtw8189f.h			RTW8189F_DEBUG
+device rtw8189f: arp, ifnet, wlan, firmload
+attach rtw8189f at sdmmc
+file	dev/sdmmc/if_rtw8189f.c		rtw8189f
+file	dev/sdmmc/rtw8189f_sdio.c	rtw8189f
+file	dev/sdmmc/rtw8189f_chip.c	rtw8189f

@@ -77,6 +77,7 @@
 ./libdata/firmware/if_rtwn
 ./libdata/firmware/if_rtw88
 ./libdata/firmware/if_rtw89
+./libdata/firmware/if_rtw8189f
 ./libdata/firmware/if_urtwn
 ./libdata/firmware/if_wpi
 ./libdata/firmware/nouveau

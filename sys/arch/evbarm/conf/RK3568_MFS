@@ -59,3 +59,7 @@ no options 	MEMORY_DISK_DYNAMIC		# fixed layout, mdsetimage format
 # then stretches to ~13s and the switchable register domain goes dark
 # mid-table.  Pace the control path like Linux instead.
 options 	HZ=1000
+
+# RTL8189FTV SDIO wifi module in the SD slot (fe2b0000); rtw8189f(4) is a
+# clean-room net80211 port of the RTL8188F SDIO silicon (024c:f179).
+rtw8189f*	at sdmmc?
