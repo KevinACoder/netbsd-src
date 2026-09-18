@@ -94,9 +94,27 @@ struct rtw89_softc {
 	kmutex_t		sc_media_mtx;
 
 	int			sc_dying;
-	enum ieee80211_state	sc_cmd_state;
-	int			sc_cmd_arg;
+	kmutex_t		sc_chip_mtx; /* sleepable chip entry points */
+	unsigned int		sc_generation;
+	unsigned int		sc_pending; /* deferred requests, drained at detach */
 	unsigned int		sc_rx_dbg;
+};
+
+struct rtw89_state_cmd {
+	struct rtw89_softc *sc;
+	enum ieee80211_state state;
+	int arg;
+	unsigned int generation;
+	unsigned int channel;
+	struct rtw89_peer_info peer;
+};
+
+struct rtw89_tx_cmd {
+	struct rtw89_softc *sc;
+	struct mbuf *m;
+	unsigned int generation;
+	bool is_mgmt;
+	bool is_eapol;
 };
 
 static const struct usb_devno rtw89_devs[] = {
@@ -113,6 +131,7 @@ CFATTACH_DECL_NEW(rtw89u, sizeof(struct rtw89_softc), rtw89_match,
 
 static void	rtw89_bringup_task(void *);
 static void	rtw89_newstate_cb(void *);
+static void	rtw89_tx_cb(void *);
 static void	rtw89_next_scan(void *);
 static void	rtw89_rx_frame(void *, const uint8_t *, size_t, int);
 static int	rtw89_init(struct ifnet *);
@@ -123,6 +142,40 @@ static int	rtw89_ioctl(struct ifnet *, u_long, void *);
 static int	rtw89_reset(struct ifnet *);
 static int	rtw89_newstate(struct ieee80211com *, enum ieee80211_state,
 		    int);
+
+/*
+ * Snapshot the net80211 view of the current peer for the chip boundary.
+ * Called at splnet from the state machine only; the caller copies the
+ * result into its deferred command, so no net80211 pointer ever reaches
+ * the sleepable chip path.
+ */
+static void
+rtw89_peer_snapshot(struct rtw89_softc *sc, struct rtw89_peer_info *peer)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	unsigned int i;
+
+	memset(peer, 0, sizeof(*peer));
+	if (ni == NULL)
+		return;
+
+	IEEE80211_ADDR_COPY(peer->bssid, ni->ni_macaddr);
+	peer->aid = IEEE80211_NODE_AID(ni);
+	peer->beacon_int = ni->ni_intval;
+	peer->dtim_period = ni->ni_dtim_period;
+	peer->short_slot =
+	    (ni->ni_capinfo & IEEE80211_CAPINFO_SHORT_SLOTTIME) != 0;
+
+	for (i = 0; i < IEEE80211_RATE_MAXSIZE &&
+	    peer->nrates < sizeof(peer->rates); i++) {
+		uint8_t rv = ni->ni_rates.rs_rates[i];
+
+		if (rv == 0)
+			break;
+		peer->rates[peer->nrates++] = rv;
+	}
+}
 
 static int
 rtw89_match(device_t parent, cfdata_t match, void *aux)
@@ -199,6 +252,7 @@ rtw89_attach(device_t parent, device_t self, void *aux)
 
 	sc->sc_dev = self;
 	sc->sc_udev = uaa->uaa_device;
+	mutex_init(&sc->sc_chip_mtx, MUTEX_DEFAULT, IPL_NONE);
 
 	aprint_naive(": Realtek RTL8851BU\n");
 	aprint_normal("\n");
@@ -346,8 +400,10 @@ rtw89_bringup_task(void *arg)
 		aprint_normal_dev(sc->sc_dev, "Ethernet address %s\n",
 		    ether_sprintf(sc->sc_info.mac_addr));
 	}
+	aprint_normal_dev(sc->sc_dev, "bringup: before announce\n");
 	ieee80211_announce(ic);
 	sc->sc_attached = true;
+	aprint_normal_dev(sc->sc_dev, "bringup: attached, exiting probe thread\n");
 
 	/*
 	 * A kthread must never return: on aarch64 lwp_trampoline jumps to
@@ -370,6 +426,7 @@ rtw89_detach(device_t self, int flags)
 	pmf_device_deregister(self);
 	s = splusb();
 	sc->sc_dying = 1;
+	sc->sc_generation++;	/* orphan in-flight deferred commands */
 	callout_halt(&sc->sc_scan_to, NULL);
 
 	if (sc->sc_chip != NULL) {
@@ -384,6 +441,7 @@ rtw89_detach(device_t self, int flags)
 		ieee80211_ifdetach(ic);
 		if_detach(ifp);
 		mutex_destroy(&sc->sc_media_mtx);
+		mutex_destroy(&sc->sc_chip_mtx);
 		sc->sc_attached = false;
 	}
 	splx(s);
@@ -479,44 +537,76 @@ rtw89_rx_frame(void *ctx, const uint8_t *data, size_t len, int rssi)
 /* ------------------------------------------------------------------ */
 
 static void
+rtw89_tx_cb(void *arg)
+{
+	struct rtw89_tx_cmd *cmd = arg;
+	struct rtw89_softc *sc = cmd->sc;
+	struct mbuf *m = cmd->m;
+
+	if (sc->sc_generation == cmd->generation && sc->sc_chip != NULL)
+		(void)rtw89_chip_tx(sc->sc_chip, m, cmd->is_mgmt,
+		    cmd->is_eapol);
+	else
+		m_freem(m);
+	kmem_free(cmd, sizeof(*cmd));
+}
+
+/*
+ * Called at splnet from if_start; the chip sleeps, so hand the frame to
+ * the workqueue.  The mbuf is owned by the command once queued.  EAPOL
+ * (the 802.1X PAE frames from the supplicant, arriving as ordinary
+ * ether_output data) must reach the chip's PORT_CTRL_PROTO accounting
+ * even after software CCMP hides the LLC header, hence the flag.
+ */
+static void
 rtw89_start(struct ifnet *ifp)
 {
 	struct rtw89_softc *sc = ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni;
 	struct mbuf *m;
-	bool is_mgmt;
-	int error;
+	unsigned int budget = 64;
 
-	if (sc->sc_chip == NULL || !rtw89_chip_ready(sc->sc_chip)) {
-		if_statinc(ifp, if_oerrors);
-		return;
-	}
-	if ((ifp->if_flags & IFF_RUNNING) == 0) {
-		if_statinc(ifp, if_oerrors);
-		return;
+	if (sc->sc_chip == NULL || !rtw89_chip_ready(sc->sc_chip) ||
+	    (ifp->if_flags & IFF_RUNNING) == 0) {
+		IFQ_POLL(&ifp->if_snd, m);
+		if (m == NULL) {
+			if (ic->ic_state >= IEEE80211_S_AUTH) {
+				IF_POLL(&ic->ic_mgtq, m);
+				if (m == NULL)
+					return;
+			} else {
+				return;
+			}
+		} else if (sc->sc_chip == NULL ||
+		    !rtw89_chip_ready(sc->sc_chip)) {
+			if_statinc(ifp, if_oerrors);
+			return;
+		}
 	}
 
-	for (;;) {
-		is_mgmt = false;
+	for (; budget != 0; budget--) {
+		bool is_mgmt = false, is_eapol = false;
+
 		ni = NULL;
-
 		IF_POLL(&ic->ic_mgtq, m);
 		if (m != NULL) {
 			IF_DEQUEUE(&ic->ic_mgtq, m);
 			ni = M_GETCTX(m, struct ieee80211_node *);
 			is_mgmt = true;
-		} else if (ic->ic_state == IEEE80211_S_RUN) {
-			struct ether_header *eh;
-			struct ieee80211_frame *wh;
+		} else {
+			struct ether_header eh;
 
+			if (ic->ic_state != IEEE80211_S_RUN)
+				break;
 			IFQ_POLL(&ifp->if_snd, m);
 			if (m == NULL)
 				break;
+			memcpy(&eh, mtod(m, void *), sizeof(eh));
+			is_eapol = eh.ether_type == htons(ETHERTYPE_PAE);
 			IFQ_DEQUEUE(&ifp->if_snd, m);
 
-			eh = mtod(m, struct ether_header *);
-			ni = ieee80211_find_txnode(ic, eh->ether_dhost);
+			ni = ieee80211_find_txnode(ic, eh.ether_dhost);
 			if (ni == NULL) {
 				if_statinc(ifp, if_oerrors);
 				m_freem(m);
@@ -530,13 +620,17 @@ rtw89_start(struct ifnet *ifp)
 			}
 
 			/*
-			 * ieee80211_encap() only builds the 802.11 header;
-			 * a software-crypto driver has to finish the
-			 * encapsulation itself (see the rtw88 lane: without
-			 * this the frame leaves with Protected set but no
-			 * CCMP header/MIC and every data frame is lost).
+			 * ieee80211_encap() only builds the 802.11 header; a
+			 * software-crypto driver has to finish the
+			 * encapsulation itself (the rtw88 lane: without this
+			 * the frame leaves with Protected set but no CCMP
+			 * header/MIC and every data frame is lost).  EAPOL
+			 * before the PTK is installed arrives unencrypted and
+			 * skips this naturally via the WEP bit.
 			 */
-			wh = mtod(m, struct ieee80211_frame *);
+			struct ieee80211_frame *wh = mtod(m,
+			    struct ieee80211_frame *);
+
 			if ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0 &&
 			    ieee80211_crypto_encap(ic, ni, m) == NULL) {
 				if_statinc(ifp, if_oerrors);
@@ -544,15 +638,35 @@ rtw89_start(struct ifnet *ifp)
 				ieee80211_free_node(ni);
 				continue;
 			}
-		} else {
-			break;
 		}
 
-		/* rtw89_chip_tx() always consumes the mbuf */
-		error = rtw89_chip_tx(sc->sc_chip, m, is_mgmt);
-		if (error != 0)
+		/*
+		 * rtw89_chip_tx() always consumes the mbuf.  The deferred
+		 * command owns it from here; on queue failure the frame is
+		 * dropped (if_oerrors), matching rtw88.
+		 */
+		struct rtw89_tx_cmd *cmd = kmem_zalloc(sizeof(*cmd),
+		    KM_NOSLEEP);
+		if (cmd == NULL) {
 			if_statinc(ifp, if_oerrors);
-
+			m_freem(m);
+			if (ni != NULL)
+				ieee80211_free_node(ni);
+			break;
+		}
+		cmd->sc = sc;
+		cmd->m = m;
+		cmd->generation = sc->sc_generation;
+		cmd->is_mgmt = is_mgmt;
+		cmd->is_eapol = is_eapol;
+		if (rtw89_call_async(rtw89_tx_cb, cmd) != 0) {
+			if_statinc(ifp, if_oerrors);
+			kmem_free(cmd, sizeof(*cmd));
+			m_freem(m);
+			if (ni != NULL)
+				ieee80211_free_node(ni);
+			break;
+		}
 		if (ni != NULL)
 			ieee80211_free_node(ni);
 	}
@@ -574,18 +688,33 @@ rtw89_watchdog(struct ifnet *ifp)
 /*
  * net80211 runs the state machine at splnet; the chip below sleeps, so
  * hand the transition to the rtw89 workqueue and drive net80211's own
- * machine from there.
+ * machine from there.  The command carries a full snapshot of what the
+ * chip path needs (state, arg, channel, peer) so a transition arriving
+ * while a previous one is queued can never interleave stale values:
+ * sc_generation bumps make the worker drop superseded or detach-orphaned
+ * commands instead of the old shared sc_cmd_state/arg overwrite race.
  */
 static int
 rtw89_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 {
 	struct rtw89_softc *sc = ic->ic_ifp->if_softc;
+	struct rtw89_state_cmd *cmd;
 
 	callout_stop(&sc->sc_scan_to);
-	sc->sc_cmd_state = nstate;
-	sc->sc_cmd_arg = arg;
-	if (rtw89_call_async(rtw89_newstate_cb, sc) != 0) {
+	cmd = kmem_zalloc(sizeof(*cmd), KM_NOSLEEP);
+	if (cmd == NULL) {
 		/* out of memory: fall back to the generic machine */
+		return sc->sc_newstate(ic, nstate, arg);
+	}
+	cmd->sc = sc;
+	cmd->state = nstate;
+	cmd->arg = arg;
+	cmd->generation = sc->sc_generation;
+	cmd->channel = ieee80211_chan2ieee(ic, ic->ic_curchan);
+	rtw89_peer_snapshot(sc, &cmd->peer);
+
+	if (rtw89_call_async(rtw89_newstate_cb, cmd) != 0) {
+		kmem_free(cmd, sizeof(*cmd));
 		return sc->sc_newstate(ic, nstate, arg);
 	}
 
@@ -595,30 +724,33 @@ rtw89_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 static void
 rtw89_newstate_cb(void *arg)
 {
-	struct rtw89_softc *sc = arg;
+	struct rtw89_state_cmd *cmd = arg;
+	struct rtw89_softc *sc = cmd->sc;
 	struct ieee80211com *ic = &sc->sc_ic;
-	enum ieee80211_state ostate = ic->ic_state;
-	enum ieee80211_state nstate = sc->sc_cmd_state;
-	int s;
+	enum ieee80211_state nstate = cmd->state;
+	int carg = cmd->arg;
+	unsigned int channel = cmd->channel;
+	struct rtw89_peer_info peer = cmd->peer;
+	int s, error;
+
+	if (sc->sc_generation != cmd->generation) {
+		kmem_free(cmd, sizeof(*cmd));
+		return;
+	}
+	kmem_free(cmd, sizeof(*cmd));
+	cmd = NULL;
 
 	if (sc->sc_dying) {
-		sc->sc_newstate(ic, nstate, sc->sc_cmd_arg);
+		sc->sc_newstate(ic, nstate, carg);
 		return;
 	}
 
-	aprint_normal_dev(sc->sc_dev, "newstate: %d -> %d\n", ostate, nstate);
-
-	/*
-	 * The chip glue below sleeps and must not interleave with
-	 * rtw89_chip_start()/stop() (mac80211 runs the state machine under
-	 * the wiphy mutex); this runs on the rtw89 worker at IPL0, so take
-	 * the same lock the chip start/stop paths take.
-	 */
+	aprint_normal_dev(sc->sc_dev, "newstate: %d -> %d\n", ic->ic_state,
+	    nstate);
 	rtw89_chip_wiphy_lock(sc->sc_chip);
 
-	s = splnet();
-	callout_stop(&sc->sc_scan_to);
 
+	mutex_enter(&sc->sc_chip_mtx);
 	switch (nstate) {
 	case IEEE80211_S_SCAN:
 		/*
@@ -627,41 +759,56 @@ rtw89_newstate_cb(void *arg)
 		 * channel it picked and let the scan callout move on.
 		 * Pure register path -- zero class-9 (FW_OFLD) H2C.
 		 */
-		rtw89_chip_set_channel(sc->sc_chip,
-		    ieee80211_chan2ieee(ic, ic->ic_curchan));
-		if (ostate != IEEE80211_S_SCAN)
+		rtw89_chip_set_channel(sc->sc_chip, channel);
+		if (ic->ic_state != IEEE80211_S_SCAN)
 			rtw89_chip_scan(sc->sc_chip, true);
-		callout_schedule(&sc->sc_scan_to, hz / 5);
 		break;
 
 	case IEEE80211_S_AUTH:
 	case IEEE80211_S_ASSOC:
+		/*
+		 * M3: the station must exist (addr_cam, class 6, sta_state
+		 * NOTEXIST->NONE) and the BSSID be programmed before the
+		 * AUTH exchange; AUTH then covers the mgmt TX path, ASSOC
+		 * raises only AUTH (Linux defers the join to bss_info_changed).
+		 */
+		(void)rtw89_chip_set_peer(sc->sc_chip,
+		    nstate == IEEE80211_S_AUTH ? RTW89_PEER_AUTHENTICATING :
+		    RTW89_PEER_AUTHENTICATED, &peer);
+		rtw89_chip_set_channel(sc->sc_chip, channel);
+		break;
+
 	case IEEE80211_S_RUN:
-		if (ostate == IEEE80211_S_SCAN)
+		if (ic->ic_state == IEEE80211_S_SCAN)
 			rtw89_chip_scan(sc->sc_chip, false);
-		if (ostate != nstate) {
-			rtw89_chip_set_channel(sc->sc_chip,
-			    ieee80211_chan2ieee(ic, ic->ic_curchan));
-			/*
-			 * M3: bind the station (addr_cam, class 6) and the
-			 * media state (class 8) here, mirroring Linux's
-			 * bss_info_changed before mgd_prepare_tx.  The
-			 * FreeBSD red/green table lists both classes as
-			 * fast-ACK paths.
-			 */
+		/*
+		 * M3: full join -- station to ASSOC plus vif BSS info
+		 * (AID, rates, beacon interval) with the dist chip/glue
+		 * boundary.  Failure rolls the peer back to NONE: the
+		 * net80211 machine below moves to S_INIT on the same
+		 * error, which must not run the teardown twice.
+		 */
+		error = rtw89_chip_set_peer(sc->sc_chip,
+		    RTW89_PEER_ASSOCIATED, &peer);
+		if (error != 0 && ic->ic_state != IEEE80211_S_INIT) {
+			(void)rtw89_chip_set_peer(sc->sc_chip,
+			    RTW89_PEER_NONE, NULL);
 		}
-		/* M3: SEC_CAM (class 0xa) key download with the PTK/GTK */
 		break;
 
 	case IEEE80211_S_INIT:
-		if (ostate == IEEE80211_S_SCAN)
-			rtw89_chip_scan(sc->sc_chip, false);
+		rtw89_chip_scan(sc->sc_chip, false);
+		(void)rtw89_chip_set_peer(sc->sc_chip, RTW89_PEER_NONE, NULL);
 		break;
 	}
+	mutex_exit(&sc->sc_chip_mtx);
+
+	if (nstate == IEEE80211_S_SCAN)
+		callout_schedule(&sc->sc_scan_to, hz / 5);
+
+	s = splnet();
+	sc->sc_newstate(ic, nstate, carg);
 	splx(s);
-
-	sc->sc_newstate(ic, nstate, sc->sc_cmd_arg);
-
 	rtw89_chip_wiphy_unlock(sc->sc_chip);
 }
 

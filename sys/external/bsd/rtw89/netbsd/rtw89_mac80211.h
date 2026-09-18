@@ -1221,7 +1221,7 @@ struct ieee80211_sband_iftype_data {
 struct ieee80211_link_sta {
 	u8			link_id;
 	u8			addr[ETH_ALEN];
-	u8			supp_rates[IEEE80211_NUM_BANDS];
+	u32			supp_rates[IEEE80211_NUM_BANDS];
 	u8			rx_nss;
 	struct ieee80211_sta	*sta;
 	struct {
@@ -1249,7 +1249,7 @@ struct ieee80211_sta {
 	struct ieee80211_sta_ht_cap ht_cap;
 	struct ieee80211_sta_vht_cap vht_cap;
 	struct ieee80211_txq	*txq[IEEE80211_NUM_TIDS];
-	u8			supp_rates[IEEE80211_NUM_BANDS];
+	u32			supp_rates[IEEE80211_NUM_BANDS];
 	struct ieee80211_link_sta deflink;
 	/* holds struct_size_t(struct rtw89_sta, links_inst, 1): 304 + 568 */
 	u8			drv_priv[880] __aligned(sizeof(void *));

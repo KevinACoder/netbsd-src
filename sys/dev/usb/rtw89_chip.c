@@ -66,6 +66,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include "core.h"
 #include "chan.h"
 #include "mac.h"
+#include "phy.h"
 #include "reg.h"
 #include "txrx.h"
 #include "rtw8851b.h"
@@ -124,17 +125,162 @@ rtw89_chip_rx_hook(struct ieee80211_hw *hw, struct sk_buff *skb)
 }
 
 /*
- * The shadow mac80211 has no station-add callback: the per-station chip
- * state (struct rtw89_sta behind drv_priv) must be bound before any
- * iterator runs (rtw88 fix d5062cf55632).
+ * The single peer is published to shadow iterators only after sta_state
+ * has bound its drv_priv links.  All callers run on the frontend's
+ * serialized, sleepable chip path, never from net80211 at splnet.
  */
-void
-rtw89_sta_init(struct ieee80211_sta *sta, struct ieee80211_vif *vif,
-    struct rtw_dev *rtwdev)
+static int
+rtw89_peer_step(struct rtw89_chip *chip, enum ieee80211_sta_state next)
 {
-	(void)sta;
-	(void)vif;
-	(void)rtwdev;
+	struct rtw89_dev *rtwdev = chip->rtwdev;
+	int ret;
+
+	ret = rtwdev->ops->sta_state(rtwdev->hw,
+	    rtw89_mac80211_vif(rtwdev->hw),
+	    rtw89_mac80211_sta(rtwdev->hw), chip->sta_state, next);
+	if (ret == 0)
+		chip->sta_state = next;
+	return ret < 0 ? -ret : ret;
+}
+
+static int
+rtw89_peer_remove(struct rtw89_chip *chip)
+{
+	struct rtw89_dev *rtwdev = chip->rtwdev;
+	struct ieee80211_hw *hw = rtwdev->hw;
+	struct ieee80211_vif *vif = rtw89_mac80211_vif(hw);
+	static const uint8_t zero[6];
+	int ret;
+
+	if (chip->sta_state == IEEE80211_STA_NOTEXIST)
+		return 0;
+	if (vif->cfg.assoc) {
+		rtw89_mac80211_set_assoc(hw, NULL, false);
+		rtwdev->ops->vif_cfg_changed(hw, vif, BSS_CHANGED_ASSOC);
+	}
+	while (chip->sta_state > IEEE80211_STA_NOTEXIST) {
+		ret = rtw89_peer_step(chip, chip->sta_state - 1);
+		if (ret != 0)
+			return ret;
+	}
+	rtw89_mac80211_set_sta(hw, NULL, false);
+	/* A failed authentication also needs to undo sta_add's DIG suspend. */
+	rtw89_phy_dig_resume(rtwdev, false);
+	vif->cfg.aid = vif->bss_conf.aid = 0;
+	rtw89_mac80211_set_assoc(hw, zero, false);
+	rtwdev->ops->link_info_changed(hw, vif, &vif->bss_conf,
+	    BSS_CHANGED_BSSID);
+	return 0;
+}
+
+int
+rtw89_chip_set_peer(struct rtw89_chip *chip, enum rtw89_peer_state state,
+    const struct rtw89_peer_info *peer)
+{
+	struct rtw89_dev *rtwdev = chip->rtwdev;
+	struct ieee80211_hw *hw = rtwdev->hw;
+	struct ieee80211_vif *vif = rtw89_mac80211_vif(hw);
+	struct ieee80211_sta *sta = rtw89_mac80211_sta(hw);
+	struct ieee80211_supported_band *sband;
+	struct rtw89_sta *rtwsta;
+	struct rtw89_sta_link *link;
+	u32 rates = 0, basic = 0;
+	unsigned int i, j, band;
+	int target, ret;
+
+	if (!chip->vif_added)
+		return state == RTW89_PEER_NONE ? 0 : ENXIO;
+	if (state == RTW89_PEER_NONE)
+		return rtw89_peer_remove(chip);
+	if (peer == NULL || !is_valid_ether_addr(peer->bssid) ||
+	    hw->conf.chandef.chan == NULL)
+		return EINVAL;
+	if (state == RTW89_PEER_ASSOCIATED &&
+	    (peer->aid == 0 || peer->aid > 2007))
+		return EINVAL;
+
+	target = state == RTW89_PEER_AUTHENTICATING ? IEEE80211_STA_NONE :
+	    state == RTW89_PEER_AUTHENTICATED ? IEEE80211_STA_AUTH :
+	    IEEE80211_STA_ASSOC;
+	if (chip->sta_state != IEEE80211_STA_NOTEXIST &&
+	    (!ether_addr_equal(sta->addr, peer->bssid) ||
+	    chip->sta_state > target)) {
+		ret = rtw89_peer_remove(chip);
+		if (ret != 0)
+			return ret;
+	}
+
+	band = hw->conf.chandef.chan->band;
+	sband = hw->wiphy->bands[band];
+	if (sband == NULL)
+		return EINVAL;
+	/* net80211 rates are 500 kbps values; mac80211 uses band-table bits. */
+	for (i = 0; i < peer->nrates && i < sizeof(peer->rates); i++) {
+		for (j = 0; j < (unsigned int)sband->n_bitrates && j < 32; j++) {
+			if (sband->bitrates[j].bitrate !=
+			    (peer->rates[i] & 0x7f) * 5)
+				continue;
+			rates |= BIT(j);
+			if (peer->rates[i] & 0x80)
+				basic |= BIT(j);
+		}
+	}
+	if (rates == 0)
+		return EINVAL;
+
+	if (chip->sta_state == IEEE80211_STA_NOTEXIST) {
+		memset(sta, 0, sizeof(*sta));
+		sta = rtw89_mac80211_sta(hw); /* restores deflink pointers */
+		rtw89_mac80211_set_sta(hw, peer->bssid, false);
+	}
+	sta->deflink.rx_nss = 1;
+	sta->bandwidth = sta->deflink.bandwidth = IEEE80211_STA_RX_BW_20;
+	sta->supp_rates[band] = sta->deflink.supp_rates[band] = rates;
+	sta->aid = state == RTW89_PEER_ASSOCIATED ? peer->aid : 0;
+	vif->cfg.aid = vif->bss_conf.aid = sta->aid;
+	vif->bss_conf.basic_rates = basic;
+	vif->bss_conf.beacon_int = peer->beacon_int;
+	vif->bss_conf.dtim_period = peer->dtim_period;
+	vif->bss_conf.use_short_slot = peer->short_slot;
+	vif->bss_conf.chanreq.oper = hw->conf.chandef;
+	/* HT/VHT/HE/EHT remain zero: net80211 negotiated only legacy rates. */
+	if (!ether_addr_equal(vif->bss_conf.bssid, peer->bssid)) {
+		rtw89_mac80211_set_assoc(hw, peer->bssid, false);
+		rtwdev->ops->link_info_changed(hw, vif, &vif->bss_conf,
+		    BSS_CHANGED_BSSID);
+	}
+
+	while (chip->sta_state < target) {
+		ret = rtw89_peer_step(chip, chip->sta_state + 1);
+		if (ret != 0)
+			goto fail;
+		if (chip->sta_state == IEEE80211_STA_NONE)
+			rtw89_mac80211_set_sta(hw, peer->bssid, true);
+	}
+	if (state == RTW89_PEER_ASSOCIATED && !vif->cfg.assoc) {
+		/* In STA mode sta_state(AUTH, ASSOC) defers the actual join here. */
+		rtw89_mac80211_set_assoc(hw, peer->bssid, true);
+		rtwdev->ops->link_info_changed(hw, vif, &vif->bss_conf,
+		    BSS_CHANGED_ERP_SLOT | BSS_CHANGED_BASIC_RATES |
+		    BSS_CHANGED_BEACON_INT);
+		rtwdev->ops->vif_cfg_changed(hw, vif, BSS_CHANGED_ASSOC);
+		/* The void callback swallows __sta_assoc's error.  Check its
+		 * final success marker before allowing data or a RUN transition. */
+		rtwsta = sta_to_rtwsta(sta);
+		link = rtwsta->links[0];
+		if (link == NULL ||
+		    rtwdev->assoc_link_on_macid[link->mac_id] != link) {
+			/* __sta_assoc did not increment total_sta_assoc. */
+			chip->sta_state = IEEE80211_STA_AUTH;
+			ret = EIO;
+			goto fail;
+		}
+	}
+	return 0;
+fail:
+	if (rtw89_peer_remove(chip) != 0)
+		rtw89_warn(rtwdev, "peer rollback failed; interface restart required\n");
+	return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -406,8 +552,10 @@ rtw89_chip_start_locked(struct rtw89_chip *chip)
 	/* mac80211's ifup order: ops->start(), then add_interface */
 	if (!chip->vif_added) {
 		error = rtw89_vif_add(chip);
-		if (error != 0)
+		if (error != 0) {
+			rtw89_core_stop(rtwdev);
 			return error;
+		}
 	}
 	return 0;
 }
@@ -417,26 +565,28 @@ rtw89_chip_stop(struct rtw89_chip *chip)
 {
 	struct wiphy *wiphy = chip->rtwdev->hw->wiphy;
 
-	/* see rtw89_chip_start() for the locking contract */
 	wiphy_lock(wiphy);
-	/* mac80211's ifdown order: remove_interface, then ops->stop */
+	if (chip->scanning)
+		rtw89_chip_scan(chip, false);
+	(void)rtw89_chip_set_peer(chip, RTW89_PEER_NONE, NULL);
 	rtw89_vif_remove(chip);
 	rtw89_core_stop(chip->rtwdev);
+	rtw89_mac80211_set_sta(chip->rtwdev->hw, NULL, false);
+	chip->sta_state = IEEE80211_STA_NOTEXIST;
 	wiphy_unlock(wiphy);
 }
 
 void
 rtw89_chip_wiphy_lock(struct rtw89_chip *chip)
 {
-
 	wiphy_lock(chip->rtwdev->hw->wiphy);
 }
 
 void
 rtw89_chip_wiphy_unlock(struct rtw89_chip *chip)
 {
-
 	wiphy_unlock(chip->rtwdev->hw->wiphy);
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -491,6 +641,8 @@ rtw89_chip_scan(struct rtw89_chip *chip, bool on)
 		return ENXIO;
 	}
 
+	if (chip->scanning == on)
+		return 0;
 	vif = rtw89_mac80211_vif(hw);
 	if (on) {
 		rtwdev->ops->sw_scan_start(hw, vif, vif->addr);
@@ -499,6 +651,7 @@ rtw89_chip_scan(struct rtw89_chip *chip, bool on)
 		rtw89_chip_scan_rx_fltr(rtwdev, false);
 		rtwdev->ops->sw_scan_complete(hw, vif);
 	}
+	chip->scanning = on;
 	return 0;
 }
 
@@ -600,12 +753,15 @@ rtw89_chip_set_channel(struct rtw89_chip *chip, unsigned int chan)
 static unsigned int rtw89_chip_tx_dbg;
 
 int
-rtw89_chip_tx(struct rtw89_chip *chip, struct mbuf *m, bool is_mgmt)
+rtw89_chip_tx(struct rtw89_chip *chip, struct mbuf *m, bool is_mgmt,
+    bool is_eapol)
 {
 	struct rtw89_dev *rtwdev = chip->rtwdev;
 	struct ieee80211_hw *hw = rtwdev->hw;
 	struct ieee80211_tx_info *info;
 	struct ieee80211_vif *vif;
+	struct ieee80211_sta *sta = NULL;
+	struct ieee80211_hdr *hdr;
 	struct sk_buff *skb;
 	size_t len = m->m_pkthdr.len;
 	int qsel;
@@ -621,17 +777,18 @@ rtw89_chip_tx(struct rtw89_chip *chip, struct mbuf *m, bool is_mgmt)
 		rtw89_chip_tx_dbg++;
 	}
 
-	if (!is_mgmt || !chip->vif_added || len == 0 ||
-	    len > RTW89_USB_TX_BUFSZ) {
+	if (!chip->vif_added || len < 24 ||
+	    len + hw->extra_tx_headroom > RTW89_USB_TX_BUFSZ ||
+	    (!is_mgmt && chip->sta_state != IEEE80211_STA_ASSOC)) {
 		m_freem(m);
-		return 0;
+		return EINVAL;
 	}
 
 	/* the HCI tx_write skb_push()es the txdesc: headroom is required */
 	skb = alloc_skb(len + hw->extra_tx_headroom, GFP_ATOMIC);
 	if (skb == NULL) {
 		m_freem(m);
-		return 0;
+		return ENOMEM;
 	}
 	skb_reserve(skb, hw->extra_tx_headroom);
 	m_copydata(m, 0, len, skb_put(skb, len));
@@ -643,11 +800,28 @@ rtw89_chip_tx(struct rtw89_chip *chip, struct mbuf *m, bool is_mgmt)
 	 */
 	vif = rtw89_mac80211_vif(hw);
 	info = IEEE80211_SKB_CB(skb);
-	info->flags = 0;
+	memset(info, 0, sizeof(*info));
 	info->control.vif = vif;
-	info->control.sta = NULL;
+	/* Complete, already software-encrypted frames: never give the core
+	 * an hw_key, nor let it add another IV/MIC. */
+	hdr = (struct ieee80211_hdr *)skb->data;
+	if (chip->sta_state != IEEE80211_STA_NOTEXIST)
+		sta = ieee80211_find_sta(vif, hdr->addr1);
+	if (!is_mgmt && sta == NULL) {
+		ieee80211_free_txskb(hw, skb);
+		m_freem(m);
+		return ENOENT;
+	}
+	info->control.sta = sta;
+	skb->priority = 0; /* legacy, non-QoS best effort */
+	info->band = hw->conf.chandef.chan->band;
 
-	ret = rtw89_core_tx_write(rtwdev, vif, NULL, skb, &qsel);
+	/* Preserve the Ethernet PAE classification passed by the frontend,
+	 * even when software CCMP hides the LLC header from this layer. */
+	if (is_eapol)
+		info->control.flags |= IEEE80211_TX_CTRL_PORT_CTRL_PROTO;
+
+	ret = rtw89_core_tx_write(rtwdev, vif, sta, skb, &qsel);
 	if (ret != 0) {
 		ieee80211_free_txskb(hw, skb);
 		m_freem(m);

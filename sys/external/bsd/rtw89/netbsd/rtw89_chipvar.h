@@ -54,6 +54,27 @@ struct rtw89_hw_info {
 	uint8_t		fw_format;
 };
 
+/* Value snapshot: no net80211 node pointers cross the sleeping boundary. */
+struct rtw89_peer_info {
+	uint8_t		bssid[6];
+	uint8_t		rates[16];	/* 500 kbps units, bit 7 = basic */
+	uint8_t		nrates;
+	uint8_t		dtim_period;
+	uint16_t	aid;		/* without the two on-air reserved bits */
+	uint16_t	beacon_int;
+	bool		short_slot;
+};
+
+enum rtw89_peer_state {
+	RTW89_PEER_NONE,
+	RTW89_PEER_AUTHENTICATING,
+	RTW89_PEER_AUTHENTICATED,
+	RTW89_PEER_ASSOCIATED
+};
+
+int	rtw89_chip_set_peer(struct rtw89_chip *, enum rtw89_peer_state,
+	    const struct rtw89_peer_info *);
+
 typedef void (*rtw89_rx_cb_t)(void *, const uint8_t *, size_t, int);
 
 /* usbdi transport (dev/usb/rtw89_usb.c) */
@@ -70,7 +91,7 @@ void	rtw89_chip_detach(struct rtw89_chip *);
 int	rtw89_chip_start(struct rtw89_chip *);
 void	rtw89_chip_stop(struct rtw89_chip *);
 int	rtw89_chip_set_channel(struct rtw89_chip *, unsigned int);
-int	rtw89_chip_tx(struct rtw89_chip *, struct mbuf *, bool);
+int	rtw89_chip_tx(struct rtw89_chip *, struct mbuf *, bool, bool);
 int	rtw89_chip_scan(struct rtw89_chip *, bool);
 void	rtw89_chip_set_callbacks(struct rtw89_chip *, void *,
 	    rtw89_rx_cb_t);

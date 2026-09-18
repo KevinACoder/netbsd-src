@@ -684,7 +684,9 @@ rtw89_mac80211_sta(struct ieee80211_hw *hw)
 {
 	struct rtw89_mac80211_ctx *ctx = rtw89_mac80211_ctx(hw);
 
-	ctx->sta_valid = true;
+	/* Merely obtaining the storage must not publish an unbound station. */
+	ctx->sta.link[0] = &ctx->sta.deflink;
+	ctx->sta.deflink.sta = &ctx->sta;
 	return &ctx->sta;
 }
 
@@ -693,8 +695,11 @@ rtw89_mac80211_set_sta(struct ieee80211_hw *hw, const u8 *addr, bool valid)
 {
 	struct rtw89_mac80211_ctx *ctx = rtw89_mac80211_ctx(hw);
 
+	if (addr != NULL) {
+		ether_addr_copy(ctx->sta.addr, addr);
+		ether_addr_copy(ctx->sta.deflink.addr, addr);
+	}
 	ctx->sta_valid = valid;
-	ether_addr_copy(ctx->sta.addr, addr);
 }
 
 void
@@ -829,7 +834,7 @@ ieee80211_find_sta(struct ieee80211_vif *vif, const u8 *addr)
 	struct rtw89_mac80211_ctx *ctx =
 	    container_of(vif, struct rtw89_mac80211_ctx, vif);
 
-	if (!ctx->sta_valid)
+	if (!ctx->sta_valid || !ether_addr_equal(ctx->sta.addr, addr))
 		return NULL;
 	return &ctx->sta;
 }
@@ -840,7 +845,7 @@ ieee80211_find_sta_by_ifaddr(struct ieee80211_hw *hw, const u8 *addr,
 {
 	struct rtw89_mac80211_ctx *ctx = rtw89_mac80211_ctx(hw);
 
-	if (!ctx->sta_valid)
+	if (!ctx->sta_valid || !ether_addr_equal(ctx->sta.addr, addr))
 		return NULL;
 	return &ctx->sta;
 }
@@ -875,12 +880,7 @@ ieee80211_iterate_stations_atomic(struct ieee80211_hw *hw,
 
 	if (!ctx->sta_valid)
 		return;
-	/*
-	 * The shadow mac80211 never issues a station-add callback, so the chip
-	 * side's per-station state (rtw_sta_info in drv_priv[]) is unbound
-	 * until here.  Without it the iterator dereferences si->sta == NULL.
-	 */
-	rtw89_sta_init(&ctx->sta, &ctx->vif, hw->priv);
+	/* Published only after the real ops->sta_state(NOTEXIST, NONE). */
 	iterator(data, &ctx->sta);
 }
 

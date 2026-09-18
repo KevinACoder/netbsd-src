@@ -77,6 +77,8 @@ struct rtw89_chip {
 
 	/* the shadow vif is bound to the core (ops->add_interface done) */
 	bool			vif_added;
+	bool			scanning;
+	int			sta_state;	/* enum ieee80211_sta_state */
 
 	/* RX delivery (set by if_rtw89 via rtw89_chip_set_callbacks) */
 	void			*rx_arg;

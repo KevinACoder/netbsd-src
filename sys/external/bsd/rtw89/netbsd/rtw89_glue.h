@@ -61,13 +61,6 @@ struct ieee80211_sta *rtw89_mac80211_sta(struct ieee80211_hw *);
 void	rtw89_mac80211_set_mac(struct ieee80211_hw *, const uint8_t *);
 void	rtw89_mac80211_set_sta(struct ieee80211_hw *, const uint8_t *, bool);
 void	rtw89_mac80211_set_assoc(struct ieee80211_hw *, const uint8_t *, bool);
-/*
- * Bind the chip's per-station view (struct rtw_sta_info, which lives in the
- * sta/vif drv_priv[] areas) before any station iterator runs.  Linux does
- * this in rtw_sta_add(); the shadow mac80211 here has no such callback, so
- * the station iterators call it themselves.
- */
-void	rtw89_sta_init(struct ieee80211_sta *, struct ieee80211_vif *,
-	    struct rtw_dev *);
+/* Station publication follows the chip's successful sta_state callback. */
 
 #endif /* _RTW89_GLUE_H_ */
