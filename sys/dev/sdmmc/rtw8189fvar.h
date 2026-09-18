@@ -30,6 +30,8 @@
 
 #include <sys/param.h>
 #include <sys/mutex.h>
+#include <sys/condvar.h>
+#include <sys/kthread.h>
 #include <sys/callout.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
@@ -63,15 +65,30 @@ extern int rtw8189f_debug;
 #define RTW8189F_DBG_PWR		0x0002
 #define RTW8189F_DBG_FW			0x0004
 #define RTW8189F_DBG_EFUSE		0x0008
+#define RTW8189F_DBG_INIT		0x0010
+#define RTW8189F_DBG_TX			0x0020
+#define RTW8189F_DBG_RX			0x0040
 #else
 #define DPRINTF(sc, fmt, ...)		((void)0)
 #define DNPRINTF(sc, n, fmt, ...)	((void)0)
 #endif
 
+/* Worker work flags (sc_flags, under sc_work_mtx). */
+#define RTW8189F_F_NEWSTATE		0x0001
+#define RTW8189F_F_TX			0x0002
+#define RTW8189F_F_EXIT			0x0004
+
+/* Bounce buffer sizes: RX must hold the largest aggregated FIFO burst,
+ * TX one TXDESC (40B) plus the largest 802.11 frame. */
+#define RTW8189F_RXBUFSZ		0x2000
+#define RTW8189F_TXBUFSZ		0x1000
+
+MBUFQ_HEAD(rtw8189f_txq);
+
 struct rtw8189f_softc {
 	device_t		sc_dev;
 	struct sdmmc_function	*sc_sf;		/* SDIO function 1 */
-	kmutex_t		sc_lock;	/* serialises bus access */
+	kmutex_t		sc_lock;	/* attach vs detach */
 
 	struct ieee80211com	sc_ic;
 	struct ethercom		sc_ec;
@@ -80,10 +97,21 @@ struct rtw8189f_softc {
 				    enum ieee80211_state, int);
 	callout_t		sc_scan_to;
 
+	/* Worker thread: owns all sleeping chip/bus work at runtime. */
+	kmutex_t		sc_work_mtx;
+	kcondvar_t		sc_cv;
+	struct rtw8189f_txq	sc_txq;		/* frames waiting for TX */
+	uint32_t		sc_flags;
+	enum ieee80211_state	sc_nstate;	/* deferred newstate args */
+	int			sc_narg;
+	lwp_t			*sc_worker;
+
 	int			sc_dying;
 	bool			sc_attached;
 	bool			sc_mac_on;	/* card enable done */
 	bool			sc_fw_ready;
+	bool			sc_chip_ready;	/* MAC/BB/RF init done */
+	bool			sc_scanning;	/* scan window open */
 	uint8_t			sc_last_hmebox;
 	uint8_t			sc_mac_addr[IEEE80211_ADDR_LEN];
 	bool			sc_mac_valid;
@@ -97,6 +125,16 @@ struct rtw8189f_softc {
 
 	/* RX state. */
 	uint32_t		sc_rx_fifo_cnt;
+	uint32_t		sc_rcr;		/* current RCR image */
+	uint32_t		sc_rf18;	/* cached RF18 image */
+	void			*sc_rxbuf;	/* 4-byte aligned bounce */
+	void			*sc_txbuf;
+
+	/* Debug counters (sysctl-visible via ifconfig -v is not wired yet). */
+	uint32_t		sc_rx_frames;
+	uint32_t		sc_rx_beacons;
+	uint32_t		sc_rx_errors;
+	uint32_t		sc_tx_frames;
 };
 
 /* rtw8189f_sdio.c */
@@ -108,6 +146,9 @@ uint32_t rtw8189f_mac_read_4(struct rtw8189f_softc *, uint32_t);
 void	rtw8189f_mac_write_1(struct rtw8189f_softc *, uint32_t, uint8_t);
 void	rtw8189f_mac_write_2(struct rtw8189f_softc *, uint32_t, uint16_t);
 void	rtw8189f_mac_write_4(struct rtw8189f_softc *, uint32_t, uint32_t);
+int	rtw8189f_fifo_write(struct rtw8189f_softc *, unsigned,
+	    const void *, size_t);
+int	rtw8189f_fifo_read(struct rtw8189f_softc *, void *, size_t);
 
 /* rtw8189f_chip.c */
 int	rtw8189f_power_on(struct rtw8189f_softc *);
@@ -115,5 +156,11 @@ int	rtw8189f_power_on_check(struct rtw8189f_softc *);
 int	rtw8189f_efuse_read(struct rtw8189f_softc *);
 int	rtw8189f_fw_download(struct rtw8189f_softc *);
 int	rtw8189f_fw_ready(struct rtw8189f_softc *);
+int	rtw8189f_chip_init(struct rtw8189f_softc *);
+void	rtw8189f_set_channel(struct rtw8189f_softc *, unsigned);
+void	rtw8189f_scan_rx_fltr(struct rtw8189f_softc *, bool);
+void	rtw8189f_set_bssid(struct rtw8189f_softc *, const uint8_t *);
+void	rtw8189f_tx_frame(struct rtw8189f_softc *, struct mbuf *);
+void	rtw8189f_rx_drain(struct rtw8189f_softc *);
 
 #endif /* !_DEV_SDMMC_RTW8189FVAR_H_ */

@@ -58,9 +58,10 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <dev/sdmmc/sdmmcvar.h>
 
 #include "rtw8189fvar.h"
+#include "rtw8189f_tables.h"
 
 #ifdef RTW8189F_DEBUG
-int rtw8189f_debug = 0;
+int rtw8189f_debug = 0;		/* flood kills console rx; enable per-boot */
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -328,23 +329,11 @@ rtw8189f_efuse_read(struct rtw8189f_softc *sc)
 
 	rtw8189f_efuse_switch_power(sc);
 
-	/*
-	 * Diagnostics: dump the first physical bytes and the region around
-	 * the MAC address, so an empty/failed parse can be told apart from
-	 * a wrong address decode.
-	 */
-	{
-		uint8_t dbg[8];
-		int di;
-
-		for (di = 0; di < 8; di++)
-			dbg[di] = rtw8189f_efuse_read_1(sc, di);
-		aprint_normal_dev(sc->sc_dev, "efuse phys[0..7]: "
-		    "%02x %02x %02x %02x %02x %02x %02x %02x (ctrl 0x%08x)\n",
-		    dbg[0], dbg[1], dbg[2], dbg[3],
-		    dbg[4], dbg[5], dbg[6], dbg[7],
-		    rtw8189f_mac_read_4(sc, RTW8189F_REG_EFUSE_CTRL));
-	}
+	DNPRINTF(sc, RTW8189F_DBG_EFUSE, "efuse phys[0..3]: "
+	    "%02x %02x %02x %02x (ctrl 0x%08x)\n",
+	    rtw8189f_efuse_read_1(sc, 0), rtw8189f_efuse_read_1(sc, 1),
+	    rtw8189f_efuse_read_1(sc, 2), rtw8189f_efuse_read_1(sc, 3),
+	    rtw8189f_mac_read_4(sc, RTW8189F_REG_EFUSE_CTRL));
 
 	/* Read the physical map (256 bytes) and parse the pg packets.
 	 * RTL8188F uses the extended-header format: a packet header with
@@ -381,7 +370,7 @@ rtw8189f_efuse_read(struct rtw8189f_softc *sc)
 		}
 	}
 
-	aprint_normal_dev(sc->sc_dev,
+	DNPRINTF(sc, RTW8189F_DBG_EFUSE,
 	    "efuse parse stopped at phys 0x%03x; logical[0x110..0x12f]: "
 	    "%02x %02x %02x %02x %02x %02x %02x %02x "
 	    "%02x %02x %02x %02x %02x %02x %02x %02x "
@@ -627,4 +616,700 @@ rtw8189f_fw_ready(struct rtw8189f_softc *sc)
 	aprint_error_dev(sc->sc_dev,
 	    "firmware not ready (MCUFWDL 0x%08x)\n", v);
 	return EIO;
+}
+
+/* ------------------------------------------------------------------ */
+/* RF (LSSI) access                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * RF writes go through the BB "3-wire" register 0x840 with the register
+ * index in bits [27:20] and the 20-bit data below (phy_RFSerialWrite_
+ * 8188F).  Reads set the index in HSSIParameter2 (0x824), toggle the
+ * read edge and sample the readback register (phy_RFSerialRead_8188F).
+ */
+static void
+rtw8189f_rf_write20(struct rtw8189f_softc *sc, uint32_t off, uint32_t data)
+{
+	uint32_t v = (((off & 0xff) << 20) | (data & RTW8189F_LSSI_READBACK_M))
+	    & 0x0fffffff;
+
+	rtw8189f_mac_write_4(sc, RTW8189F_BB_LSSI_WRITE, v);
+	delay(1);
+}
+
+static uint32_t
+rtw8189f_rf_read20(struct rtw8189f_softc *sc, uint32_t off)
+{
+	uint32_t t, v;
+	int pi;
+
+	t = rtw8189f_mac_read_4(sc, RTW8189F_BB_HSSI_P2);
+	t = (t & ~RTW8189F_LSSI_READ_ADDR_M) |
+	    ((off & 0xff) << 23) | RTW8189F_LSSI_READ_EDGE;
+	rtw8189f_mac_write_4(sc, RTW8189F_BB_HSSI_P2, t & ~RTW8189F_LSSI_READ_EDGE);
+	t = rtw8189f_mac_read_4(sc, RTW8189F_BB_HSSI_P2);
+	rtw8189f_mac_write_4(sc, RTW8189F_BB_HSSI_P2, t & ~RTW8189F_LSSI_READ_EDGE);
+	rtw8189f_mac_write_4(sc, RTW8189F_BB_HSSI_P2, t | RTW8189F_LSSI_READ_EDGE);
+
+	delay(10);
+	delay(50);
+	delay(50);
+	delay(10);
+
+	pi = rtw8189f_mac_read_4(sc, RTW8189F_BB_HSSI_P1) & __BIT(8);
+	v = rtw8189f_mac_read_4(sc, pi ? RTW8189F_BB_HSPI_READBACK
+					: RTW8189F_BB_LSSI_READBACK);
+	return v & RTW8189F_LSSI_READBACK_M;
+}
+
+/* ------------------------------------------------------------------ */
+/* Init table interpreter                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The vendor tables carry IF/ELSE/ENDIF blocks in address words with
+ * BIT31/BIT30 set.  Condition matching is a bit-defined compare against
+ * the driver identity vector (check_positive): we replicate the exact
+ * identity the Linux driver computes -- cut A counts as 15 (unknown),
+ * platform ODM_CE = 4, interface ODM_ITRF_SDIO = 4, package unknown
+ * counts as 15 -- so the same branches are taken.
+ */
+#define RTW8189F_DRIVER1	0x0f04f400
+
+static bool
+rtw8189f_cond_match(uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4)
+{
+	uint32_t driver1 = RTW8189F_DRIVER1, bit_mask = 0;
+	uint32_t driver2 = 0, driver4 = 0;	/* no RF-path type selects */
+
+	(void)c3;
+	if (((c1 & 0x0000f000) != 0) &&
+	    ((c1 & 0x0000f000) != (driver1 & 0x0000f000)))
+		return false;
+	if (((c1 & 0x0f000000) != 0) &&
+	    ((c1 & 0x0f000000) != (driver1 & 0x0f000000)))
+		return false;
+
+	c1 &= 0x00ff0fff;
+	driver1 &= 0x00ff0fff;
+	if ((c1 & driver1) != c1)
+		return false;
+
+	if ((c1 & 0x0f) == 0)	/* board type is DONTCARE */
+		return true;
+
+	if (c1 & __BIT(0))
+		bit_mask |= 0x000000ff;
+	if (c1 & __BIT(1))
+		bit_mask |= 0x0000ff00;
+	if (c1 & __BIT(2))
+		bit_mask |= 0x00ff0000;
+	if (c1 & __BIT(3))
+		bit_mask |= 0xff000000;
+
+	return ((c2 & bit_mask) == (driver2 & bit_mask)) &&
+	       ((c4 & bit_mask) == (driver4 & bit_mask));
+}
+
+#define RTW8189F_COND_ENDIF	3
+#define RTW8189F_COND_ELSE	2
+
+/*
+ * Shared per-table walk: drives the condition state machine and hands
+ * matched {addr, val} pairs to the apply callback.  Returns the number
+ * of applied entries.
+ */
+static int
+rtw8189f_walk_table(const uint32_t *tbl, size_t npairs,
+    int (*apply)(struct rtw8189f_softc *, uint32_t, uint32_t, void *),
+    struct rtw8189f_softc *sc, void *arg)
+{
+	bool matched = true, skipped = false;
+	uint32_t pre1 = 0, pre2 = 0;
+	size_t i;
+	int applied = 0;
+
+	for (i = 0; i < npairs; i++) {
+		uint32_t v1 = tbl[2 * i], v2 = tbl[2 * i + 1];
+
+		if (v1 & (__BIT(31) | __BIT(30))) {
+			if (v1 & __BIT(31)) {
+				uint8_t c_cond = (v1 & (__BIT(29) | __BIT(28))) >> 28;
+
+				if (c_cond == RTW8189F_COND_ENDIF) {
+					matched = true;
+					skipped = false;
+				} else if (c_cond == RTW8189F_COND_ELSE) {
+					matched = !skipped;
+				} else {
+					pre1 = v1;
+					pre2 = v2;
+				}
+			} else {	/* negative condition body */
+				if (!skipped) {
+					if (rtw8189f_cond_match(pre1, pre2, v1, v2)) {
+						matched = true;
+						skipped = true;
+					} else {
+						matched = false;
+						skipped = false;
+					}
+				} else
+					matched = false;
+			}
+		} else {
+			if (matched)
+				applied += apply(sc, v1, v2, arg) ? 1 : 0;
+		}
+	}
+	return applied;
+}
+
+static int
+rtw8189f_apply_mac(struct rtw8189f_softc *sc, uint32_t addr, uint32_t val,
+    void *arg)
+{
+	rtw8189f_mac_write_1(sc, addr, val & 0xff);
+	return 1;
+}
+
+static int
+rtw8189f_apply_bb(struct rtw8189f_softc *sc, uint32_t addr, uint32_t val,
+    void *arg)
+{
+	/* 0xF9..0xFE are delay markers; none appear in the 8188F images. */
+	if (addr >= 0xf9 && addr <= 0xfe)
+		return 0;
+	rtw8189f_mac_write_4(sc, addr, val);
+	return 1;
+}
+
+static int
+rtw8189f_apply_rf(struct rtw8189f_softc *sc, uint32_t addr, uint32_t val,
+    void *arg)
+{
+	uint32_t get;
+	uint8_t count;
+
+	rtw8189f_rf_write20(sc, addr, val);
+
+	if (addr == 0xb6) {
+		for (count = 0; count < 6; count++) {
+			get = rtw8189f_rf_read20(sc, addr);
+			if ((get >> 8) == (val >> 8))
+				break;
+			rtw8189f_rf_write20(sc, addr, val);
+		}
+	} else if (addr == 0xb2) {
+		for (count = 0; count < 6; count++) {
+			get = rtw8189f_rf_read20(sc, addr);
+			if (get == val)
+				break;
+			rtw8189f_rf_write20(sc, addr, val);
+			/* Redo the LC calibration. */
+			rtw8189f_rf_write20(sc, RTW8189F_RF_CHNLBW, 0x0fc07);
+		}
+	}
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Chip init (vendor rtl8188fs_hal_init, post-firmware section)        */
+/* ------------------------------------------------------------------ */
+
+int
+rtw8189f_chip_init(struct rtw8189f_softc *sc)
+{
+	uint32_t v;
+	uint8_t v8;
+
+	/* 1. MAC init table (1-byte register writes). */
+	rtw8189f_walk_table(rtw8189f_mac_tbl, __arraycount(rtw8189f_mac_tbl) / 2,
+	    rtw8189f_apply_mac, sc, NULL);
+
+	/* 2. BB config: enable the BB resets/clock, RF on, RF register 1,
+	 * then the PHY and AGC tables (PHY_BBConfig8188F). */
+	v = rtw8189f_mac_read_2(sc, RTW8189F_REG_SYS_FUNC_EN);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_SYS_FUNC_EN,
+	    v | __BIT(13) | __BIT(1) | __BIT(0));
+	rtw8189f_mac_write_1(sc, 0x1f, __BIT(0) | __BIT(1) | __BIT(2));
+	delay(10);
+	rtw8189f_rf_write20(sc, 0x1, 0x780);
+
+	rtw8189f_walk_table(rtw8189f_bb_phy_tbl,
+	    __arraycount(rtw8189f_bb_phy_tbl) / 2, rtw8189f_apply_bb, sc, NULL);
+	rtw8189f_walk_table(rtw8189f_bb_agc_tbl,
+	    __arraycount(rtw8189f_bb_agc_tbl) / 2, rtw8189f_apply_bb, sc, NULL);
+
+	/* 3. RF init table (with the 0xb6/0xb2 readback-verified entries). */
+	rtw8189f_walk_table(rtw8189f_rf_tbl,
+	    __arraycount(rtw8189f_rf_tbl) / 2, rtw8189f_apply_rf, sc, NULL);
+	sc->sc_rf18 = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
+	DNPRINTF(sc, RTW8189F_DBG_INIT, "rf18 after table: 0x%05x\n", sc->sc_rf18);
+
+	/* 4. TX page allocation: NPQ/HPQ/LPQ/PUB + buffer boundaries. */
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_RQPN_NPQ, RTW8189F_RQPN_NPQ(RTW8189F_PAGE_NUM_NPQ));
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_RQPN,
+	    RTW8189F_RQPN_HPQ(RTW8189F_PAGE_NUM_HPQ) |
+	    RTW8189F_RQPN_LPQ(RTW8189F_PAGE_NUM_LPQ) |
+	    RTW8189F_RQPN_PUBQ(RTW8189F_NUM_PUBQ) |
+	    RTW8189F_RQPN_LD_RQPN);
+
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_TXPKTBUF_BCNQ_BDNY, RTW8189F_TX_PAGE_BOUNDARY);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_TXPKTBUF_MGQ_BDNY, RTW8189F_TX_PAGE_BOUNDARY);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_TXPKTBUF_WMAC_LBK_BF_HD, RTW8189F_TX_PAGE_BOUNDARY);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_TRXFF_BNDY, RTW8189F_TX_PAGE_BOUNDARY);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_TDECTRL + 1, RTW8189F_TX_PAGE_BOUNDARY);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_TRXFF_BNDY + 2, RTW8189F_RX_DMA_BOUNDARY);
+
+	/* 5. Auto LLT. */
+	v = rtw8189f_mac_read_4(sc, RTW8189F_REG_AUTO_LLT);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_AUTO_LLT, v | RTW8189F_BIT_AUTO_INIT_LLT);
+	{
+		int retry;
+
+		for (retry = 0; retry < 1000; retry++) {
+			v = rtw8189f_mac_read_4(sc, RTW8189F_REG_AUTO_LLT);
+			if ((v & RTW8189F_BIT_AUTO_INIT_LLT) == 0)
+				break;
+			kpause("rtw8189fl", false, 1, NULL);
+		}
+		if (v & RTW8189F_BIT_AUTO_INIT_LLT) {
+			aprint_error_dev(sc->sc_dev, "auto LLT timeout\n");
+			return EIO;
+		}
+	}
+
+	/* 6. Queue-to-TXDMA mapping (three-out-EP default: BE/BK low,
+	 * VI normal, VO/MG/HI high).  RX aggregation stays off. */
+	v = rtw8189f_mac_read_2(sc, RTW8189F_REG_TRXDMA_CTRL) & 0x7;
+	v |= RTW8189F_TRXDMA_BEQ_MAP(RTW8189F_QUEUE_LOW) |
+	     RTW8189F_TRXDMA_BKQ_MAP(RTW8189F_QUEUE_LOW) |
+	     RTW8189F_TRXDMA_VIQ_MAP(RTW8189F_QUEUE_NORMAL) |
+	     RTW8189F_TRXDMA_VOQ_MAP(RTW8189F_QUEUE_HIGH) |
+	     RTW8189F_TRXDMA_MGQ_MAP(RTW8189F_QUEUE_HIGH) |
+	     RTW8189F_TRXDMA_HIQ_MAP(RTW8189F_QUEUE_HIGH);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_TRXDMA_CTRL, v);
+
+	/* 7. Page size 128, driver info size 32 bytes. */
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_PBP,
+	    RTW8189F_PBP_RX(RTW8189F_PBP_128) | RTW8189F_PBP_TX(RTW8189F_PBP_128));
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_RX_DRVINFO_SZ, 4);
+
+	/* 8. Network type (vendor uses NT_LINK_AP here; the state machine
+	 * programs the rest). */
+	v = rtw8189f_mac_read_4(sc, RTW8189F_REG_CR);
+	v = (v & ~RTW8189F_CR_NETTYPE_M) | RTW8189F_CR_NETTYPE(RTW8189F_NT_LINK_AP);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_CR, v);
+
+	/* 9. RCR: vendor default plus AAP (the MAC drops everything else'
+	 * probe responses until the address filters are programmed --
+	 * same lesson as the 8821CU RCR BIT_AAP).  CBSSID_BCN/DATA are
+	 * dropped during scan windows only (see scan_rx_fltr). */
+	sc->sc_rcr = RTW8189F_RCR_DEFAULT | RTW8189F_RCR_AAP;
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_RCR, sc->sc_rcr);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_MAR + 0, 0xffffffff);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_MAR + 4, 0xffffffff);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_RXFLTMAP2, 0xffff);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_RXFLTMAP1, 0x400);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_RXFLTMAP0, 0xffff);
+
+	/* 10. Response rates, SIFS, retry limits, EDCA. */
+	v = rtw8189f_mac_read_4(sc, RTW8189F_REG_RRSR);
+	v &= ~0xfffff;
+	v |= RTW8189F_RATE_RRSR_CCK_ONLY_1M;
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_RRSR, v);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_SPEC_SIFS, 0x100a);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_MAC_SPEC_SIFS, 0x100a);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_SIFS_CTX, 0x100a);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_SIFS_TRX, 0x100a);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_RETRY_LIMIT, RTW8189F_RETRY_LIMIT(0x30));
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_EDCA_BE_PARAM, 0x005ea42b);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_EDCA_BK_PARAM, 0x0000a44f);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_EDCA_VI_PARAM, 0x005ea324);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_EDCA_VO_PARAM, 0x002fa226);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_USTIME_EDCA, 0x28);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_USTIME_TSF, 0x28);
+
+	/* 11. Retry function + ACK timeout. */
+	v8 = rtw8189f_mac_read_1(sc, RTW8189F_REG_FWHW_TXQ_CTRL);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_FWHW_TXQ_CTRL,
+	    v8 | RTW8189F_AMPDU_RTY_NEW);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_ACKTO, 0x40);
+
+	/* 12. Beacon parameters (STA: TSF update disabled). */
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_BCN_CTRL,
+	    RTW8189F_BCN_DIS_TSF_UDT | (RTW8189F_BCN_DIS_TSF_UDT << 8));
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_TBTT_PROHIBIT, 0x04);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_TBTT_PROHIBIT + 1, 0x64);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_BCNDMATIM, 0x02);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_BCNTCFG, 0x4413);
+
+	/* 13. Burst/single-pkt misc (vendor _InitBurstPktLen_8188FS). */
+	v8 = rtw8189f_mac_read_1(sc, 0x4c7);
+	rtw8189f_mac_write_1(sc, 0x4c7, v8 | __BIT(7));
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_RX_PKT_LIMIT, 0x18);
+	rtw8189f_mac_write_1(sc, 0x4ca, 0x1f);		/* MAX_AGGR_NUM */
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_PIFS, 0x00);
+	v8 = rtw8189f_mac_read_1(sc, RTW8189F_REG_FWHW_TXQ_CTRL);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_FWHW_TXQ_CTRL, v8 & ~__BIT(7));
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_AMPDU_MAX_TIME, 0x70);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_ARFR0, 0x00000010);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_ARFR0 + 4, 0xfffff000);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_ARFR1, 0x00000010);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_ARFR1 + 4, 0x003ff000);
+
+	/* 14. Secondary CCA + BAR mode + HW sequence numbers. */
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_SECONDARY_CCA_CTRL, 0x3);
+	rtw8189f_mac_write_1(sc, 0x976, 0);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_BAR_MODE_CTRL, 0x0201ffff);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_HWSEQ_CTRL, 0xff);
+
+	/* 15. SDIO TX control: keep 0x0[15:3], clear the rest. */
+	{
+		uint32_t t;
+
+		t  = (uint32_t)rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 0);
+		t |= (uint32_t)rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 1) << 8;
+		t |= (uint32_t)rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 2) << 16;
+		t |= (uint32_t)rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 3) << 24;
+		t &= 0x0000fff8;
+		rtw8189f_sdiolocal_write_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 0, t & 0xff);
+		rtw8189f_sdiolocal_write_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 1, (t >> 8) & 0xff);
+		rtw8189f_sdiolocal_write_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 2, 0);
+		rtw8189f_sdiolocal_write_1(sc, RTW8189F_SDIO_REG_TX_CTRL + 3, 0);
+	}
+
+	/* 16. Turn on CCK/OFDM blocks. */
+	v = rtw8189f_mac_read_4(sc, RTW8189F_BB_RFMOD);
+	rtw8189f_mac_write_4(sc, RTW8189F_BB_RFMOD,
+	    v | RTW8189F_BB_RFMOD_CCK_EN | RTW8189F_BB_RFMOD_OFDM_EN);
+
+	/* 17. Default channel 1 + 20 MHz RF bandwidth settings. */
+	rtw8189f_rf_write20(sc, 0x87, 0x065);
+	rtw8189f_rf_write20(sc, 0x1c, 0x000);
+	rtw8189f_rf_write20(sc, 0xdf, 0x140);
+	rtw8189f_rf_write20(sc, 0x1b, 0x0c6c);
+	rtw8189f_set_channel(sc, 1);
+
+	/* 18. TX power indices: fixed mid-range values (0x26) for all
+	 * rates; per-channel efuse calibration is a follow-up. */
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_OFDM6_18, 0x26262626);
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_OFDM24_54, 0x26262626);
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_CCK1,
+	    (rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK1) & ~0x0000ff00) | 0x2600);
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_CCK2_11, 0x26262600);
+
+	/* 19. Enable MAC TX/RX, NAV upper bound (30ms / 128us). */
+	v8 = rtw8189f_mac_read_1(sc, RTW8189F_REG_CR);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_CR,
+	    v8 | RTW8189F_MACTXEN | RTW8189F_MACRXEN);
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_NAV_UPPER, (30000 + 127) / 128);
+
+	/* 20. Our own address (MACID port 0). */
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_MACID,
+	    (uint32_t)sc->sc_mac_addr[0] |
+	    ((uint32_t)sc->sc_mac_addr[1] << 8) |
+	    ((uint32_t)sc->sc_mac_addr[2] << 16) |
+	    ((uint32_t)sc->sc_mac_addr[3] << 24));
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_MACID + 4,
+	    (uint16_t)(sc->sc_mac_addr[4] | (sc->sc_mac_addr[5] << 8)));
+
+	aprint_normal_dev(sc->sc_dev,
+	    "chip init done (rf18 0x%05x, rcr 0x%08x)\n", sc->sc_rf18, sc->sc_rcr);
+	return 0;
+}
+
+void
+rtw8189f_set_channel(struct rtw8189f_softc *sc, unsigned chan)
+{
+	if (chan < 1 || chan > 14)
+		return;
+
+	rtw8189f_rf_write20(sc, RTW8189F_RF_CHNLBW,
+	    (sc->sc_rf18 & ~0xff) | chan);
+}
+
+/*
+ * Scan window RX filter: the CBSSID bits gate beacons/probe responses on
+ * a BSSID match against REG_BSSID, which is not programmed during a
+ * scan -- exactly the rtw89 lane's A_BCN_CHK_EN trap.  AAP stays on
+ * permanently (8821CU lesson: AP unicast responses need it).
+ */
+void
+rtw8189f_scan_rx_fltr(struct rtw8189f_softc *sc, bool widen)
+{
+	uint32_t rcr = sc->sc_rcr;
+	const uint32_t scan_bits = RTW8189F_RCR_CBSSID_BCN | RTW8189F_RCR_CBSSID_DATA;
+
+	if (widen)
+		rcr &= ~scan_bits;
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_RCR, rcr);
+}
+
+void
+rtw8189f_set_bssid(struct rtw8189f_softc *sc, const uint8_t *bssid)
+{
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_BSSID,
+	    (uint32_t)bssid[0] | ((uint32_t)bssid[1] << 8) |
+	    ((uint32_t)bssid[2] << 16) | ((uint32_t)bssid[3] << 24));
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_BSSID + 4,
+	    (uint16_t)(bssid[4] | (bssid[5] << 8)));
+}
+
+/* ------------------------------------------------------------------ */
+/* TX                                                                  */
+/* ------------------------------------------------------------------ */
+
+static uint16_t
+rtw8189f_txdesc_chksum(uint8_t *desc)
+{
+	uint16_t sum = 0;
+	int i;
+
+	desc[28] = 0;
+	desc[29] = 0;
+	for (i = 0; i < 16; i++)
+		sum ^= le16dec(desc + 2 * i);
+	return sum;
+}
+
+#define RTW8189F_TX_QUEUE_IDX_HI	0
+
+void
+rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ifnet *ifp = ic->ic_ifp;
+	struct ieee80211_node *ni;
+	struct ieee80211_frame *wh;
+	uint8_t *buf = sc->sc_txbuf;
+	uint32_t len, pages, free_hi, free_pub;
+	unsigned rate;
+	int tries;
+
+	ni = M_GETCTX(m, struct ieee80211_node *);
+	if (ni == NULL) {
+		m_freem(m);
+		return;
+	}
+
+	wh = mtod(m, struct ieee80211_frame *);
+	rate = (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT
+	    ? RTW8189F_RATE_1M : RTW8189F_RATE_6M;
+
+	len = (uint32_t)m->m_pkthdr.len;
+	if (len + RTW8189F_TXDESC_SIZE > RTW8189F_TXBUFSZ) {
+		if_statinc(ifp, if_oerrors);
+		goto out;
+	}
+
+	memset(buf, 0, RTW8189F_TXDESC_SIZE);
+	m_copydata(m, 0, len, buf + RTW8189F_TXDESC_SIZE);
+
+	le32enc(buf + 0, (len & RTW8189F_TXDW0_PKTLEN_M) |
+	    (RTW8189F_TXDESC_SIZE << RTW8189F_TXDW0_OFFSET_S));
+	le32enc(buf + 4, RTW8189F_TXDESC_QSEL_MGNT << RTW8189F_TXDW1_QSEL_S);
+	le32enc(buf + 12, RTW8189F_TXDW3_USE_RATE);
+	le32enc(buf + 16, rate & RTW8189F_TXDW4_RATE_M);
+	le32enc(buf + 32, RTW8189F_TXDW8_HWSEQ_EN);
+	le16enc(buf + 28, rtw8189f_txdesc_chksum(buf));
+
+	len = (len + RTW8189F_TXDESC_SIZE + 3) & ~3u;
+	pages = (len + 127) / 128;
+
+	/* Wait for HIQ (+public) pages, vendor polling mode. */
+	for (tries = 0;; tries++) {
+		free_hi = rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 0);
+		free_pub = rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 6);
+		if (free_hi + free_pub >= pages)
+			break;
+		if (tries >= 100 || sc->sc_dying) {
+			DPRINTF(sc, "tx: no free pages (%u+%u < %u)\n",
+			    free_hi, free_pub, pages);
+			if_statinc(ifp, if_oerrors);
+			goto out;
+		}
+		kpause("rtw8189ft", true, mstohz(50), NULL);
+	}
+
+	if (rtw8189f_fifo_write(sc, RTW8189F_WLAN_TX_HIQ_DEVICE_ID, buf, len) != 0) {
+		DPRINTF(sc, "tx: fifo write failed\n");
+		if_statinc(ifp, if_oerrors);
+		goto out;
+	}
+
+	if_statinc(ifp, if_opackets);
+	sc->sc_tx_frames++;
+	DNPRINTF(sc, RTW8189F_DBG_TX, "tx %s len %u rate %u\n",
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT
+	    ? "mgmt" : "data", len, rate);
+out:
+	ieee80211_free_node(ni);
+	m_freem(m);
+}
+
+/* ------------------------------------------------------------------ */
+/* RX                                                                  */
+/* ------------------------------------------------------------------ */
+
+static uint16_t
+rtw8189f_rx_req_len(struct rtw8189f_softc *sc)
+{
+	uint16_t len;
+
+	len = (uint16_t)rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_RX0_REQ_LEN);
+	len |= (uint16_t)rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_RX0_REQ_LEN + 1) << 8;
+	/* Vendor carry fix for length multiples of 256. */
+	if ((len % 256) == 0)
+		len += rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_RX0_REQ_LEN);
+	return len;
+}
+
+void
+rtw8189f_rx_drain(struct rtw8189f_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ifnet *ifp = ic->ic_ifp;
+	int s;
+	unsigned pkt;
+
+	for (pkt = 0; pkt < 64; pkt++) {
+		uint8_t *buf = sc->sc_rxbuf;
+		uint16_t rxlen;
+		uint32_t off;
+		uint16_t reqlen;
+
+		reqlen = rtw8189f_rx_req_len(sc);
+		if (reqlen == 0)
+			break;
+		if (reqlen > RTW8189F_RXBUFSZ) {
+			/* Desynchronised FIFO report: flush the reported
+			 * burst in bounded chunks rather than dying. */
+			unsigned chunk;
+
+			sc->sc_rx_errors++;
+			DNPRINTF(sc, RTW8189F_DBG_RX,
+			    "rx: oversized request %u, flushing\n", reqlen);
+			for (chunk = 0; chunk < 8; chunk++)
+				rtw8189f_fifo_read(sc, sc->sc_rxbuf,
+				    RTW8189F_RXBUFSZ);
+			continue;
+		}
+		rxlen = (reqlen + 3) & ~3u;
+
+		if (rtw8189f_fifo_read(sc, buf, rxlen) != 0) {
+			sc->sc_rx_errors++;
+			return;
+		}
+
+		off = 0;
+		while (off + 24 <= rxlen) {
+			uint32_t desc_off = off;
+			uint32_t d0 = le32dec(buf + off);
+			uint32_t d2 = le32dec(buf + off + 8);
+			uint32_t pkt_len = d0 & 0x3fff;
+			uint32_t drvinfo = ((d0 >> 16) & 0xf) << 3;
+			uint32_t shift = (d0 >> 24) & 0x3;
+			bool physt = (d0 & __BIT(26)) != 0;
+			uint32_t total, frame_off;
+			struct mbuf *m;
+			struct ieee80211_node *ni;
+			uint8_t fc0;
+			int rssi;
+
+			total = 24 + drvinfo + shift + pkt_len;
+			frame_off = off + 24 + drvinfo + shift;
+			off += (total + 7) & ~7u;
+
+			if (d2 & __BIT(28)) {		/* C2H event */
+				DNPRINTF(sc, RTW8189F_DBG_RX, "rx: c2h len %u\n",
+				    pkt_len);
+				continue;
+			}
+
+			if ((d0 & __BIT(14)) || pkt_len == 0 ||
+			    frame_off + pkt_len > rxlen ||
+			    pkt_len < sizeof(struct ieee80211_frame_min) ||
+			    pkt_len > MCLBYTES - 16) {
+				sc->sc_rx_errors++;
+				DNPRINTF(sc, RTW8189F_DBG_RX,
+				    "rx: bad pkt d0 %08x len %u\n", d0, pkt_len);
+				continue;
+			}
+
+			/* PHY status dword0 carries the PWDB report; the
+			 * net80211 scan cache only needs monotonic units. */
+			rssi = 30;
+			if (physt) {
+				/* PHY status byte 0 carries the PWDB-style
+				 * signal report; byte 2 is the (0-based)
+				 * receive channel. */
+				rssi = buf[desc_off + 24] & 0x7f;
+				if (rssi == 0)
+					rssi = 1;
+			}
+
+			m = m_gethdr(M_DONTWAIT, MT_DATA);
+			if (m == NULL) {
+				sc->sc_rx_errors++;
+				continue;
+			}
+			if (pkt_len > MHLEN)
+				MCLGET(m, M_DONTWAIT);
+			if (pkt_len > MHLEN && !(m->m_flags & M_EXT)) {
+				m_freem(m);
+				sc->sc_rx_errors++;
+				continue;
+			}
+			m_set_rcvif(m, ifp);
+			memcpy(mtod(m, void *), buf + frame_off, pkt_len);
+			m->m_pkthdr.len = m->m_len = pkt_len;
+
+			fc0 = *(uint8_t *)(buf + frame_off);
+			if ((fc0 & IEEE80211_FC0_TYPE_MASK) ==
+			    IEEE80211_FC0_TYPE_MGT &&
+			    ((fc0 & IEEE80211_FC0_SUBTYPE_MASK) ==
+			    IEEE80211_FC0_SUBTYPE_BEACON ||
+			    (fc0 & IEEE80211_FC0_SUBTYPE_MASK) ==
+			    IEEE80211_FC0_SUBTYPE_PROBE_RESP)) {
+				const uint8_t *ie, *eie;
+				unsigned ds = 0;
+
+				sc->sc_rx_beacons++;
+				/* Beacon/probe-rsp fixed part after the
+				 * 802.11 header is 8+2+2 bytes; walk the
+				 * IEs for the DS parameter set (id 3) and
+				 * replicate net80211's channel check. */
+				ie = buf + frame_off + 12;
+				eie = buf + frame_off + pkt_len;
+				for (; ie + 2 <= eie; ie += 2 + ie[1]) {
+					if (ie[0] == 3 && ie + 3 <= eie) {
+						ds = ie[2];
+						break;
+					}
+				}
+				DNPRINTF(sc, RTW8189F_DBG_RX,
+				    "bcn #%u fc %02x ds %u cur %u pwdb %u "
+				    "fscan %d\n",
+				    sc->sc_rx_beacons, fc0, ds,
+				    ieee80211_chan2ieee(ic, ic->ic_curchan),
+				    buf[desc_off + 24],
+				    (ic->ic_flags & IEEE80211_F_SCAN) ? 1 : 0);
+			}
+
+			s = splnet();
+			ni = ieee80211_find_rxnode(ic,
+			    mtod(m, struct ieee80211_frame_min *));
+			if (ni != NULL) {
+				ieee80211_input(ic, m, ni, rssi, 0);
+				ieee80211_free_node(ni);
+			} else
+				m_freem(m);
+			splx(s);
+
+			sc->sc_rx_frames++;
+		}
+	}
 }

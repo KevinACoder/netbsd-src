@@ -93,7 +93,11 @@ static void	rtw8189f_start(struct ifnet *);
 static void	rtw8189f_watchdog(struct ifnet *);
 static int	rtw8189f_ioctl(struct ifnet *, u_long, void *);
 static int	rtw8189f_newstate(struct ieee80211com *, enum ieee80211_state,
-		    int);
+			    int);
+static void	rtw8189f_newstate_cb(struct rtw8189f_softc *);
+static void	rtw8189f_next_scan(void *);
+static void	rtw8189f_worker(void *);
+static void	rtw8189f_worker_stop(struct rtw8189f_softc *);
 
 static int
 rtw8189f_match(device_t parent, cfdata_t match, void *aux)
@@ -131,7 +135,11 @@ rtw8189f_attach(device_t parent, device_t self, void *aux)
 	aprint_normal("\n");
 
 	mutex_init(&sc->sc_lock, MUTEX_DEFAULT, IPL_NONE);
+	mutex_init(&sc->sc_work_mtx, MUTEX_DEFAULT, IPL_NONE);
+	cv_init(&sc->sc_cv, device_xname(self));
+	MBUFQ_INIT(&sc->sc_txq);
 	callout_init(&sc->sc_scan_to, 0);
+	callout_setfunc(&sc->sc_scan_to, rtw8189f_next_scan, sc);
 
 	/* 512-byte blocks for the CMD53 FIFO/register bursts. */
 	if (sdmmc_io_set_blocklen(sc->sc_sf, 512) != 0) {
@@ -195,10 +203,13 @@ rtw8189f_attachhook(device_t self)
 		return;
 	}
 
+	/* Bounce buffers for the CMD53 FIFO bursts (4-byte aligned). */
+	sc->sc_rxbuf = kmem_alloc(RTW8189F_RXBUFSZ, KM_SLEEP);
+	sc->sc_txbuf = kmem_alloc(RTW8189F_TXBUFSZ, KM_SLEEP);
+
 	/*
-	 * Register with net80211.  The MAC/BB/RF init (chip start) is a
-	 * later milestone; the interface exists but ifconfig up fails
-	 * with EOPNOTSUPP until then.
+	 * Register with net80211.  The MAC/BB/RF init runs from
+	 * rtw8189f_init() on the first ifconfig up.
 	 */
 	ic->ic_ifp = ifp;
 	ic->ic_phytype = IEEE80211_T_OFDM;
@@ -290,6 +301,10 @@ rtw8189f_detach(device_t self, int flags)
 	pmf_device_deregister(self);
 	s = splnet();
 	sc->sc_dying = 1;
+	splx(s);
+
+	rtw8189f_worker_stop(sc);
+	s = splnet();
 	callout_halt(&sc->sc_scan_to, NULL);
 
 	if (sc->sc_attached) {
@@ -300,6 +315,15 @@ rtw8189f_detach(device_t self, int flags)
 	}
 	splx(s);
 
+	if (sc->sc_rxbuf != NULL)
+		kmem_free(sc->sc_rxbuf, RTW8189F_RXBUFSZ);
+	if (sc->sc_txbuf != NULL)
+		kmem_free(sc->sc_txbuf, RTW8189F_TXBUFSZ);
+	if (sc->sc_fw != NULL)
+		kmem_free(sc->sc_fw, sc->sc_fwsize);
+
+	mutex_destroy(&sc->sc_work_mtx);
+	cv_destroy(&sc->sc_cv);
 	mutex_destroy(&sc->sc_lock);
 	callout_destroy(&sc->sc_scan_to);
 
@@ -330,41 +354,161 @@ rtw8189f_init(struct ifnet *ifp)
 {
 	struct rtw8189f_softc *sc = ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
+	int error, s;
 
 	if (sc->sc_dying)
 		return ENXIO;
-	if (!sc->sc_fw_ready) {
-		aprint_error_dev(sc->sc_dev,
-		    "chip not initialised (MAC/BB/RF init pending)\n");
+	if (!sc->sc_fw_ready)
 		return EOPNOTSUPP;
+
+	/* MAC/BB/RF init + LLT/queue/RCR bring-up (sleeping; ioctl ctx). */
+	if (!sc->sc_chip_ready) {
+		error = rtw8189f_chip_init(sc);
+		if (error != 0)
+			return error;
+		sc->sc_chip_ready = true;
+
+		/* A previous worker may still be draining its last loop. */
+		{
+			int wait;
+
+			for (wait = 0; sc->sc_worker != NULL && wait < 40; wait++)
+				kpause("rtw8189fw", false, mstohz(50), NULL);
+			if (sc->sc_worker != NULL) {
+				sc->sc_chip_ready = false;
+				return EBUSY;
+			}
+		}
+
+		error = kthread_create(PRI_NONE, 0, NULL, rtw8189f_worker, sc,
+		    &sc->sc_worker, "%s-worker", device_xname(sc->sc_dev));
+		if (error != 0) {
+			sc->sc_chip_ready = false;
+			return error;
+		}
 	}
 
-	/*
-	 * M3 milestone will add the MAC/BB/RF init and start the scan
-	 * state machine here.
-	 */
-	(void)ic;
+	s = splnet();
+	ifp->if_flags |= IFF_RUNNING;
+	ifp->if_flags &= ~IFF_OACTIVE;
+	ifp->if_timer = 0;
+	ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+	splx(s);
+
 	return 0;
 }
 
 static void
 rtw8189f_stop(struct ifnet *ifp, int disable)
 {
+	struct rtw8189f_softc *sc = ifp->if_softc;
+	struct ieee80211com *ic = &sc->sc_ic;
+	int s;
 
+	s = splnet();
 	ifp->if_timer = 0;
 	ifp->if_flags &= ~(IFF_RUNNING | IFF_OACTIVE);
+	callout_stop(&sc->sc_scan_to);
+	if (ic->ic_state != IEEE80211_S_INIT)
+		ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+	splx(s);
+
+	/*
+	 * Halt the worker without joining it: the worker can be deep
+	 * inside a net80211 callback chain and a join here deadlocks the
+	 * ioctl thread (observed on board).  The worker clears
+	 * sc_worker itself on exit; init() waits for it before creating
+	 * a new one.
+	 */
+	mutex_enter(&sc->sc_work_mtx);
+	sc->sc_flags |= RTW8189F_F_EXIT;
+	cv_broadcast(&sc->sc_cv);
+	mutex_exit(&sc->sc_work_mtx);
+
+	sc->sc_chip_ready = false;
 }
 
 static void
 rtw8189f_start(struct ifnet *ifp)
 {
 	struct rtw8189f_softc *sc = ifp->if_softc;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mbuf *m;
+	bool kick = false;
+	int s;
 
-	if (!sc->sc_fw_ready) {
+	if (!sc->sc_chip_ready || (ifp->if_flags & IFF_RUNNING) == 0) {
 		if_statinc(ifp, if_oerrors);
 		return;
 	}
-	/* TX path lands with the M3 milestone. */
+
+	s = splnet();
+	for (;;) {
+		struct ether_header *eh;
+		struct ieee80211_node *ni;
+		struct ieee80211_frame *wh;
+
+		IF_POLL(&ic->ic_mgtq, m);
+		if (m != NULL) {
+			IF_DEQUEUE(&ic->ic_mgtq, m);
+			/* mgmt mbufs carry their node via M_SETCTX. */
+			DPRINTF(sc, "start: mgmt frame queued\n");
+			MBUFQ_ENQUEUE(&sc->sc_txq, m);
+			kick = true;
+			continue;
+		}
+
+		if (ic->ic_state != IEEE80211_S_RUN)
+			break;
+
+		IFQ_POLL(&ifp->if_snd, m);
+		if (m == NULL)
+			break;
+		IFQ_DEQUEUE(&ifp->if_snd, m);
+
+		eh = mtod(m, struct ether_header *);
+		ni = ieee80211_find_txnode(ic, eh->ether_dhost);
+		if (ni == NULL) {
+			if_statinc(ifp, if_oerrors);
+			m_freem(m);
+			continue;
+		}
+
+		if ((m = ieee80211_encap(ic, m, ni)) == NULL) {
+			if_statinc(ifp, if_oerrors);
+			ieee80211_free_node(ni);
+			continue;
+		}
+
+		/*
+		 * ieee80211_encap() only builds the 802.11 header, sets the
+		 * Protected bit and reserves room for the crypto header; a
+		 * software-crypto driver has to finish the encapsulation
+		 * itself.  Without this the frame leaves with Protected set
+		 * but no CCMP header/MIC and the AP discards every data
+		 * frame (rtw88 lane lesson).
+		 */
+		wh = mtod(m, struct ieee80211_frame *);
+		if ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0 &&
+		    ieee80211_crypto_encap(ic, ni, m) == NULL) {
+			if_statinc(ifp, if_oerrors);
+			m_freem(m);
+			ieee80211_free_node(ni);
+			continue;
+		}
+
+		M_SETCTX(m, ni);
+		MBUFQ_ENQUEUE(&sc->sc_txq, m);
+		kick = true;
+	}
+	splx(s);
+
+	if (kick) {
+		mutex_enter(&sc->sc_work_mtx);
+		sc->sc_flags |= RTW8189F_F_TX;
+		cv_broadcast(&sc->sc_cv);
+		mutex_exit(&sc->sc_work_mtx);
+	}
 }
 
 static void
@@ -421,15 +565,182 @@ rtw8189f_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 }
 
 /* ------------------------------------------------------------------ */
-/* net80211 state machine                                              */
+/* State machine, scanning and the worker thread                       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * net80211 here is the pre-FreeBSD-8 stack: scanning is driven by
+ * re-entering IEEE80211_S_SCAN through ic_newstate, with the channel
+ * net80211 picked in ic_curchan, and each pass probing the channel via
+ * ieee80211_probe_curchan() (frames arrive in ic->ic_mgtq).  The state
+ * machine runs at splnet while everything below sleeps on SDIO, so the
+ * chip work is deferred to the worker thread, exactly as if_rtw88.c
+ * does with its async callback.
+ */
 static int
 rtw8189f_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
     int arg)
 {
 	struct rtw8189f_softc *sc = ic->ic_ifp->if_softc;
 
-	/* M3 milestone: program channel/filters per state. */
-	return sc->sc_newstate(ic, nstate, arg);
+	callout_stop(&sc->sc_scan_to);
+	if (sc->sc_worker == NULL || sc->sc_dying || !sc->sc_chip_ready)
+		return sc->sc_newstate(ic, nstate, arg);
+
+	mutex_enter(&sc->sc_work_mtx);
+	sc->sc_nstate = nstate;
+	sc->sc_narg = arg;
+	sc->sc_flags |= RTW8189F_F_NEWSTATE;
+	cv_broadcast(&sc->sc_cv);
+	mutex_exit(&sc->sc_work_mtx);
+
+	return 0;
+}
+
+/* Runs on the worker; ic->ic_state still holds the previous state. */
+static void
+rtw8189f_newstate_cb(struct rtw8189f_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	enum ieee80211_state nstate = sc->sc_nstate, ostate = ic->ic_state;
+	int arg = sc->sc_narg;
+
+	DNPRINTF(sc, RTW8189F_DBG_INIT, "newstate %d -> %d ch %d\n", ostate,
+	    nstate, ieee80211_chan2ieee(ic, ic->ic_curchan));
+
+	switch (nstate) {
+	case IEEE80211_S_SCAN:
+		/* One channel per pass; the callout moves to the next. */
+		rtw8189f_set_channel(sc,
+		    ieee80211_chan2ieee(ic, ic->ic_curchan));
+		if (ostate != IEEE80211_S_SCAN && !sc->sc_scanning) {
+			sc->sc_scanning = true;
+			rtw8189f_scan_rx_fltr(sc, true);
+		}
+		callout_schedule(&sc->sc_scan_to, hz / 5);
+		break;
+
+	case IEEE80211_S_AUTH:
+	case IEEE80211_S_ASSOC:
+	case IEEE80211_S_RUN:
+		if (sc->sc_scanning) {
+			sc->sc_scanning = false;
+			rtw8189f_scan_rx_fltr(sc, false);
+		}
+		if (ostate != nstate) {
+			rtw8189f_set_channel(sc,
+			    ieee80211_chan2ieee(ic, ic->ic_curchan));
+			if (nstate != IEEE80211_S_AUTH)
+				rtw8189f_set_bssid(sc, ic->ic_bss->ni_bssid);
+		}
+		break;
+
+	case IEEE80211_S_INIT:
+		if (sc->sc_scanning) {
+			sc->sc_scanning = false;
+			rtw8189f_scan_rx_fltr(sc, false);
+		}
+		break;
+	}
+
+	sc->sc_newstate(ic, nstate, arg);
+}
+
+static void
+rtw8189f_next_scan(void *arg)
+{
+	struct rtw8189f_softc *sc = arg;
+	int s;
+
+	s = splnet();
+	if (sc->sc_ic.ic_state == IEEE80211_S_SCAN)
+		ieee80211_next_scan(&sc->sc_ic);
+	splx(s);
+}
+
+static void
+rtw8189f_worker_stop(struct rtw8189f_softc *sc)
+{
+	int wait;
+
+	mutex_enter(&sc->sc_work_mtx);
+	sc->sc_flags |= RTW8189F_F_EXIT;
+	cv_broadcast(&sc->sc_cv);
+	mutex_exit(&sc->sc_work_mtx);
+
+	/* Bounded wait: the worker clears sc_worker itself on exit. */
+	for (wait = 0; sc->sc_worker != NULL && wait < 200; wait++)
+		kpause("rtw8189fw", false, mstohz(10), NULL);
+}
+
+static void
+rtw8189f_worker(void *arg)
+{
+	struct rtw8189f_softc *sc = arg;
+	struct rtw8189f_txq locq;
+	struct mbuf *m;
+	struct ieee80211_node *ni;
+	uint32_t flags;
+
+	MBUFQ_INIT(&locq);
+
+	while (!sc->sc_dying) {
+		mutex_enter(&sc->sc_work_mtx);
+		while (!(sc->sc_flags & (RTW8189F_F_NEWSTATE | RTW8189F_F_TX |
+		    RTW8189F_F_EXIT)) && !sc->sc_dying)
+			cv_timedwait(&sc->sc_cv, &sc->sc_work_mtx, mstohz(50));
+		flags = sc->sc_flags;
+		sc->sc_flags = 0;
+		/* Steal the TX queue without holding the mutex on the bus. */
+		for (;;) {
+			MBUFQ_DEQUEUE(&sc->sc_txq, m);
+			if (m == NULL)
+				break;
+			MBUFQ_ENQUEUE(&locq, m);
+		}
+		mutex_exit(&sc->sc_work_mtx);
+
+		if ((flags & RTW8189F_F_EXIT) || sc->sc_dying)
+			break;
+
+		if (flags & RTW8189F_F_NEWSTATE)
+			rtw8189f_newstate_cb(sc);
+
+		for (;;) {
+			MBUFQ_DEQUEUE(&locq, m);
+			if (m == NULL)
+				break;
+			rtw8189f_tx_frame(sc, m);
+		}
+
+		/* Poll the RX FIFO; interrupts are a hardening step. */
+		rtw8189f_rx_drain(sc);
+	}
+
+	/* Flush anything still queued. */
+	for (;;) {
+		MBUFQ_DEQUEUE(&locq, m);
+		if (m == NULL)
+			break;
+		ni = M_GETCTX(m, struct ieee80211_node *);
+		if (ni != NULL)
+			ieee80211_free_node(ni);
+		m_freem(m);
+	}
+	mutex_enter(&sc->sc_work_mtx);
+	for (;;) {
+		MBUFQ_DEQUEUE(&sc->sc_txq, m);
+		if (m == NULL)
+			break;
+		ni = M_GETCTX(m, struct ieee80211_node *);
+		if (ni != NULL)
+			ieee80211_free_node(ni);
+		m_freem(m);
+	}
+	sc->sc_worker = NULL;
+	cv_broadcast(&sc->sc_cv);
+	mutex_exit(&sc->sc_work_mtx);
+
+	/* rtw89 lane lesson: a kthread must kthread_exit(), never return. */
+	kthread_exit(0);
 }

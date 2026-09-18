@@ -140,4 +140,186 @@
 #define RTW8189F_FW_SIGNATURE			0x88f1
 #define RTW8189F_FW_VERSION_OFF			4	/* u8 version at [4] */
 
+/*
+ * TX/RX DMA configuration (vendor sdio_halinit.c _InitQueueReservedPage
+ * et al.).  TX page size is always 128 bytes.
+ */
+#define RTW8189F_REG_RQPN			0x0200
+#define RTW8189F_REG_TDECTRL			0x0208
+#define RTW8189F_REG_RQPN_NPQ			0x0214
+#define RTW8189F_REG_AUTO_LLT			0x0224
+#define RTW8189F_BIT_AUTO_INIT_LLT		__BIT(16)
+#define RTW8189F_REG_RXDMA_AGG_PG_TH		0x0280
+#define RTW8189F_REG_RXDMA_MODE_CTRL		0x0290	/* 8188F */
+
+#define RTW8189F_RQPN_HPQ(x)			((x) & 0xff)
+#define RTW8189F_RQPN_LPQ(x)			(((x) & 0xff) << 8)
+#define RTW8189F_RQPN_PUBQ(x)			(((x) & 0xff) << 16)
+#define RTW8189F_RQPN_NPQ(x)			((x) & 0xff)
+#define RTW8189F_RQPN_LD_RQPN			__BIT(31)
+
+/* NORMAL_PAGE_NUM_* / TX_TOTAL_PAGE_NUMBER_8188F: BCNQ 0x08, WOW 0x00. */
+#define RTW8189F_PAGE_NUM_HPQ			0x0c
+#define RTW8189F_PAGE_NUM_LPQ			0x02
+#define RTW8189F_PAGE_NUM_NPQ			0x02
+#define RTW8189F_TX_TOTAL_PAGE_NUMBER		0xf7	/* 0xFF - 8 - 0 */
+#define RTW8189F_NUM_PUBQ \
+	(RTW8189F_TX_TOTAL_PAGE_NUMBER - RTW8189F_PAGE_NUM_HPQ - \
+	 RTW8189F_PAGE_NUM_LPQ - RTW8189F_PAGE_NUM_NPQ)
+#define RTW8189F_TX_PAGE_BOUNDARY		0xf8	/* TX_TOTAL + 1 */
+#define RTW8189F_RX_DMA_BOUNDARY		0x3f7f	/* 0x4000 - 0x80 - 1 */
+
+/* Queue-to-TXDMA-ring mapping (REG_TRXDMA_CTRL). */
+#define RTW8189F_REG_TRXDMA_CTRL		0x010c
+#define RTW8189F_TRXDMA_HIQ_MAP(x)		(((x) & 0x3) << 14)
+#define RTW8189F_TRXDMA_MGQ_MAP(x)		(((x) & 0x3) << 12)
+#define RTW8189F_TRXDMA_BKQ_MAP(x)		(((x) & 0x3) << 10)
+#define RTW8189F_TRXDMA_BEQ_MAP(x)		(((x) & 0x3) << 8)
+#define RTW8189F_TRXDMA_VIQ_MAP(x)		(((x) & 0x3) << 6)
+#define RTW8189F_TRXDMA_VOQ_MAP(x)		(((x) & 0x3) << 4)
+#define RTW8189F_QUEUE_LOW			1
+#define RTW8189F_QUEUE_NORMAL			2
+#define RTW8189F_QUEUE_HIGH			3
+
+#define RTW8189F_REG_PBP			0x0104
+#define RTW8189F_PBP_128			0x1
+#define RTW8189F_PBP_RX(x)			(x)
+#define RTW8189F_PBP_TX(x)			((x) << 4)
+
+/* TX buffer boundaries (all get TX_PAGE_BOUNDARY). */
+#define RTW8189F_REG_TXPKTBUF_BCNQ_BDNY		0x0424
+#define RTW8189F_REG_TXPKTBUF_MGQ_BDNY		0x0425
+#define RTW8189F_REG_TXPKTBUF_WMAC_LBK_BF_HD	0x045d
+#define RTW8189F_REG_TRXFF_BNDY			0x0114
+
+/* Protocol configuration. */
+#define RTW8189F_REG_FWHW_TXQ_CTRL		0x0420
+#define RTW8189F_REG_HWSEQ_CTRL			0x0423
+#define RTW8189F_REG_SPEC_SIFS			0x0428
+#define RTW8189F_REG_RETRY_LIMIT		0x042a
+#define RTW8189F_REG_RRSR			0x0440
+#define RTW8189F_REG_ARFR0			0x0444
+#define RTW8189F_REG_ARFR1			0x044c
+#define RTW8189F_REG_AMPDU_MAX_TIME		0x0456
+#define RTW8189F_REG_BAR_MODE_CTRL		0x04cc
+#define RTW8189F_AMPDU_RTY_NEW			__BIT(7)
+#define RTW8189F_RATE_RRSR_CCK_ONLY_1M		0xffff1
+#define RTW8189F_RETRY_LIMIT(x)			(((x) & 0x3f) | (((x) & 0x3f) << 8))
+
+#define RTW8189F_REG_EDCA_VO_PARAM		0x0500
+#define RTW8189F_REG_EDCA_VI_PARAM		0x0504
+#define RTW8189F_REG_EDCA_BE_PARAM		0x0508
+#define RTW8189F_REG_EDCA_BK_PARAM		0x050c
+#define RTW8189F_REG_BCNTCFG			0x0510
+#define RTW8189F_REG_PIFS			0x0512
+#define RTW8189F_REG_SIFS_CTX			0x0514
+#define RTW8189F_REG_SIFS_TRX			0x0516
+#define RTW8189F_REG_TBTT_PROHIBIT		0x0540
+#define RTW8189F_REG_BCN_CTRL			0x0550
+#define RTW8189F_REG_DRVERLYINT			0x0558
+#define RTW8189F_REG_BCNDMATIM			0x0559
+#define RTW8189F_REG_USTIME_TSF			0x055c	/* 8188F */
+#define RTW8189F_REG_SECONDARY_CCA_CTRL		0x0577	/* 8188F */
+#define RTW8189F_BCN_DIS_TSF_UDT		__BIT(4)
+#define RTW8189F_BCN_EN_BCN_FUNCTION		__BIT(3)
+
+/* WMAC configuration. */
+#define RTW8189F_REG_RCR			0x0608
+#define RTW8189F_REG_RX_DRVINFO_SZ		0x060f
+#define RTW8189F_REG_MACID			0x0610
+#define RTW8189F_REG_BSSID			0x0618
+#define RTW8189F_REG_MAR			0x0620
+#define RTW8189F_REG_USTIME_EDCA		0x0638	/* 8188F */
+#define RTW8189F_REG_MAC_SPEC_SIFS		0x063a
+#define RTW8189F_REG_ACKTO			0x0640
+#define RTW8189F_REG_NAV_UPPER			0x0652
+#define RTW8189F_REG_RXFLTMAP0			0x06a0
+#define RTW8189F_REG_RXFLTMAP1			0x06a2
+#define RTW8189F_REG_RXFLTMAP2			0x06a4
+#define RTW8189F_REG_RX_PKT_LIMIT		0x060c	/* 8188F */
+#define RTW8189F_REG_C2HEVT_CLEAR		0x01af
+
+/* REG_RCR bits (default ReceiveConfig = 0x700060ce, no AAP / no APPFCS:
+ * HW strips the 4-byte FCS, so RX frames need no trimming). */
+#define RTW8189F_RCR_APP_MIC			__BIT(30)
+#define RTW8189F_RCR_APP_ICV			__BIT(29)
+#define RTW8189F_RCR_APP_PHYST_RXFF		__BIT(28)
+#define RTW8189F_RCR_HTC_LOC_CTRL		__BIT(14)
+#define RTW8189F_RCR_AMF			__BIT(13)
+#define RTW8189F_RCR_ADF			__BIT(11)
+#define RTW8189F_RCR_AICV			__BIT(9)
+#define RTW8189F_RCR_ACRC32			__BIT(8)
+#define RTW8189F_RCR_CBSSID_BCN			__BIT(7)
+#define RTW8189F_RCR_CBSSID_DATA		__BIT(6)
+#define RTW8189F_RCR_AB				__BIT(3)
+#define RTW8189F_RCR_AM				__BIT(2)
+#define RTW8189F_RCR_APM			__BIT(1)
+#define RTW8189F_RCR_AAP			__BIT(0)
+#define RTW8189F_RCR_DEFAULT \
+	(RTW8189F_RCR_APP_MIC | RTW8189F_RCR_APP_ICV | \
+	 RTW8189F_RCR_APP_PHYST_RXFF | RTW8189F_RCR_HTC_LOC_CTRL | \
+	 RTW8189F_RCR_AMF | RTW8189F_RCR_CBSSID_BCN | \
+	 RTW8189F_RCR_CBSSID_DATA | RTW8189F_RCR_AB | \
+	 RTW8189F_RCR_AM | RTW8189F_RCR_APM)
+
+/* REG_CR network type field. */
+#define RTW8189F_CR_NETTYPE_M			0x30000
+#define RTW8189F_CR_NETTYPE(x)			(((x) & 0x3) << 16)
+#define RTW8189F_NT_LINK_AP			0x2
+
+/* BB register file and RF LSSI access (rtl8188f_phycfg.c). */
+#define RTW8189F_BB_HSSI_P1			0x0820	/* rFPGA0_XA_HSSIParameter1 */
+#define RTW8189F_BB_HSSI_P2			0x0824	/* rFPGA0_XA_HSSIParameter2 */
+#define RTW8189F_BB_LSSI_WRITE			0x0840	/* rFPGA0_XA_LSSIParameter */
+#define RTW8189F_BB_LSSI_READBACK		0x08a0	/* rFPGA0_XA_LSSIReadBack */
+#define RTW8189F_BB_HSPI_READBACK		0x08b8	/* TransceiverA_HSPI_ReadBack */
+#define RTW8189F_BB_RFMOD			0x0800	/* rFPGA0_RFMOD */
+#define RTW8189F_BB_RFMOD_CCK_EN		__BIT(24)
+#define RTW8189F_BB_RFMOD_OFDM_EN		__BIT(25)
+#define RTW8189F_LSSI_READ_ADDR_M		0x7f800000
+#define RTW8189F_LSSI_READ_EDGE			0x80000000
+#define RTW8189F_LSSI_READBACK_M		0x000fffff
+
+/* RF register indices (RF6052). */
+#define RTW8189F_RF_CHNLBW			0x18	/* channel in bits[7:0] */
+#define RTW8189F_RF20_CHNLBW_BW_M		0x0c00	/* bits[11:10] */
+#define RTW8189F_RF20_20MHZ			0x0c00	/* BIT10|BIT11 */
+
+/* TX power index registers (PHY_SetTxPowerIndex_8188F); one byte per rate. */
+#define RTW8189F_TXAGC_OFDM6_18			0x0e00	/* 6/9/12/18M */
+#define RTW8189F_TXAGC_OFDM24_54		0x0e04	/* 24/36/48/54M */
+#define RTW8189F_TXAGC_CCK1			0x0e08	/* bits[15:8] = 1M */
+#define RTW8189F_TXAGC_CCK2_11			0x086c	/* 2M b1 / 5.5M b2 / 11M b3 */
+
+/* System interrupt mask register (8188F). */
+#define RTW8189F_REG_HSIMR			0x0058
+
+/*
+ * TX descriptor (40 bytes; RTL8188F SDIO: the CMD53 FIFO write itself
+ * submits the frame, no OWN bit, dword7[15:0] carries a checksum over
+ * the first 32 bytes, HW sequence numbers enabled via REG_HWSEQ_CTRL).
+ */
+#define RTW8189F_TXDESC_SIZE			40
+#define RTW8189F_TXDESC_QSEL_MGNT		0x12
+
+/* dword0: [15:0] packet size, [23:16] offset (= descriptor size). */
+#define RTW8189F_TXDW0_PKTLEN_M			0x0000ffff
+#define RTW8189F_TXDW0_OFFSET_S			16
+/* dword1: [12:8] queue select. */
+#define RTW8189F_TXDW1_QSEL_S			8
+/* dword3: BIT8 use_rate. */
+#define RTW8189F_TXDW3_USE_RATE			__BIT(8)
+/* dword4: [6:0] TX rate. */
+#define RTW8189F_TXDW4_RATE_M			0x7f
+/* dword7: [15:0] SDIO checksum. */
+#define RTW8189F_TXDW7_CHKSUM_M			0x0000ffff
+/* dword8: BIT15 hwseq enable. */
+#define RTW8189F_TXDW8_HWSEQ_EN			__BIT(15)
+/* dword9: [23:12] sequence. */
+#define RTW8189F_TXDW9_SEQ_S			12
+
+/* TX rate indices (DESC8188F_RATE*). */
+#define RTW8189F_RATE_1M			0x00
+#define RTW8189F_RATE_6M			0x04
+
 #endif /* !_DEV_SDMMC_RTW8189F_REG_H_ */
