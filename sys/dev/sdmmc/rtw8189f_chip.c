@@ -61,7 +61,9 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include "rtw8189f_tables.h"
 
 #ifdef RTW8189F_DEBUG
-int rtw8189f_debug = 0;		/* flood kills console rx; enable per-boot */
+/* 0x70 = INIT|TX|RX: state/scan dwell, per-mgmt TX, per-beacon RX lines --
+ * sustainable on the console.  A full 0xffff flood kills console input. */
+int rtw8189f_debug = 0x70;
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1024,11 +1026,16 @@ rtw8189f_chip_init(struct rtw8189f_softc *sc)
 void
 rtw8189f_set_channel(struct rtw8189f_softc *sc, unsigned chan)
 {
+	uint32_t want;
+
 	if (chan < 1 || chan > 14)
 		return;
 
-	rtw8189f_rf_write20(sc, RTW8189F_RF_CHNLBW,
-	    (sc->sc_rf18 & ~0xff) | chan);
+	want = (sc->sc_rf18 & ~0xff) | chan;
+	rtw8189f_rf_write20(sc, RTW8189F_RF_CHNLBW, want);
+	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	    "setchan %u rf18 want 0x%05x got 0x%05x\n", chan, want,
+	    rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW));
 }
 
 /*
@@ -1142,9 +1149,10 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 
 	if_statinc(ifp, if_opackets);
 	sc->sc_tx_frames++;
-	DNPRINTF(sc, RTW8189F_DBG_TX, "tx %s len %u rate %u\n",
+	DNPRINTF(sc, RTW8189F_DBG_TX, "tx %s len %u rate %u ch %u\n",
 	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT
-	    ? "mgmt" : "data", len, rate);
+	    ? "mgmt" : "data", len, rate,
+	    ieee80211_chan2ieee(&sc->sc_ic, sc->sc_ic.ic_curchan));
 out:
 	ieee80211_free_node(ni);
 	m_freem(m);
@@ -1292,10 +1300,11 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 				}
 				DNPRINTF(sc, RTW8189F_DBG_RX,
 				    "bcn #%u fc %02x ds %u cur %u pwdb %u "
-				    "fscan %d\n",
+				    "hwc %u fscan %d\n",
 				    sc->sc_rx_beacons, fc0, ds,
 				    ieee80211_chan2ieee(ic, ic->ic_curchan),
 				    buf[desc_off + 24],
+				    buf[desc_off + 26] & 0xf,
 				    (ic->ic_flags & IEEE80211_F_SCAN) ? 1 : 0);
 			}
 

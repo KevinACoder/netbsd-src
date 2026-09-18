@@ -77,6 +77,7 @@ extern int rtw8189f_debug;
 #define RTW8189F_F_NEWSTATE		0x0001
 #define RTW8189F_F_TX			0x0002
 #define RTW8189F_F_EXIT			0x0004
+#define RTW8189F_F_SCANNEXT		0x0008
 
 /* Bounce buffer sizes: RX must hold the largest aggregated FIFO burst,
  * TX one TXDESC (40B) plus the largest 802.11 frame. */

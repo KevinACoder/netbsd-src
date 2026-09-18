@@ -583,7 +583,15 @@ rtw8189f_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 {
 	struct rtw8189f_softc *sc = ic->ic_ifp->if_softc;
 
-	callout_stop(&sc->sc_scan_to);
+	/*
+	 * Only kill the dwell timer when leaving scan.  The first INIT->SCAN
+	 * transition re-enters here synchronously (begin_scan -> next_scan ->
+	 * new_state(S_SCAN)) before the first dwell has even started; stopping
+	 * unconditionally used to cancel that dwell's timer, leaving the RF on
+	 * the attach channel (1) for microseconds only.
+	 */
+	if (nstate != IEEE80211_S_SCAN)
+		callout_stop(&sc->sc_scan_to);
 	if (sc->sc_worker == NULL || sc->sc_dying || !sc->sc_chip_ready)
 		return sc->sc_newstate(ic, nstate, arg);
 
@@ -646,16 +654,20 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc)
 	sc->sc_newstate(ic, nstate, arg);
 }
 
+/*
+ * Callout context must not sleep: the channel switch has to drain the RX
+ * FIFO (CMD53) while ic_curchan still names the old dwell channel, so the
+ * callout only wakes the worker and ieee80211_next_scan() runs there.
+ */
 static void
 rtw8189f_next_scan(void *arg)
 {
 	struct rtw8189f_softc *sc = arg;
-	int s;
 
-	s = splnet();
-	if (sc->sc_ic.ic_state == IEEE80211_S_SCAN)
-		ieee80211_next_scan(&sc->sc_ic);
-	splx(s);
+	mutex_enter(&sc->sc_work_mtx);
+	sc->sc_flags |= RTW8189F_F_SCANNEXT;
+	cv_broadcast(&sc->sc_cv);
+	mutex_exit(&sc->sc_work_mtx);
 }
 
 static void
@@ -687,7 +699,7 @@ rtw8189f_worker(void *arg)
 	while (!sc->sc_dying) {
 		mutex_enter(&sc->sc_work_mtx);
 		while (!(sc->sc_flags & (RTW8189F_F_NEWSTATE | RTW8189F_F_TX |
-		    RTW8189F_F_EXIT)) && !sc->sc_dying)
+		    RTW8189F_F_SCANNEXT | RTW8189F_F_EXIT)) && !sc->sc_dying)
 			cv_timedwait(&sc->sc_cv, &sc->sc_work_mtx, mstohz(50));
 		flags = sc->sc_flags;
 		sc->sc_flags = 0;
@@ -702,6 +714,22 @@ rtw8189f_worker(void *arg)
 
 		if ((flags & RTW8189F_F_EXIT) || sc->sc_dying)
 			break;
+
+		/*
+		 * Drain the FIFO before anything moves ic_curchan: frames
+		 * heard on the previous dwell carry that channel in their
+		 * DS-param IE and net80211 discards them on mismatch, so
+		 * they must be input while the radio is still tuned there.
+		 */
+		rtw8189f_rx_drain(sc);
+
+		if (flags & RTW8189F_F_SCANNEXT) {
+			int s = splnet();
+
+			if (sc->sc_ic.ic_state == IEEE80211_S_SCAN)
+				ieee80211_next_scan(&sc->sc_ic);
+			splx(s);
+		}
 
 		if (flags & RTW8189F_F_NEWSTATE)
 			rtw8189f_newstate_cb(sc);
