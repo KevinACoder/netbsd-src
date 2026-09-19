@@ -391,7 +391,9 @@ rtw8189f_init(struct ifnet *ifp)
 	s = splnet();
 	ifp->if_flags |= IFF_RUNNING;
 	ifp->if_flags &= ~IFF_OACTIVE;
-	ifp->if_timer = 0;
+	/* 1 Hz tick: ieee80211_watchdog drives the AUTH/ASSOC mgt timers;
+	 * without it the state machine never times out nor retries. */
+	ifp->if_timer = 1;
 	ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 	splx(s);
 
@@ -516,7 +518,8 @@ rtw8189f_watchdog(struct ifnet *ifp)
 {
 	struct rtw8189f_softc *sc = ifp->if_softc;
 
-	ifp->if_timer = 0;
+	/* Keep ticking while up; stop() clears if_timer. */
+	ifp->if_timer = 1;
 	ieee80211_watchdog(&sc->sc_ic);
 }
 
@@ -638,8 +641,11 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc)
 		if (ostate != nstate) {
 			rtw8189f_set_channel(sc,
 			    ieee80211_chan2ieee(ic, ic->ic_curchan));
-			if (nstate != IEEE80211_S_AUTH)
-				rtw8189f_set_bssid(sc, ic->ic_bss->ni_bssid);
+			/* Program the BSSID before AUTH too: the unwidened
+			 * filter re-enables BSSID checking and the auth
+			 * response must pass it (vendor joins with the
+			 * BSSID already written). */
+			rtw8189f_set_bssid(sc, ic->ic_bss->ni_bssid);
 		}
 		break;
 

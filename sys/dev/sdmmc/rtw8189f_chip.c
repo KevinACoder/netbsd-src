@@ -61,10 +61,10 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include "rtw8189f_tables.h"
 
 #ifdef RTW8189F_DEBUG
-/* 0 by default: even the INIT|TX|RX subset floods ~150 lines/s during a
- * continuous scan and kills console input within minutes.  Enable per-boot
- * for short (<1 min) observations only. */
-int rtw8189f_debug = 0;
+/* 0x30 = INIT|TX: newstate transitions, per-mgmt TX, non-beacon mgmt RX --
+ * association-attempt volumes only.  Never leave non-zero: sustained scan
+ * floods kill console input within minutes. */
+int rtw8189f_debug = 0x30;
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1277,6 +1277,22 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 			m->m_pkthdr.len = m->m_len = pkt_len;
 
 			fc0 = *(uint8_t *)(buf + frame_off);
+			if ((fc0 & IEEE80211_FC0_TYPE_MASK) ==
+			    IEEE80211_FC0_TYPE_MGT &&
+			    (fc0 & IEEE80211_FC0_SUBTYPE_MASK) !=
+			    IEEE80211_FC0_SUBTYPE_BEACON &&
+			    (fc0 & IEEE80211_FC0_SUBTYPE_MASK) !=
+			    IEEE80211_FC0_SUBTYPE_PROBE_RESP) {
+				/* Non-beacon mgmt (auth/assoc rsp, deauth,
+				 * EAPOL-adjacent): reaching this print means
+				 * the FIFO delivered it, so a missing auth
+				 * response is a TX-audibility problem, not an
+				 * RX filter drop. */
+				DNPRINTF(sc, RTW8189F_DBG_INIT,
+				    "mgmtrx fc %02x pwdb %u cur %u\n", fc0,
+				    buf[desc_off + 24],
+				    ieee80211_chan2ieee(ic, ic->ic_curchan));
+			}
 			if ((fc0 & IEEE80211_FC0_TYPE_MASK) ==
 			    IEEE80211_FC0_TYPE_MGT &&
 			    ((fc0 & IEEE80211_FC0_SUBTYPE_MASK) ==
