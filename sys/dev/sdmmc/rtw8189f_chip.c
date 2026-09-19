@@ -64,7 +64,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 /* 0x30 = INIT|TX: newstate transitions, per-mgmt TX, non-beacon mgmt RX --
  * association-attempt volumes only.  Never leave non-zero: sustained scan
  * floods kill console input within minutes. */
-int rtw8189f_debug = RTW8189F_DBG_INIT;
+int rtw8189f_debug = 0;
 #endif
 
 static void	rtw8189f_txpwr_parse(struct rtw8189f_softc *);
@@ -1823,6 +1823,13 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 		} else {
 			le32enc(buf + 0, le32dec(buf + 0) | RTW8189F_TXDW0_BMC);
 		}
+	} else if ((wh->i_addr1[0] & 0x01) == 0) {
+		/* Unicast data asks for the same CCX report: the 4-way
+		 * EAPOL frames are data-class, and RETRY_OVER vs TXOK on
+		 * msg 2/4 tells an inaudible frame from a rejected one. */
+		rptseq = sc->sc_txrpt_seq++ & RTW8189F_TXDW6_SW_DEFINE_M;
+		le32enc(buf + 8, RTW8189F_TXDW2_SPE_RPT);
+		le32enc(buf + 24, rptseq);
 	}
 	le32enc(buf + 32, RTW8189F_TXDW8_HWSEQ_EN);
 	le16enc(buf + 28, rtw8189f_txdesc_chksum(buf));
