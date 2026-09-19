@@ -36,8 +36,8 @@
  * flips it to the AIC boot ROM, this driver downloads the firmware
  * there, and the re-enumerated app personality carries the data plane.
  * The chip logic is a clean-room implementation of the vendor SDK's
- * lmac_msg protocol (os/aic8800, GPL); aic8800_chip.c holds the command
- * layer and aic8800_usb.c the usbdi(9) transport.
+ * lmac_msg protocol (os/aic8800, GPL); aic8800_chip.c holds the
+ * download state machine and aic8800_usb.c the usbdi(9) transport.
  */
 
 #include <sys/cdefs.h>
@@ -46,6 +46,8 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/kmem.h>
+#include <sys/kthread.h>
 #include <sys/device.h>
 #include <sys/module.h>
 #include <sys/pmf.h>
@@ -74,6 +76,7 @@ CFATTACH_DECL_NEW(aic8800u, sizeof(struct aic8800u_softc), aic8800u_match,
 
 static void	aic8800u_dump_layout(struct aic8800u_softc *);
 static struct usbd_interface *aic8800u_find_wifi_iface(struct aic8800u_softc *);
+static void	aic8800u_bringup_task(void *);
 
 static int
 aic8800u_match(device_t parent, cfdata_t match, void *aux)
@@ -90,7 +93,7 @@ aic8800u_match(device_t parent, cfdata_t match, void *aux)
  * The app personality is a composite: interface 1.0 is the WiFi function
  * (vendor class ff/ff/ff), 1.1/1.2 are Bluetooth.  The boot ROM exposes
  * a single vendor-class interface.  Pick the vendor-class interface that
- * carries bulk endpoints, exactly like the Linux driver's
+ * carries bulk endpoints, exactly like the vendor driver's
  * aicwf_parse_usb() does.
  */
 static struct usbd_interface *
@@ -182,6 +185,62 @@ aic8800u_dump_layout(struct aic8800u_softc *sc)
 	}
 }
 
+/*
+ * Thread exit path: clear the lwp pointer and tear the transport down
+ * if detach already gave up on us (kthread_join from detach can
+ * deadlock on an aborted transfer -- the rtw8189f lesson).  Whoever
+ * observes the other side gone also destroys sc_load_mtx.
+ */
+static void
+aic8800u_bringup_done(struct aic8800u_softc *sc)
+{
+	bool last;
+
+	mutex_enter(&sc->sc_load_mtx);
+	sc->sc_bringup_lwp = NULL;
+	last = sc->sc_detached;
+	mutex_exit(&sc->sc_load_mtx);
+
+	if (last) {
+		aic8800u_transport_fini(sc);
+		mutex_destroy(&sc->sc_load_mtx);
+	}
+
+	kthread_exit(0);
+}
+
+static void
+aic8800u_bringup_task(void *arg)
+{
+	struct aic8800u_softc *sc = arg;
+	int attempt;
+
+	/*
+	 * The loader runs on its own thread: the download waits for CFMs
+	 * that only arrive via the USB callbacks, and firmware(9) cannot
+	 * read files until the root file system is mounted -- which on
+	 * this board happens after USB enumeration (rtw89 lesson).
+	 */
+	for (attempt = 0; attempt < 120; attempt++) {
+		if (sc->sc_dying)
+			aic8800u_bringup_done(sc);
+		if (aic8800u_transport_init(sc) == 0)
+			break;
+		kpause("aicfwup", false, mstohz(100), NULL);
+	}
+	if (!sc->sc_transport_ready) {
+		aprint_error_dev(sc->sc_dev, "transport init failed\n");
+		aic8800u_bringup_done(sc);
+	}
+
+	/* let the freshly re-enumerated device settle (KI-036 family) */
+	kpause("aicsettle", false, mstohz(200), NULL);
+
+	aic8800u_fw_download(sc);
+
+	aic8800u_bringup_done(sc);
+}
+
 static void
 aic8800u_attach(device_t parent, device_t self, void *aux)
 {
@@ -192,6 +251,7 @@ aic8800u_attach(device_t parent, device_t self, void *aux)
 
 	sc->sc_dev = self;
 	sc->sc_udev = uaa->uaa_device;
+	mutex_init(&sc->sc_load_mtx, MUTEX_DEFAULT, IPL_NONE);
 
 	aprint_naive(": AICSemi AIC8800D80\n");
 	aprint_normal("\n");
@@ -227,11 +287,29 @@ aic8800u_attach(device_t parent, device_t self, void *aux)
 		return;
 	}
 
-	/*
-	 * M1 brings the firmware up from a dedicated thread here (the
-	 * boot-ROM personality) and registers with net80211 (the app
-	 * personality); the interface does not exist before that.
-	 */
+	if (sc->sc_personality == AIC8800U_BROM) {
+		/*
+		 * Download the firmware.  The device disappears and
+		 * re-enumerates as the app personality once the
+		 * download finishes; this attachment goes away with it.
+		 */
+		error = kthread_create(PRI_NONE, 0, NULL, aic8800u_bringup_task,
+		    sc, &sc->sc_bringup_lwp, "aic8800fw");
+		if (error != 0) {
+			aprint_error_dev(self,
+			    "cannot start the bring-up thread (%d)\n", error);
+			return;
+		}
+	} else {
+		/*
+		 * App personality: the firmware is running.  M2 wires
+		 * the net80211 attachment here (the MAC address is a
+		 * vendor default 88:00:33:77 + two random bytes -- the
+		 * dongle has no efuse MAC in this flow).
+		 */
+		aprint_normal_dev(self, "app firmware running, M2 attaches"
+		    " net80211\n");
+	}
 
 	pmf_device_register(self, NULL, NULL);
 	usbd_add_drv_event(USB_EVENT_DRIVER_ATTACH, sc->sc_udev, sc->sc_dev);
@@ -255,8 +333,29 @@ static int
 aic8800u_detach(device_t self, int flags)
 {
 	struct aic8800u_softc *sc = device_private(self);
+	bool thread_running;
 
+	mutex_enter(&sc->sc_load_mtx);
 	sc->sc_dying = true;
+	sc->sc_detached = true;
+	thread_running = sc->sc_bringup_lwp != NULL;
+	mutex_exit(&sc->sc_load_mtx);
+
+	if (thread_running) {
+		/*
+		 * Wake the thread out of any sync transfer; it clears
+		 * sc_bringup_lwp and tears the transport (and the lock)
+		 * down itself.
+		 */
+		if (sc->sc_evt_pipe != NULL)
+			usbd_abort_pipe(sc->sc_evt_pipe);
+		if (sc->sc_cmd_pipe != NULL)
+			usbd_abort_pipe(sc->sc_cmd_pipe);
+	} else {
+		aic8800u_transport_fini(sc);
+		mutex_destroy(&sc->sc_load_mtx);
+	}
+
 	pmf_device_deregister(self);
 
 	return 0;
