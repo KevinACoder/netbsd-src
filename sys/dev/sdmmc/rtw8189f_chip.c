@@ -61,9 +61,10 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include "rtw8189f_tables.h"
 
 #ifdef RTW8189F_DEBUG
-/* 0x70 = INIT|TX|RX: state/scan dwell, per-mgmt TX, per-beacon RX lines --
- * sustainable on the console.  A full 0xffff flood kills console input. */
-int rtw8189f_debug = 0x70;
+/* 0 by default: even the INIT|TX|RX subset floods ~150 lines/s during a
+ * continuous scan and kills console input within minutes.  Enable per-boot
+ * for short (<1 min) observations only. */
+int rtw8189f_debug = 0;
 #endif
 
 /* ------------------------------------------------------------------ */
