@@ -487,6 +487,7 @@
 #define	USB_VENDOR_TENX	0x1130		/* Ten X Technology, Inc. */
 #define	USB_VENDOR_JRC	0x1145		/* Japan Radio Company */
 #define	USB_VENDOR_SPHAIRON	0x114b		/* Sphairon Access Systems GmbH */
+#define	USB_VENDOR_PANDORA	0x1111		/* Pandora International Ltd. */
 #define	USB_VENDOR_DELORME	0x1163		/* DeLorme */
 #define	USB_VENDOR_SERVERWORKS	0x1166		/* ServerWorks */
 #define	USB_VENDOR_ACERCM	0x1189		/* Acer Communications & Multimedia */
@@ -622,6 +623,7 @@
 #define	USB_VENDOR_MOSCHIP	0x9710		/* MosChip Semiconductor */
 #define	USB_VENDOR_NETGEAR4	0x9846		/* Netgear */
 #define	USB_VENDOR_xxFTDI	0x9e88		/* FTDI */
+#define	USB_VENDOR_AICSEMI	0xa69c		/* AICSemi */
 #define	USB_VENDOR_CACE	0xcace		/* CACE Technologies */
 #define	USB_VENDOR_COMPARE	0xcdab		/* Compare */
 #define	USB_VENDOR_DATAAPEX	0xdaae		/* DataApex */
@@ -1162,6 +1164,10 @@
 
 /* Behavior Technology Computer products */
 #define	USB_PRODUCT_BTC_BTC7932	0x6782		/* Keyboard with mouse port */
+
+/* AICSemi products */
+#define	USB_PRODUCT_AICSEMI_AIC8800D80_BROM	0x8d80		/* AIC8800D80 boot ROM */
+#define	USB_PRODUCT_AICSEMI_AIC8800D80	0x8d81		/* AIC8800D80 */
 
 /* CACE Technologies products */
 #define	USB_PRODUCT_CACE_AIRPCAPNX	0x0300		/* AirPcap Nx */
@@ -3127,6 +3133,9 @@
 /* Siemens products */
 #define	USB_PRODUCT_SIEMENS_SPEEDSTREAM	0x1001		/* SpeedStream USB */
 #define	USB_PRODUCT_SIEMENS_SPEEDSTREAM22	0x1022		/* SpeedStream USB 1022 */
+
+/* Pandora International Ltd. products */
+#define	USB_PRODUCT_PANDORA_AIC8800D80_CD	0x1111		/* AIC8800D80 (fake CD-ROM mode) */
 
 /* Siemens Info products */
 #define	USB_PRODUCT_SIEMENS2_WLL013	0x001b		/* WLL013 */

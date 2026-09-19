@@ -559,6 +559,98 @@ realtek_rtl8821cu_reinit(struct usbd_device *dev)
 }
 
 /*
+ * AIC8800D80 USB wireless adapters come up as a fake USB stick
+ * ("Pandora International Ltd. 88M80", 1111:1111) holding a Windows
+ * installer.  A vendor-specific 16-byte SCSI command (opcode 0xfd, last
+ * byte 0xf2) wrapped in a Bulk-Only CBW makes them re-enumerate as the
+ * AIC boot ROM (a69c:8d80), which aic8800u(4) then drives through the
+ * firmware download.  A generic SCSI eject is acknowledged (CSW status 0)
+ * but does NOT switch personality -- do not send one.
+ *
+ * Ground truth: doc/rk3568-itx-wiki/runs/20260913-linux-aic8800-usb/ §2.
+ */
+static int
+aic8800_reinit(struct usbd_device *dev)
+{
+	unsigned char cmd[31];
+	usb_config_descriptor_t *cdesc;
+	usb_interface_descriptor_t *id;
+	usb_endpoint_descriptor_t *ed;
+	struct usbd_interface *iface;
+	int attempt, i, j, rv = UMATCH_HIGHEST;
+
+	memset(cmd, 0, sizeof(cmd));
+	/* Byte 0..3: Command Block Wrapper (CBW) signature */
+	set_cbw(cmd);
+	/* 4..7: CBW Tag, has to be unique, but only a single transfer is used. */
+	cmd[4] = 0x12;
+	cmd[5] = 0x34;
+	cmd[6] = 0x56;
+	cmd[7] = 0x78;
+	/* 8..11: CBW Transfer Length, no data here */
+	/* 12: CBW Flag: output, so 0 */
+	/* 13: CBW Lun: 0 */
+	/* 14: CBW Length: 16-byte vendor CDB */
+	cmd[14] = 0x10;
+
+	/* Rest is the SCSI payload: vendor CDB "fd 00*14 f2" */
+	cmd[15] = 0xfd;
+	cmd[30] = 0xf2;
+
+	/*
+	 * Lab: dump the fake-stick personality's layout so the boot-ROM and
+	 * app personalities that follow the switch can be told apart in the
+	 * kernel log.
+	 */
+	(void)usbd_set_config_index(dev, 0, 0);
+	cdesc = usbd_get_config_descriptor(dev);
+	if (cdesc != NULL) {
+		for (i = 0; i < cdesc->bNumInterface; i++) {
+			if (usbd_device2interface_handle(dev, i, &iface) != 0)
+				continue;
+			id = usbd_get_interface_descriptor(iface);
+			if (id == NULL)
+				continue;
+			aprint_normal("umodeswitch: if %d class %#x/%#x/%#x,"
+			    " %d endpoints\n", id->bInterfaceNumber,
+			    id->bInterfaceClass, id->bInterfaceSubClass,
+			    id->bInterfaceProtocol, id->bNumEndpoints);
+			for (j = 0; j < id->bNumEndpoints; j++) {
+				ed = usbd_interface2endpoint_descriptor(iface, j);
+				if (ed != NULL)
+					aprint_normal("umodeswitch:   ep %#x attr"
+					    " %#x maxpkt %d\n",
+					    ed->bEndpointAddress, ed->bmAttributes,
+					    UGETW(ed->wMaxPacketSize));
+			}
+		}
+	}
+
+	/*
+	 * Lab: on acceptance the device leaves the bus mid-transaction, so
+	 * the CSW read failing is the expected success sign; retry like the
+	 * Realtek wrapper for the transient cases.
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		rv = send_bulkmsg(dev, cmd, sizeof(cmd));
+		aprint_normal("umodeswitch: AIC8800 eject attempt %d: status %d"
+		    " (%s), count %u, csw %d (%s), csw count %u\n",
+		    attempt + 1,
+		    (int)umodeswitch_last_status,
+		    usbd_errstr(umodeswitch_last_status),
+		    (unsigned)umodeswitch_last_count,
+		    (int)umodeswitch_last_csw_status,
+		    usbd_errstr(umodeswitch_last_csw_status),
+		    (unsigned)umodeswitch_last_csw_count);
+		if (umodeswitch_last_status == USBD_NORMAL_COMPLETION)
+			break;
+		delay(100000);
+	}
+
+	return rv;
+}
+
+/*
  * First personality:
  *
  * Claim the entire device if a mode-switch is required.
@@ -655,6 +747,11 @@ umodeswitch_match(device_t parent, cfdata_t match, void *aux)
 	case USB_VENDOR_REALTEK:
 		if (uaa->uaa_product == USB_PRODUCT_REALTEK_RTL8821CU_CD)
 			return realtek_rtl8821cu_reinit(uaa->uaa_device);
+		break;
+
+	case USB_VENDOR_PANDORA:
+		if (uaa->uaa_product == USB_PRODUCT_PANDORA_AIC8800D80_CD)
+			return aic8800_reinit(uaa->uaa_device);
 		break;
 
 	default:

@@ -1,0 +1,19 @@
+$NetBSD$
+
+AICSemi AIC8800D80 firmware, copied unmodified from the vendor SDK at
+os/aic8800 (radxa-pkg packaging, 5.0+git20260123.5f7be68d,
+src/USB/driver_fw/fw/aic8800D80/).  Only the non-IPC u02 variant files
+that the RK3568 Linux ground truth exercised are packaged:
+
+  fmacfw_8800d80_u02.bin        main firmware      -> RAM 0x00110000
+  fw_adid_8800d80_u02.bin       ADID               -> RAM 0x00161928
+  fw_patch_8800d80_u02.bin      ROM patch          -> RAM 0x00100000
+  fw_patch_table_8800d80_u02.bin  chip-rev table   (parsed, not downloaded)
+  lmacfw_rf_8800d80_u02.bin     RF calibration     (app stage)
+  aic_userconfig_8800d80.txt    power/channel config (app stage)
+  aic_powerlimit_8800d80.txt    power limits       (app stage)
+  calibmode_8800d80.bin         calibration mode   (app stage)
+
+The firmware binaries are the AICSemi redistributable payloads shipped
+with the vendor SDK; the NetBSD driver (aic8800u) is a clean-room
+implementation and contains no vendor source.

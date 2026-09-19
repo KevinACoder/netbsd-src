@@ -269,6 +269,15 @@
 ./libdata/firmware/if_rtw8189f			base-firmware-root
 ./libdata/firmware/if_rtw8189f/Realtek-Firmware-License.txt	base-firmware-root	firmware
 ./libdata/firmware/if_rtw8189f/rtw8189f_fw.bin	base-firmware-root	firmware
+./libdata/firmware/aic8800u			base-firmware-root
+./libdata/firmware/aic8800u/fmacfw_8800d80_u02.bin	base-firmware-root	firmware
+./libdata/firmware/aic8800u/fw_adid_8800d80_u02.bin	base-firmware-root	firmware
+./libdata/firmware/aic8800u/fw_patch_8800d80_u02.bin	base-firmware-root	firmware
+./libdata/firmware/aic8800u/fw_patch_table_8800d80_u02.bin	base-firmware-root	firmware
+./libdata/firmware/aic8800u/lmacfw_rf_8800d80_u02.bin	base-firmware-root	firmware
+./libdata/firmware/aic8800u/aic_userconfig_8800d80.txt	base-firmware-root	firmware
+./libdata/firmware/aic8800u/aic_powerlimit_8800d80.txt	base-firmware-root	firmware
+./libdata/firmware/aic8800u/calibmode_8800d80.bin	base-firmware-root	firmware
 ./libdata/firmware/if_wpi			base-firmware-root
 ./libdata/firmware/if_wpi/LICENSE.ipw3945-ucode	base-obsolete	obsolete,firmware
 ./libdata/firmware/if_wpi/LICENSE.iwlwifi-3945-ucode	base-firmware-root	firmware

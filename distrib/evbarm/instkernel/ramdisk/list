@@ -107,3 +107,15 @@ COPY	${NETBSDSRCDIR}/external/realtek/rtw89/dist/rtw8851b_fw.bin	libdata/firmwar
 # Firmware is the vendor hal8188f_fw.c array_mp_8188f_fw_nic payload
 # (20306 B, sig 0x88f1, fw_ver 0xe).
 COPY	${NETBSDSRCDIR}/external/realtek/rtw8189f/dist/rtw8189f_fw.bin	libdata/firmware/if_rtw8189f/rtw8189f_fw.bin
+
+# RK3568 lab: aic8800u(4) firmware for the AICSemi AIC8800D80 USB dongle.
+# Non-IPC u02 variant per the Linux ground truth (loader downloads
+# fmacfw/adid/patch to RAM, the app stage reads lmacfw_rf + userconfig).
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fmacfw_8800d80_u02.bin	libdata/firmware/aic8800u/fmacfw_8800d80_u02.bin
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fw_adid_8800d80_u02.bin	libdata/firmware/aic8800u/fw_adid_8800d80_u02.bin
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fw_patch_8800d80_u02.bin	libdata/firmware/aic8800u/fw_patch_8800d80_u02.bin
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fw_patch_table_8800d80_u02.bin	libdata/firmware/aic8800u/fw_patch_table_8800d80_u02.bin
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/lmacfw_rf_8800d80_u02.bin	libdata/firmware/aic8800u/lmacfw_rf_8800d80_u02.bin
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/aic_userconfig_8800d80.txt	libdata/firmware/aic8800u/aic_userconfig_8800d80.txt
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/aic_powerlimit_8800d80.txt	libdata/firmware/aic8800u/aic_powerlimit_8800d80.txt
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/calibmode_8800d80.bin	libdata/firmware/aic8800u/calibmode_8800d80.bin

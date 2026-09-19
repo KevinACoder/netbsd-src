@@ -554,6 +554,17 @@ device	rtw89u: ether, ifnet, arp, wlan, firmload
 attach	rtw89u at usbdevif
 file	dev/usb/if_rtw89.c		rtw89u
 
+# AICSemi AIC8800D80 802.11ax USB wireless adapter
+# ("aic8800" cannot be a device name: config(1) rejects base names that end
+# in a digit, hence the USB-style "aic8800u".  The driver claims both the
+# boot-ROM (0xa69c:0x8d80, firmware download) and the app (0xa69c:0x8d81,
+# data plane) personalities; umodeswitch(4) flips the fake CD-ROM first.)
+device	aic8800u: ether, ifnet, arp, wlan, firmload
+attach	aic8800u at usbdevif
+file	dev/usb/if_aic8800u.c		aic8800u
+file	dev/usb/aic8800_chip.c		aic8800u
+file	dev/usb/aic8800_usb.c		aic8800u
+
 # Realtek RTL8187/RTL8187B 802.11b/g USB wireless adapter
 device	urtw: ether, ifnet, arp, wlan
 attach	urtw at usbdevif

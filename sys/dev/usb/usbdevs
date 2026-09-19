@@ -480,6 +480,7 @@ vendor SILABS		0x10c4	Silicon Labs
 vendor TENX		0x1130	Ten X Technology, Inc.
 vendor JRC		0x1145	Japan Radio Company
 vendor SPHAIRON		0x114b	Sphairon Access Systems GmbH
+vendor PANDORA		0x1111	Pandora International Ltd.
 vendor DELORME		0x1163	DeLorme
 vendor SERVERWORKS	0x1166	ServerWorks
 vendor ACERCM		0x1189	Acer Communications & Multimedia
@@ -615,6 +616,7 @@ vendor ALLWIN		0x8516	ALLWIN Tech
 vendor MOSCHIP		0x9710	MosChip Semiconductor
 vendor NETGEAR4		0x9846	Netgear
 vendor xxFTDI		0x9e88	FTDI
+vendor AICSEMI		0xa69c	AICSemi
 vendor CACE		0xcace	CACE Technologies
 vendor COMPARE		0xcdab	Compare
 vendor DATAAPEX		0xdaae	DataApex
@@ -1155,6 +1157,10 @@ product BROTHER HL1050		0x0002	HL-1050 laser printer
 
 /* Behavior Technology Computer products */
 product BTC BTC7932		0x6782	Keyboard with mouse port
+
+/* AICSemi products */
+product AICSEMI AIC8800D80_BROM	0x8d80	AIC8800D80 boot ROM
+product AICSEMI AIC8800D80	0x8d81	AIC8800D80
 
 /* CACE Technologies products */
 product CACE AIRPCAPNX		0x0300	AirPcap Nx
@@ -3120,6 +3126,9 @@ product SHUTTLE SCL3712		0x5594	SCM Micro SCL3712-NFC&RW
 /* Siemens products */
 product SIEMENS SPEEDSTREAM	0x1001	SpeedStream USB
 product SIEMENS SPEEDSTREAM22	0x1022	SpeedStream USB 1022
+
+/* Pandora International Ltd. products */
+product PANDORA AIC8800D80_CD	0x1111	AIC8800D80 (fake CD-ROM mode)
 
 /* Siemens Info products */
 product SIEMENS2 WLL013		0x001b	WLL013
