@@ -69,6 +69,7 @@ int rtw8189f_debug = RTW8189F_DBG_INIT;
 
 static void	rtw8189f_txpwr_parse(struct rtw8189f_softc *);
 static void	rtw8189f_set_txpower(struct rtw8189f_softc *, unsigned);
+static void	rtw8189f_iqk(struct rtw8189f_softc *);
 
 /* ------------------------------------------------------------------ */
 /* Power sequence                                                      */
@@ -669,6 +670,42 @@ rtw8189f_rf_read20(struct rtw8189f_softc *sc, uint32_t off)
 	return v & RTW8189F_LSSI_READBACK_M;
 }
 
+/*
+ * Vendor-style masked access (PHY_SetBBReg_8188F / PHY_SetRFReg_8188F):
+ * "data" fills the field selected by "mask" and is shifted down to the
+ * mask's lowest set bit ((data << ctz(mask)) & mask).  The IQK sequences
+ * are transcribed call by call in this convention.
+ */
+static uint32_t
+rtw8189f_bb_get(struct rtw8189f_softc *sc, uint32_t addr, uint32_t mask)
+{
+
+	return (rtw8189f_mac_read_4(sc, addr) & mask) >> __builtin_ctz(mask);
+}
+
+static void
+rtw8189f_bb_set(struct rtw8189f_softc *sc, uint32_t addr, uint32_t mask,
+    uint32_t data)
+{
+	uint32_t v;
+
+	if (mask != 0xffffffff) {
+		v = rtw8189f_mac_read_4(sc, addr);
+		data = (v & ~mask) | ((data << __builtin_ctz(mask)) & mask);
+	}
+	rtw8189f_mac_write_4(sc, addr, data);
+}
+
+static void
+rtw8189f_rf_rmw20(struct rtw8189f_softc *sc, uint32_t off, uint32_t mask,
+    uint32_t data)
+{
+	uint32_t v = rtw8189f_rf_read20(sc, off);
+
+	rtw8189f_rf_write20(sc, off,
+	    (v & ~mask) | ((data << __builtin_ctz(mask)) & mask));
+}
+
 /* ------------------------------------------------------------------ */
 /* Init table interpreter                                              */
 /* ------------------------------------------------------------------ */
@@ -858,21 +895,35 @@ rtw8189f_chip_init(struct rtw8189f_softc *sc)
 	/* 3. RF init table (with the 0xb6/0xb2 readback-verified entries). */
 	rtw8189f_walk_table(rtw8189f_rf_tbl,
 	    __arraycount(rtw8189f_rf_tbl) / 2, rtw8189f_apply_rf, sc, NULL);
-	/* The table starts LCK (RF18 bit 15); it is not channel state.
-	 * Wait for completion before caching RF18, otherwise every scan
-	 * dwell restarts calibration immediately before transmitting. */
-	for (lc_retry = 0; lc_retry < 100; lc_retry++) {
-		v = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
-		if ((v & __BIT(15)) == 0)
-			break;
-		kpause("rtw8189flc", false, mstohz(10), NULL);
+
+	/*
+	 * Vendor halrf_lck_trigger: assert RF18 bit15, poll until the
+	 * hardware self-clears it, then restore the channel image.  A
+	 * settle delay comes before the first poll -- the trigger write
+	 * needs time to latch, and a single immediate read can observe the
+	 * pre-calibration value and end the wait before LCK even starts.
+	 */
+	{
+		uint32_t lc_cal = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
+
+		rtw8189f_rf_write20(sc, RTW8189F_RF_CHNLBW, lc_cal | __BIT(15));
+		kpause("rtw8189fl0", false, mstohz(10), NULL);
+		for (lc_retry = 0; lc_retry < 100; lc_retry++) {
+			v = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
+			if ((v & __BIT(15)) == 0)
+				break;
+			kpause("rtw8189flc", false, mstohz(10), NULL);
+		}
+		if (lc_retry == 100) {
+			aprint_error_dev(sc->sc_dev,
+			    "initial LC calibration timed out\n");
+			return ETIMEDOUT;
+		}
+		sc->sc_rf18 = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
+		DNPRINTF(sc, RTW8189F_DBG_INIT,
+		    "lck: cal 0x%05x settled 0x%05x after %u ms\n",
+		    lc_cal, sc->sc_rf18, 10 + lc_retry * 10);
 	}
-	if (lc_retry == 100) {
-		aprint_error_dev(sc->sc_dev, "initial LC calibration timed out\n");
-		return ETIMEDOUT;
-	}
-	sc->sc_rf18 = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
-	DNPRINTF(sc, RTW8189F_DBG_INIT, "rf18 after table: 0x%05x\n", sc->sc_rf18);
 
 	/* 4. TX page allocation: NPQ/HPQ/LPQ/PUB + buffer boundaries. */
 	rtw8189f_mac_write_1(sc, RTW8189F_REG_RQPN_NPQ, RTW8189F_RQPN_NPQ(RTW8189F_PAGE_NUM_NPQ));
@@ -1210,6 +1261,440 @@ rtw8189f_set_txpower(struct rtw8189f_softc *sc, unsigned chan)
 	    chan, cck_idx, ofdm_idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* IQK: path A TX/RX I/Q imbalance calibration (vendor halrf_8188f.c)  */
+/* ------------------------------------------------------------------ */
+
+/* ADDA on/off list (_phy_path_adda_on8188f, IQK_ADDA_REG_NUM = 16). */
+static const uint32_t rtw8189f_iqk_adda[16] = {
+	0x85c, 0xe6c, 0xe70, 0xe74, 0xe78, 0xe7c, 0xe80, 0xe84,
+	0xe88, 0xe8c, 0xed0, 0xed4, 0xed8, 0xedc, 0xee0, 0xeec
+};
+
+/* MAC registers backed up around calibration (IQK_MAC_REG). */
+static const uint32_t rtw8189f_iqk_mac[4] = { 0x522, 0x550, 0x551, 0x040 };
+
+/* BB registers backed up around calibration (IQK_BB_REG_92C). */
+static const uint32_t rtw8189f_iqk_bb[9] = {
+	0xc04, 0xc08, 0x874, 0xb68, 0xb6c, 0x870, 0x860, 0x864, 0x800
+};
+
+static void
+rtw8189f_iqk_adda_on(struct rtw8189f_softc *sc)
+{
+	unsigned i;
+
+	for (i = 0; i < 16; i++)
+		rtw8189f_bb_set(sc, rtw8189f_iqk_adda[i], 0xffffffff,
+		    0x03c00014);
+}
+
+static void
+rtw8189f_iqk_save(struct rtw8189f_softc *sc, uint32_t *adda_bk,
+    uint32_t *mac_bk, uint32_t *bb_bk)
+{
+	unsigned i;
+
+	for (i = 0; i < 16; i++)
+		adda_bk[i] = rtw8189f_mac_read_4(sc, rtw8189f_iqk_adda[i]);
+	for (i = 0; i < 3; i++)
+		mac_bk[i] = rtw8189f_mac_read_1(sc, rtw8189f_iqk_mac[i]);
+	mac_bk[3] = rtw8189f_mac_read_4(sc, rtw8189f_iqk_mac[3]);
+	for (i = 0; i < 9; i++)
+		bb_bk[i] = rtw8189f_mac_read_4(sc, rtw8189f_iqk_bb[i]);
+}
+
+static void
+rtw8189f_iqk_reload(struct rtw8189f_softc *sc, uint32_t *adda_bk,
+    uint32_t *mac_bk, uint32_t *bb_bk)
+{
+	unsigned i;
+
+	for (i = 0; i < 16; i++)
+		rtw8189f_mac_write_4(sc, rtw8189f_iqk_adda[i], adda_bk[i]);
+	for (i = 0; i < 3; i++)
+		rtw8189f_mac_write_1(sc, rtw8189f_iqk_mac[i], mac_bk[i]);
+	rtw8189f_mac_write_4(sc, rtw8189f_iqk_mac[3], mac_bk[3]);
+	for (i = 0; i < 9; i++)
+		rtw8189f_mac_write_4(sc, rtw8189f_iqk_bb[i], bb_bk[i]);
+}
+
+static void
+rtw8189f_iqk_delay(struct rtw8189f_softc *sc)
+{
+
+	kpause("rtw8189fiq", false, mstohz(RTW8189F_IQK_DELAY_MS), NULL);
+}
+
+/*
+ * TX IQK one-shot with LOK (vendor phy_path_a_iqk_8188f).  Returns 1 on
+ * success and stores the RF 0x08 LOK result in *lokp.
+ */
+static uint8_t
+rtw8189f_iqk_tx(struct rtw8189f_softc *sc, uint32_t *lokp)
+{
+	uint32_t eac, e94, e9c;
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x000000);
+	/* RF LUT: TX PA settings for the calibration tone. */
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_WE_LUT, __BIT(19), 1);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_RCK_OS, 0xfffff, 0x20000);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_TXPA_G1, 0xfffff, 0x0000f);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_TXPA_G2, 0xfffff, 0x07ff7);
+	rtw8189f_rf_rmw20(sc, 0xdf, 0xfffff, 0x980);
+	rtw8189f_rf_rmw20(sc, 0x56, 0xfffff, 0x5102a);
+
+	/* Enter IQK mode. */
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x808000);
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK_TONE_A, 0xffffffff, 0x18008c1c);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_TONE_A, 0xffffffff, 0x38008c1c);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK_PI_A, 0xffffffff, 0x821403ff);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_PI_A, 0xffffffff, 0x28160000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_RSP, 0xffffffff, 0x00462911);
+	/* One shot, path A LOK & IQK. */
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_PTS, 0xffffffff, 0xf9000000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_PTS, 0xffffffff, 0xf8000000);
+	rtw8189f_iqk_delay(sc);
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x000000);
+	rtw8189f_rf_rmw20(sc, 0xdf, 0xfffff, 0x180);
+	*lokp = rtw8189f_rf_read20(sc, RTW8189F_RF_LOK);
+
+	eac = rtw8189f_mac_read_4(sc, RTW8189F_BB_RXPW_AFTER_IQK_A2);
+	e94 = rtw8189f_mac_read_4(sc, RTW8189F_BB_TXPW_BEFORE_IQK_A);
+	e9c = rtw8189f_mac_read_4(sc, RTW8189F_BB_TXPW_AFTER_IQK_A);
+	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	    "iqk tx: eac %08x e94 %08x e9c %08x lok %05x\n",
+	    eac, e94, e9c, *lokp);
+
+	if (!(eac & __BIT(28)) &&
+	    ((e94 & 0x03ff0000) >> 16) != 0x142 &&
+	    ((e9c & 0x03ff0000) >> 16) != 0x42)
+		return 1;
+	return 0;
+}
+
+/*
+ * RX IQK, two phases (vendor phy_path_a_rx_iqk_8188f).  Returns bit0 set
+ * when the TX image check passed and bit1 when RX IQK converged.
+ */
+static uint8_t
+rtw8189f_iqk_rx(struct rtw8189f_softc *sc, uint32_t lok)
+{
+	uint32_t eac, e94, e9c, ea4, u4tmp;
+
+	/* Phase 1: measure the TX image with the LUT table. */
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x000000);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_WE_LUT, __BIT(19), 1);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_RCK_OS, 0xfffff, 0x30000);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_TXPA_G1, 0xfffff, 0x0000f);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_TXPA_G2, 0xfffff, 0xf1173);
+	rtw8189f_rf_rmw20(sc, 0xdf, 0xfffff, 0x980);
+	rtw8189f_rf_rmw20(sc, 0x56, 0xfffff, 0x5102a);
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x808000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK, 0xffffffff, 0x01007c00);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK, 0xffffffff, 0x01004800);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK_TONE_A, 0xffffffff, 0x10008c1c);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_TONE_A, 0xffffffff, 0x30008c1c);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK_PI_A, 0xffffffff, 0x82160fff);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_PI_A, 0xffffffff, 0x28160000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_RSP, 0xffffffff, 0x00462911);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_PTS, 0xffffffff, 0xf9000000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_PTS, 0xffffffff, 0xf8000000);
+	rtw8189f_iqk_delay(sc);
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x000000);
+	rtw8189f_rf_rmw20(sc, 0xdf, 0xfffff, 0x180);
+
+	eac = rtw8189f_mac_read_4(sc, RTW8189F_BB_RXPW_AFTER_IQK_A2);
+	e94 = rtw8189f_mac_read_4(sc, RTW8189F_BB_TXPW_BEFORE_IQK_A);
+	e9c = rtw8189f_mac_read_4(sc, RTW8189F_BB_TXPW_AFTER_IQK_A);
+	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	    "iqk rx1: eac %08x e94 %08x e9c %08x\n", eac, e94, e9c);
+	if ((eac & __BIT(28)) ||
+	    ((e94 & 0x03ff0000) >> 16) == 0x142 ||
+	    ((e9c & 0x03ff0000) >> 16) == 0x42)
+		return 0;	/* if TX not OK, ignore RX */
+
+	u4tmp = 0x80007c00 | (e94 & 0x3ff0000) | ((e9c & 0x3ff0000) >> 16);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK, 0xffffffff, u4tmp);
+
+	/* Phase 2: RX IQK with the TX params latched above. */
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x000000);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_WE_LUT, __BIT(19), 1);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_RCK_OS, 0xfffff, 0x30000);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_TXPA_G1, 0xfffff, 0x0000f);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_TXPA_G2, 0xfffff, 0xf7ff2);
+	rtw8189f_rf_rmw20(sc, 0xdf, 0xfffff, 0x980);
+	rtw8189f_rf_rmw20(sc, 0x56, 0xfffff, 0x51000);
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x808000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK, 0xffffffff, 0x01004800);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK_TONE_A, 0xffffffff, 0x30008c1c);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_TONE_A, 0xffffffff, 0x10008c1c);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK_PI_A, 0xffffffff, 0x82160000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_PI_A, 0xffffffff, 0x281613ff);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_RSP, 0xffffffff, 0x0046a911);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_PTS, 0xffffffff, 0xf9000000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK_AGC_PTS, 0xffffffff, 0xf8000000);
+	rtw8189f_iqk_delay(sc);
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x000000);
+	rtw8189f_rf_rmw20(sc, 0xdf, 0xfffff, 0x180);
+	rtw8189f_rf_rmw20(sc, RTW8189F_RF_LOK, 0xfffff, lok);
+
+	eac = rtw8189f_mac_read_4(sc, RTW8189F_BB_RXPW_AFTER_IQK_A2);
+	ea4 = rtw8189f_mac_read_4(sc, RTW8189F_BB_RXPW_BEFORE_IQK_A2);
+	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	    "iqk rx2: eac %08x ea4 %08x\n", eac, ea4);
+	if (!(eac & __BIT(27)) &&
+	    ((ea4 & 0x03ff0000) >> 16) != 0x132 &&
+	    ((eac & 0x03ff0000) >> 16) != 0x36)
+		return 0x03;
+	return 0x01;
+}
+
+/*
+ * Convergence check across calibration passes (vendor
+ * phy_simularity_compare_8188f, bound 8; path B entries stay zero on
+ * this 1T1R part and always compare equal).
+ */
+static bool
+rtw8189f_iqk_simular(struct rtw8189f_softc *sc, int32_t result[][8],
+    uint8_t c1, uint8_t c2)
+{
+	uint32_t i, j, simularity_bit_map = 0;
+	uint8_t final_candidate[2] = { 0xff, 0xff };
+	bool is_result = true;
+	int32_t tmp1, tmp2, diff;
+
+	for (i = 0; i < 8; i++) {
+		if (i == 1 || i == 3 || i == 5 || i == 7) {
+			tmp1 = (result[c1][i] & 0x200) ?
+			    result[c1][i] | 0xfffffc00 : result[c1][i];
+			tmp2 = (result[c2][i] & 0x200) ?
+			    result[c2][i] | 0xfffffc00 : result[c2][i];
+		} else {
+			tmp1 = result[c1][i];
+			tmp2 = result[c2][i];
+		}
+		diff = (tmp1 > tmp2) ? tmp1 - tmp2 : tmp2 - tmp1;
+		if (diff > RTW8189F_IQK_MAX_TOLERANCE) {
+			if ((i == 2 || i == 6) && simularity_bit_map == 0) {
+				if (result[c1][i] + result[c1][i + 1] == 0)
+					final_candidate[i / 4] = c2;
+				else if (result[c2][i] + result[c2][i + 1] == 0)
+					final_candidate[i / 4] = c1;
+				else
+					simularity_bit_map |= 1 << i;
+			} else
+				simularity_bit_map |= 1 << i;
+		}
+	}
+
+	if (simularity_bit_map == 0) {
+		for (i = 0; i < 2; i++) {
+			if (final_candidate[i] != 0xff) {
+				for (j = i * 4; j < (i + 1) * 4 - 2; j++)
+					result[3][j] =
+					    result[final_candidate[i]][j];
+				is_result = false;
+			}
+		}
+		return is_result;
+	}
+
+	if (!(simularity_bit_map & 0x03))
+		for (i = 0; i < 2; i++)
+			result[3][i] = result[c1][i];
+	if (!(simularity_bit_map & 0x0c))
+		for (i = 2; i < 4; i++)
+			result[3][i] = result[c1][i];
+	return false;
+}
+
+/* Apply the winning pass (vendor _phy_path_a_fill_iqk_matrix8188f). */
+static void
+rtw8189f_iqk_fill_matrix(struct rtw8189f_softc *sc, int32_t result[][8],
+    uint8_t fc)
+{
+	uint32_t oldval_0, x, tx0_a;
+	int32_t y, tx0_c;
+
+	if (fc == 0xff)
+		return;
+
+	oldval_0 = (rtw8189f_mac_read_4(sc, RTW8189F_BB_XA_TXIQK) >> 22) &
+	    0x3ff;
+
+	x = (uint32_t)result[fc][0];
+	if (x & 0x200)
+		x |= 0xfffffc00;
+	tx0_a = (x * oldval_0) >> 8;
+	DNPRINTF(sc, RTW8189F_DBG_INIT, "iqk fill: x %u tx0_a %x old %x\n",
+	    x, tx0_a, oldval_0);
+	rtw8189f_bb_set(sc, RTW8189F_BB_XA_TXIQK, 0x3ff, tx0_a);
+	rtw8189f_bb_set(sc, RTW8189F_BB_ECCA_THRESHOLD, __BIT(31),
+	    ((x * oldval_0 >> 7) & 0x1));
+
+	y = result[fc][1];
+	if (y & 0x200)
+		y |= 0xfffffc00;
+	tx0_c = (int32_t)((uint32_t)y * oldval_0) >> 8;
+	rtw8189f_bb_set(sc, RTW8189F_BB_XC_TXAFE, 0xf0000000,
+	    (uint32_t)(tx0_c & 0x3c0) >> 6);
+	rtw8189f_bb_set(sc, RTW8189F_BB_XA_TXIQK, 0x003f0000, tx0_c & 0x3f);
+	rtw8189f_bb_set(sc, RTW8189F_BB_ECCA_THRESHOLD, __BIT(29),
+	    (((uint32_t)y * oldval_0 >> 7) & 0x1));
+
+	if (result[fc][2] == 0) {
+		/* TX-only calibration: leave the RX IQC untouched. */
+		DNPRINTF(sc, RTW8189F_DBG_INIT, "iqk fill: tx only\n");
+		return;
+	}
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_XA_RXIQK, 0x3ff, result[fc][2]);
+	rtw8189f_bb_set(sc, RTW8189F_BB_XA_RXIQK, 0xfc00,
+	    result[fc][3] & 0x3f);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_EXT_ANT, 0xf0000000,
+	    (result[fc][3] >> 6) & 0xf);
+}
+
+/* One calibration pass (vendor _phy_iq_calibrate_8188f, retry_count 2). */
+static void
+rtw8189f_iqk_pass(struct rtw8189f_softc *sc, int32_t result[][8], uint8_t t,
+    uint32_t *adda_bk, uint32_t *mac_bk, uint32_t *bb_bk)
+{
+	uint8_t retry, path_aok = 0, c50;
+	uint32_t lok = sc->sc_lok;
+
+	c50 = rtw8189f_bb_get(sc, RTW8189F_BB_RXIQK_INITGAIN, 0xff);
+
+	if (t == 0)
+		rtw8189f_iqk_save(sc, adda_bk, mac_bk, bb_bk);
+	rtw8189f_iqk_adda_on(sc);
+
+	rtw8189f_bb_set(sc, RTW8189F_BB_TRX_PATH_ENABLE, 0xffffffff,
+	    0x03a05600);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TR_MUX_PAR, 0xffffffff, 0x000800e4);
+	rtw8189f_bb_set(sc, RTW8189F_BB_XCD_RF_INTERFACE_SW, 0xffffffff,
+	    0x25204000);
+
+	/* MAC settings for calibration (only 0x520[23:16] in vendor). */
+	rtw8189f_bb_set(sc, RTW8189F_BB_CAL_LIFETIME, 0x00ff0000, 0xff);
+
+	/* IQ calibration setting. */
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x808000);
+	rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK, 0xffffffff, 0x01007c00);
+	rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK, 0xffffffff, 0x01004800);
+
+	for (retry = 0; retry < 2; retry++) {
+		path_aok = rtw8189f_iqk_tx(sc, &lok);
+		if (path_aok == 0x01) {
+			rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00,
+			    0x000000);
+			sc->sc_lok = lok;
+			DNPRINTF(sc, RTW8189F_DBG_INIT,
+			    "path a tx iqk ok (pass %u)\n", t);
+			result[t][0] =
+			    (rtw8189f_mac_read_4(sc,
+			    RTW8189F_BB_TXPW_BEFORE_IQK_A) & 0x3ff0000) >> 16;
+			result[t][1] =
+			    (rtw8189f_mac_read_4(sc,
+			    RTW8189F_BB_TXPW_AFTER_IQK_A) & 0x3ff0000) >> 16;
+			break;
+		}
+	}
+
+	for (retry = 0; retry < 2; retry++) {
+		path_aok = rtw8189f_iqk_rx(sc, sc->sc_lok);
+		if (path_aok == 0x03) {
+			DNPRINTF(sc, RTW8189F_DBG_INIT,
+			    "path a rx iqk ok (pass %u)\n", t);
+			result[t][2] =
+			    (rtw8189f_mac_read_4(sc,
+			    RTW8189F_BB_RXPW_BEFORE_IQK_A2) & 0x3ff0000) >> 16;
+			result[t][3] =
+			    (rtw8189f_mac_read_4(sc,
+			    RTW8189F_BB_RXPW_AFTER_IQK_A2) & 0x3ff0000) >> 16;
+			break;
+		}
+		DNPRINTF(sc, RTW8189F_DBG_INIT,
+		    "path a rx iqk fail (pass %u try %u)\n", t, retry);
+	}
+	if (path_aok == 0)
+		DNPRINTF(sc, RTW8189F_DBG_INIT, "path a iqk failed\n");
+
+	/* Back to BB mode; all-but-the-first pass also restores context. */
+	rtw8189f_bb_set(sc, RTW8189F_BB_IQK, 0xffffff00, 0x000000);
+	if (t != 0) {
+		rtw8189f_iqk_reload(sc, adda_bk, mac_bk, bb_bk);
+		/* Restore the RX initial gain (0x50 glitch trick). */
+		rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_INITGAIN, 0xff, 0x50);
+		rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_INITGAIN, 0xff, c50);
+		/* 0xe30 IQC default values. */
+		rtw8189f_bb_set(sc, RTW8189F_BB_TXIQK_TONE_A, 0xffffffff,
+		    0x01008c00);
+		rtw8189f_bb_set(sc, RTW8189F_BB_RXIQK_TONE_A, 0xffffffff,
+		    0x01008c00);
+	}
+}
+
+/*
+ * Full calibration (vendor phy_iq_calibrate_8188f): three passes, pick
+ * the convergent result, apply the IQK correction matrix.  Runs once at
+ * the first channel switch, matching the vendor's neediqk_24g hook.
+ */
+static void
+rtw8189f_iqk(struct rtw8189f_softc *sc)
+{
+	int32_t result[4][8];
+	uint32_t adda_bk[16], mac_bk[4], bb_bk[9];
+	int32_t sum;
+	uint8_t i, j, fc = 0xff;
+
+	memset(result, 0, sizeof(result));
+	memset(adda_bk, 0, sizeof(adda_bk));
+	memset(mac_bk, 0, sizeof(mac_bk));
+	memset(bb_bk, 0, sizeof(bb_bk));
+
+	for (i = 0; i < 3; i++) {
+		rtw8189f_iqk_pass(sc, result, i, adda_bk, mac_bk, bb_bk);
+		if (i == 1) {
+			if (rtw8189f_iqk_simular(sc, result, 0, 1)) {
+				fc = 0;
+				break;
+			}
+		}
+		if (i == 2) {
+			if (rtw8189f_iqk_simular(sc, result, 0, 2)) {
+				fc = 0;
+				break;
+			}
+			if (rtw8189f_iqk_simular(sc, result, 1, 2)) {
+				fc = 1;
+			} else {
+				sum = 0;
+				for (j = 0; j < 8; j++)
+					sum += result[3][j];
+				fc = (sum != 0) ? 3 : 0xff;
+			}
+		}
+	}
+
+	DNPRINTF(sc, RTW8189F_DBG_INIT, "iqk: final candidate %u\n", fc);
+	rtw8189f_iqk_fill_matrix(sc, result, fc);
+	sc->sc_iqk_done = true;
+	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	    "iqk done: c80 %08x c94 %08x c14 %08x (gt 393d00e2/f0000000/"
+	    "40000d00)\n",
+	    rtw8189f_mac_read_4(sc, RTW8189F_BB_XA_TXIQK),
+	    rtw8189f_mac_read_4(sc, RTW8189F_BB_XC_TXAFE),
+	    rtw8189f_mac_read_4(sc, RTW8189F_BB_XA_RXIQK));
+}
+
 void
 rtw8189f_set_channel(struct rtw8189f_softc *sc, unsigned chan)
 {
@@ -1223,6 +1708,12 @@ rtw8189f_set_channel(struct rtw8189f_softc *sc, unsigned chan)
 	/* Vendor reprograms TX power on every channel switch
 	 * (PHY_SetSwChnlBWMode8188F -> set_tx_power_level). */
 	rtw8189f_set_txpower(sc, chan);
+	/* Vendor runs IQK on the first channel switch after init
+	 * (neediqk_24g seeded right after the init LCK).  Without it the
+	 * TX constellation is never corrected: the AP cannot demodulate
+	 * our frames and never ACKs (M4 RETRY_OVER signature). */
+	if (!sc->sc_iqk_done)
+		rtw8189f_iqk(sc);
 	/* DBG_RX: per-channel verification print, would flood at DBG_INIT
 	 * during scan. */
 	DNPRINTF(sc, RTW8189F_DBG_RX,
@@ -1524,6 +2015,13 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 			m->m_pkthdr.len = m->m_len = pkt_len;
 
 			fc0 = *(uint8_t *)(buf + frame_off);
+			/* Unicast-to-us discriminator: the M4 branch
+			 * criterion.  If this counter stays zero while AUTH
+			 * reports RETRY_OVER, the AP's replies are being
+			 * dropped on the RX side rather than never sent. */
+			if (memcmp(buf + frame_off + 4, sc->sc_mac_addr,
+			    IEEE80211_ADDR_LEN) == 0)
+				sc->sc_ucast_rx++;
 			if ((fc0 & IEEE80211_FC0_TYPE_MASK) ==
 			    IEEE80211_FC0_TYPE_MGT &&
 			    ((fc0 & IEEE80211_FC0_SUBTYPE_MASK) == IEEE80211_FC0_SUBTYPE_AUTH ||

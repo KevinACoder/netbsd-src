@@ -628,8 +628,10 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc,
 	 * scan hops (1 -> 1) would otherwise flood the console (they stay on
 	 * DBG_RX). */
 	if (ostate != nstate)
-		DNPRINTF(sc, RTW8189F_DBG_INIT, "newstate %d -> %d ch %d\n",
-		    ostate, nstate, ieee80211_chan2ieee(ic, ic->ic_curchan));
+		DNPRINTF(sc, RTW8189F_DBG_INIT, "newstate %d -> %d ch %d "
+		    "ucast rx %u\n",
+		    ostate, nstate, ieee80211_chan2ieee(ic, ic->ic_curchan),
+		    sc->sc_ucast_rx);
 	else
 		DNPRINTF(sc, RTW8189F_DBG_RX, "newstate %d -> %d ch %d\n",
 		    ostate, nstate, ieee80211_chan2ieee(ic, ic->ic_curchan));

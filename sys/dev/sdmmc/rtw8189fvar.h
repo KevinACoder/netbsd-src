@@ -113,6 +113,7 @@ struct rtw8189f_softc {
 	bool			sc_fw_ready;
 	bool			sc_chip_ready;	/* MAC/BB/RF init done */
 	bool			sc_scanning;	/* scan window open */
+	bool			sc_iqk_done;	/* one-shot IQK ran */
 	uint8_t			sc_last_hmebox;
 	uint8_t			sc_mac_addr[IEEE80211_ADDR_LEN];
 	bool			sc_mac_valid;
@@ -144,6 +145,8 @@ struct rtw8189f_softc {
 	uint32_t		sc_rx_errors;
 	uint32_t		sc_tx_frames;
 	uint32_t		sc_txrpt_seq;	/* SW_DEFINE for C2H TX reports */
+	uint32_t		sc_ucast_rx;	/* frames with addr1 == our MAC */
+	uint32_t		sc_lok;		/* IQK LOK result (RF 0x08) */
 };
 
 /* rtw8189f_sdio.c */

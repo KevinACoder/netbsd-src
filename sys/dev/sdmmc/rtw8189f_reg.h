@@ -298,6 +298,47 @@
 #define RTW8189F_TXAGC_CCK2_11			0x086c	/* 2M b1 / 5.5M b2 / 11M b3 */
 
 /*
+ * IQK (TX/RX I/Q imbalance calibration) register file, vendor halrf_8188f.c.
+ * Field writes use the vendor shift convention: data is shifted to the
+ * mask's lowest set bit ((data << ctz(mask)) & mask).
+ */
+#define RTW8189F_BB_IQK				0x0e28	/* IQK mode on/off, bits[31:8] */
+#define RTW8189F_BB_TXIQK_TONE_A		0x0e30
+#define RTW8189F_BB_RXIQK_TONE_A		0x0e34
+#define RTW8189F_BB_TXIQK_PI_A			0x0e38
+#define RTW8189F_BB_RXIQK_PI_A			0x0e3c
+#define RTW8189F_BB_TXIQK			0x0e40	/* rTx_IQK = rIQK_AGC_Rsp */
+#define RTW8189F_BB_RXIQK			0x0e44
+#define RTW8189F_BB_IQK_AGC_PTS			0x0e48
+#define RTW8189F_BB_IQK_AGC_RSP			0x0e4c
+#define RTW8189F_BB_TXPW_BEFORE_IQK_A		0x0e94
+#define RTW8189F_BB_TXPW_AFTER_IQK_A		0x0e9c
+#define RTW8189F_BB_RXPW_BEFORE_IQK_A2		0x0ea4
+#define RTW8189F_BB_RXPW_AFTER_IQK_A2		0x0eac
+#define RTW8189F_BB_XA_RXIQK			0x0c14	/* RX IQC matrix */
+#define RTW8189F_BB_ECCA_THRESHOLD		0x0c4c
+#define RTW8189F_BB_AGC_RSSI_TABLE		0x0c78
+#define RTW8189F_BB_XA_TXIQK			0x0c80	/* TX IQC matrix */
+#define RTW8189F_BB_XC_TXAFE			0x0c94
+#define RTW8189F_BB_RXIQK_EXT_ANT		0x0ca0
+#define RTW8189F_BB_RXIQK_INITGAIN		0x0c50	/* byte0, save/restore */
+#define RTW8189F_BB_CAL_LIFETIME		0x0520	/* [23:16] = 0xff for IQK */
+#define RTW8189F_BB_TRX_PATH_ENABLE		0x0c04
+#define RTW8189F_BB_TR_MUX_PAR			0x0c08
+#define RTW8189F_BB_XCD_RF_INTERFACE_SW		0x0874
+
+/* RF register indices used by the IQK/LCK sequences (RF6052). */
+#define RTW8189F_RF_WE_LUT			0xef	/* bit19: table LUT mode */
+#define RTW8189F_RF_RCK_OS			0x30
+#define RTW8189F_RF_TXPA_G1			0x31
+#define RTW8189F_RF_TXPA_G2			0x32
+#define RTW8189F_RF_LOK				0x08	/* LOK result */
+
+/* IQK constants (vendor MAX_TOLERANCE / IQK_DELAY_TIME_8188F). */
+#define RTW8189F_IQK_MAX_TOLERANCE		5
+#define RTW8189F_IQK_DELAY_MS			25
+
+/*
  * TX power PG section of the eFuse logical map (vendor pg_txpwr_saddr):
  * 18 bytes for path A: CCK-1T base for 6 CCK channel groups (1-2, 3-5,
  * 6-8, 9-11, 12-13, 14), OFDM-1T/BW40 base for 5 groups (1-2, 3-5, 6-8,
