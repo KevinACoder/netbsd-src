@@ -798,6 +798,12 @@ rtw8189f_apply_rf(struct rtw8189f_softc *sc, uint32_t addr, uint32_t val,
 	uint32_t get;
 	uint8_t count;
 
+	/* RF tables use 0xfe/0xffe as 50 ms delays, notably between
+	 * the LCK trigger and the RF1f calibration latch sequence. */
+	if (addr == 0xfe || addr == 0xffe) {
+		kpause("rtw8189frf", false, mstohz(50), NULL);
+		return 0;
+	}
 	rtw8189f_rf_write20(sc, addr, val);
 
 	if (addr == 0xb6) {
@@ -829,6 +835,7 @@ rtw8189f_chip_init(struct rtw8189f_softc *sc)
 {
 	uint32_t v;
 	uint8_t v8;
+	unsigned lc_retry;
 
 	/* 1. MAC init table (1-byte register writes). */
 	rtw8189f_walk_table(rtw8189f_mac_tbl, __arraycount(rtw8189f_mac_tbl) / 2,
@@ -851,6 +858,19 @@ rtw8189f_chip_init(struct rtw8189f_softc *sc)
 	/* 3. RF init table (with the 0xb6/0xb2 readback-verified entries). */
 	rtw8189f_walk_table(rtw8189f_rf_tbl,
 	    __arraycount(rtw8189f_rf_tbl) / 2, rtw8189f_apply_rf, sc, NULL);
+	/* The table starts LCK (RF18 bit 15); it is not channel state.
+	 * Wait for completion before caching RF18, otherwise every scan
+	 * dwell restarts calibration immediately before transmitting. */
+	for (lc_retry = 0; lc_retry < 100; lc_retry++) {
+		v = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
+		if ((v & __BIT(15)) == 0)
+			break;
+		kpause("rtw8189flc", false, mstohz(10), NULL);
+	}
+	if (lc_retry == 100) {
+		aprint_error_dev(sc->sc_dev, "initial LC calibration timed out\n");
+		return ETIMEDOUT;
+	}
 	sc->sc_rf18 = rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW);
 	DNPRINTF(sc, RTW8189F_DBG_INIT, "rf18 after table: 0x%05x\n", sc->sc_rf18);
 
@@ -1198,7 +1218,7 @@ rtw8189f_set_channel(struct rtw8189f_softc *sc, unsigned chan)
 	if (chan < 1 || chan > 14)
 		return;
 
-	want = (sc->sc_rf18 & ~0xff) | chan;
+	want = (sc->sc_rf18 & ~(0xffU | __BIT(15))) | chan;
 	rtw8189f_rf_write20(sc, RTW8189F_RF_CHNLBW, want);
 	/* Vendor reprograms TX power on every channel switch
 	 * (PHY_SetSwChnlBWMode8188F -> set_tx_power_level). */
