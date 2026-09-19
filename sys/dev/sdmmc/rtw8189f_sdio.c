@@ -130,21 +130,31 @@ rtw8189f_fifo_write(struct rtw8189f_softc *sc, unsigned devid,
     const void *buf, size_t len)
 {
 	uint32_t addr;
+	size_t wirelen = len > 512 ? roundup(len, 512) : roundup(len, 4);
+
+
+	if (wirelen > RTW8189F_TXBUFSZ || (len & 3) != 0)
+		return EINVAL;
+	memset((uint8_t *)__UNCONST(buf) + len, 0, wirelen - len);
 
 	/* Round to 4 bytes: the length encoding is in dwords. */
 	addr = (devid << 13) | ((len & ~3) >> 2);
 	KASSERT(((vaddr_t)buf & 3) == 0);
 	return sdmmc_io_write_region_1(sc->sc_sf, addr,
-	    __UNCONST(buf), (int)len);
+	    __UNCONST(buf), (int)wirelen);
 }
 
 int
 rtw8189f_fifo_read(struct rtw8189f_softc *sc, void *buf, size_t len)
 {
 	uint32_t addr;
+	size_t wirelen = len > 512 ? roundup(len, 512) : roundup(len, 4);
+
+	if (wirelen > RTW8189F_RXBUFSZ)
+		return EINVAL;
 
 	addr = (RTW8189F_WLAN_RX0FF_DEVICE_ID << 13) |
 	    (sc->sc_rx_fifo_cnt++ & RTW8189F_WLAN_RX0FF_MSK);
 	return sdmmc_io_read_region_1(sc->sc_sf, addr,
-	    (u_char *)buf, (int)len);
+	    (u_char *)buf, (int)wirelen);
 }

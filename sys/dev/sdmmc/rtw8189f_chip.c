@@ -64,11 +64,11 @@ __KERNEL_RCSID(0, "$NetBSD$");
 /* 0x30 = INIT|TX: newstate transitions, per-mgmt TX, non-beacon mgmt RX --
  * association-attempt volumes only.  Never leave non-zero: sustained scan
  * floods kill console input within minutes. */
-int rtw8189f_debug = 0x30;
+int rtw8189f_debug = RTW8189F_DBG_INIT;
+#endif
 
 static void	rtw8189f_txpwr_parse(struct rtw8189f_softc *);
 static void	rtw8189f_set_txpower(struct rtw8189f_softc *, unsigned);
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Power sequence                                                      */
@@ -992,6 +992,29 @@ rtw8189f_chip_init(struct rtw8189f_softc *sc)
 	rtw8189f_mac_write_4(sc, RTW8189F_BB_RFMOD,
 	    v | RTW8189F_BB_RFMOD_CCK_EN | RTW8189F_BB_RFMOD_OFDM_EN);
 
+	/* 20 MHz BB clock/filter configuration (RTL8188F). */
+	v = rtw8189f_mac_read_4(sc, 0x800);
+	rtw8189f_mac_write_4(sc, 0x800,
+	    (v & ~0x7701U) | 0x5700);
+	v = rtw8189f_mac_read_4(sc, 0x900);
+	rtw8189f_mac_write_4(sc, 0x900, v & ~1U);
+	v = rtw8189f_mac_read_4(sc, 0xce4);
+	rtw8189f_mac_write_4(sc, 0xce4, (v & ~0xf0000000U) | 0x10000000);
+	v = rtw8189f_mac_read_4(sc, 0xc10);
+	rtw8189f_mac_write_4(sc, 0xc10, (v & ~0x30000000U) | 0x10000000);
+	v = rtw8189f_mac_read_4(sc, 0x954);
+	rtw8189f_mac_write_4(sc, 0x954, (v & ~0x00f80000U) | 0x00300000);
+
+	/* Crystal trim is board-specific, stored at logical eFuse 0xb9. */
+	v8 = sc->sc_efuse_map[0xb9];
+	if (v8 == 0xff)
+		v8 = 0x20;
+	v8 &= 0x3f;
+	v = rtw8189f_mac_read_4(sc, 0x24);
+	rtw8189f_mac_write_4(sc, 0x24,
+	    (v & ~0x007ff800U) | ((v8 | (v8 << 6)) << 11));
+	DNPRINTF(sc, RTW8189F_DBG_INIT, "crystal trim %u\n", v8);
+
 	/* 17. TX power indices parsed from the eFuse PG section (with
 	 * IC-default fallbacks) BEFORE the first channel switch programs
 	 * them; then default channel 1 + 20 MHz RF bandwidth settings. */
@@ -1076,11 +1099,11 @@ rtw8189f_txpwr_parse(struct rtw8189f_softc *sc)
 		    pg[6 + g] <= RTW8189F_TXPWR_MAX ?
 		    pg[6 + g] : RTW8189F_TXPWR_DEF_OFDM;
 
-	/* Byte 18: MSB = BW20-1T diff, LSB = OFDM-1T diff.  The 0xFF
+	/* Byte 12: MSB = BW20-1T diff, LSB = OFDM-1T diff.  The 0xFF
 	 * (unprogrammed) form sign-extends to -1, exactly as the vendor
 	 * parser keeps it.  CCK-1T diff is never stored in PG (0). */
-	bw20_diff = rtw8189f_txpwr_diff_nib(pg[17], true);
-	ofdm_diff = rtw8189f_txpwr_diff_nib(pg[17], false);
+	bw20_diff = rtw8189f_txpwr_diff_nib(pg[11], true);
+	ofdm_diff = rtw8189f_txpwr_diff_nib(pg[11], false);
 	sc->sc_txpwr_bw20_diff = bw20_diff;
 	sc->sc_txpwr_ofdm_diff = ofdm_diff;
 
@@ -1148,11 +1171,6 @@ rtw8189f_set_txpower(struct rtw8189f_softc *sc, unsigned chan)
 	ofdm_idx = rtw8189f_txpwr_clamp(sc->sc_txpwr_ofdm_base[ofdm_g] +
 	    sc->sc_txpwr_ofdm_diff);
 
-	/* DIAGNOSTIC: TX at maximum power — if the AP still never ACKs,
-	 * the TX power path is exonerated and the problem is in the RF TX
-	 * chain (calibration/PA), not the TXAGC indices. */
-	cck_idx = RTW8189F_TXPWR_MAX;
-	ofdm_idx = RTW8189F_TXPWR_MAX;
 
 	/* CCK 1M (0xe08 byte1) and 2/5.5/11M (0x86c bytes1-3). */
 	v = rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK1);
@@ -1160,7 +1178,7 @@ rtw8189f_set_txpower(struct rtw8189f_softc *sc, unsigned chan)
 	    (v & ~0x0000ff00) | (cck_idx << 8));
 	v = rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK2_11);
 	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_CCK2_11,
-	    (v & ~0x00ffffff) | (cck_idx << 8) | (cck_idx << 16) |
+	    (v & ~0xffffff00U) | (cck_idx << 8) | (cck_idx << 16) |
 	    (cck_idx << 24));
 
 	/* OFDM 6/9/12/18M (0xe00) and 24/36/48/54M (0xe04). */
@@ -1322,49 +1340,6 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 		goto out;
 	}
 
-	if ((rtw8189f_debug & RTW8189F_DBG_TX) &&
-	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT) {
-		/* Bounded probe: the firmware returns HIQ pages once the
-		 * frame has gone out.  Page recovery without a C2H TX report
-		 * points at the C2H channel; no recovery at all points at
-		 * the frame never leaving the queue. */
-		unsigned p;
-		uint8_t hi;
-
-		for (p = 0; p < 20; p++) {
-			hi = rtw8189f_sdiolocal_read_1(sc,
-			    RTW8189F_SDIO_REG_FREE_TXPG + 0);
-			if (hi >= free_hi)
-				break;
-			kpause("rtw8189fp", true, mstohz(5), NULL);
-		}
-		DNPRINTF(sc, RTW8189F_DBG_TX, "txpg %s hi %u->%u after %ums\n",
-		    hi >= free_hi ? "recovered" : "STUCK", free_hi, hi,
-		    p * 5);
-	}
-
-	DNPRINTF(sc, RTW8189F_DBG_TX,
-	    "txpg pre hi %u pub %u, post hi %u pub %u, oqt ac %u noac %u\n",
-	    free_hi, free_pub,
-	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 0),
-	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 6),
-	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_AC_OQT_FREEPG),
-	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_NOAC_OQT_FREEPG));
-
-	if ((rtw8189f_debug & RTW8189F_DBG_TX) && len >= RTW8189F_TXDESC_SIZE) {
-		/* Frame hex dump (up to 48 bytes): the mbuf content is the
-		 * ground truth for what the chip radiates. */
-		char hex[3 * 48 + 1];
-		const uint8_t *f = buf + RTW8189F_TXDESC_SIZE;
-		unsigned i, n = len - RTW8189F_TXDESC_SIZE;
-
-		if (n > 48)
-			n = 48;
-		for (i = 0; i < n; i++)
-			snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ",
-			    f[i]);
-		DNPRINTF(sc, RTW8189F_DBG_TX, "txdump %u: %s\n", len, hex);
-	}
 
 	if_statinc(ifp, if_opackets);
 	sc->sc_tx_frames++;
@@ -1451,8 +1426,19 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 			frame_off = off + 24 + drvinfo + shift;
 			off += (total + 7) & ~7u;
 
+			/* Validate the complete record before inspecting any payload. */
+			if (total > rxlen - desc_off || pkt_len == 0) {
+				sc->sc_rx_errors++;
+				break;
+			}
+
 			if (d2 & __BIT(28)) {		/* C2H event */
-				char ph[4 * 10 + 1];
+				if (pkt_len < 3 ||
+				    (buf[frame_off] == 0x03 && pkt_len < 9)) {
+					sc->sc_rx_errors++;
+					continue;
+				}
+				char ph[4 * 10 + 1] = { 0 };
 				uint8_t id = buf[frame_off];
 				uint8_t cseq = buf[frame_off + 1];
 				uint8_t b0 = buf[frame_off + 2];
@@ -1471,7 +1457,7 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 				DNPRINTF(sc, RTW8189F_DBG_INIT,
 				    "c2h id %02x seq %u len %u b0 %02x "
 				    "rpt %u %s%s\n", id, cseq, pkt_len, b0,
-				    pkt_len >= 8 ? buf[frame_off + 8] : 0, ph,
+				    pkt_len >= 9 ? buf[frame_off + 8] : 0, ph,
 				    id == 0x03 ?
 				    ((b0 & 0x80) ? " RETRY_OVER" :
 				     (b0 & 0x40) ? " LIFETIME_OVER" : " TXOK") :
@@ -1520,10 +1506,8 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 			fc0 = *(uint8_t *)(buf + frame_off);
 			if ((fc0 & IEEE80211_FC0_TYPE_MASK) ==
 			    IEEE80211_FC0_TYPE_MGT &&
-			    (fc0 & IEEE80211_FC0_SUBTYPE_MASK) !=
-			    IEEE80211_FC0_SUBTYPE_BEACON &&
-			    (fc0 & IEEE80211_FC0_SUBTYPE_MASK) !=
-			    IEEE80211_FC0_SUBTYPE_PROBE_RESP) {
+			    ((fc0 & IEEE80211_FC0_SUBTYPE_MASK) == IEEE80211_FC0_SUBTYPE_AUTH ||
+			    (fc0 & IEEE80211_FC0_SUBTYPE_MASK) == IEEE80211_FC0_SUBTYPE_ASSOC_RESP)) {
 				/* Non-beacon mgmt (auth/assoc rsp, deauth,
 				 * EAPOL-adjacent): reaching this print means
 				 * the FIFO delivered it, so a missing auth
@@ -1548,7 +1532,7 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 				 * 802.11 header is 8+2+2 bytes; walk the
 				 * IEs for the DS parameter set (id 3) and
 				 * replicate net80211's channel check. */
-				ie = buf + frame_off + 12;
+				ie = buf + frame_off + 36;
 				eie = buf + frame_off + pkt_len;
 				for (; ie + 2 <= eie; ie += 2 + ie[1]) {
 					if (ie[0] == 3 && ie + 3 <= eie) {

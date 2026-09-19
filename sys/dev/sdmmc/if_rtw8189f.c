@@ -94,7 +94,8 @@ static void	rtw8189f_watchdog(struct ifnet *);
 static int	rtw8189f_ioctl(struct ifnet *, u_long, void *);
 static int	rtw8189f_newstate(struct ieee80211com *, enum ieee80211_state,
 			    int);
-static void	rtw8189f_newstate_cb(struct rtw8189f_softc *);
+static void	rtw8189f_newstate_cb(struct rtw8189f_softc *,
+			    enum ieee80211_state, int);
 static void	rtw8189f_next_scan(void *);
 static void	rtw8189f_worker(void *);
 static void	rtw8189f_worker_stop(struct rtw8189f_softc *);
@@ -135,7 +136,7 @@ rtw8189f_attach(device_t parent, device_t self, void *aux)
 	aprint_normal("\n");
 
 	mutex_init(&sc->sc_lock, MUTEX_DEFAULT, IPL_NONE);
-	mutex_init(&sc->sc_work_mtx, MUTEX_DEFAULT, IPL_NONE);
+	mutex_init(&sc->sc_work_mtx, MUTEX_DEFAULT, IPL_NET);
 	cv_init(&sc->sc_cv, device_xname(self));
 	MBUFQ_INIT(&sc->sc_txq);
 	callout_init(&sc->sc_scan_to, 0);
@@ -363,10 +364,6 @@ rtw8189f_init(struct ifnet *ifp)
 
 	/* MAC/BB/RF init + LLT/queue/RCR bring-up (sleeping; ioctl ctx). */
 	if (!sc->sc_chip_ready) {
-		error = rtw8189f_chip_init(sc);
-		if (error != 0)
-			return error;
-		sc->sc_chip_ready = true;
 
 		/* A previous worker may still be draining its last loop. */
 		{
@@ -379,6 +376,15 @@ rtw8189f_init(struct ifnet *ifp)
 				return EBUSY;
 			}
 		}
+
+		error = rtw8189f_chip_init(sc);
+		if (error != 0)
+			return error;
+		sc->sc_chip_ready = true;
+
+		mutex_enter(&sc->sc_work_mtx);
+		sc->sc_flags = 0;
+		mutex_exit(&sc->sc_work_mtx);
 
 		error = kthread_create(PRI_NONE, 0, NULL, rtw8189f_worker, sc,
 		    &sc->sc_worker, "%s-worker", device_xname(sc->sc_dev));
@@ -454,8 +460,10 @@ rtw8189f_start(struct ifnet *ifp)
 		if (m != NULL) {
 			IF_DEQUEUE(&ic->ic_mgtq, m);
 			/* mgmt mbufs carry their node via M_SETCTX. */
-			DPRINTF(sc, "start: mgmt frame queued\n");
+			DNPRINTF(sc, RTW8189F_DBG_TX, "start: mgmt frame queued\n");
+			mutex_enter(&sc->sc_work_mtx);
 			MBUFQ_ENQUEUE(&sc->sc_txq, m);
+			mutex_exit(&sc->sc_work_mtx);
 			kick = true;
 			continue;
 		}
@@ -500,7 +508,9 @@ rtw8189f_start(struct ifnet *ifp)
 		}
 
 		M_SETCTX(m, ni);
+		mutex_enter(&sc->sc_work_mtx);
 		MBUFQ_ENQUEUE(&sc->sc_txq, m);
+		mutex_exit(&sc->sc_work_mtx);
 		kick = true;
 	}
 	splx(s);
@@ -528,10 +538,9 @@ rtw8189f_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 {
 	struct rtw8189f_softc *sc = ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
-	int error = 0, s;
+	int error = 0;
 
-	s = splnet();
-
+	/* init/stop perform sleeping bus and worker operations. */
 	switch (cmd) {
 	case SIOCSIFFLAGS:
 		if (sc->sc_dying) {
@@ -563,7 +572,6 @@ rtw8189f_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 		break;
 	}
 
-	splx(s);
 	return error;
 }
 
@@ -610,11 +618,11 @@ rtw8189f_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 
 /* Runs on the worker; ic->ic_state still holds the previous state. */
 static void
-rtw8189f_newstate_cb(struct rtw8189f_softc *sc)
+rtw8189f_newstate_cb(struct rtw8189f_softc *sc,
+    enum ieee80211_state nstate, int arg)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
-	enum ieee80211_state nstate = sc->sc_nstate, ostate = ic->ic_state;
-	int arg = sc->sc_narg;
+	enum ieee80211_state ostate = ic->ic_state;
 
 	/* Real state transitions on the always-on INIT bit; the per-channel
 	 * scan hops (1 -> 1) would otherwise flood the console (they stay on
@@ -706,15 +714,23 @@ rtw8189f_worker(void *arg)
 	struct mbuf *m;
 	struct ieee80211_node *ni;
 	uint32_t flags;
+	enum ieee80211_state nstate;
+	int narg;
 
 	MBUFQ_INIT(&locq);
 
 	while (!sc->sc_dying) {
 		mutex_enter(&sc->sc_work_mtx);
 		while (!(sc->sc_flags & (RTW8189F_F_NEWSTATE | RTW8189F_F_TX |
-		    RTW8189F_F_SCANNEXT | RTW8189F_F_EXIT)) && !sc->sc_dying)
-			cv_timedwait(&sc->sc_cv, &sc->sc_work_mtx, mstohz(50));
+		    RTW8189F_F_SCANNEXT | RTW8189F_F_EXIT)) && !sc->sc_dying) {
+			/* A timeout is RX work, even without a software event. */
+			if (cv_timedwait(&sc->sc_cv, &sc->sc_work_mtx,
+			    mstohz(50)) == EWOULDBLOCK)
+				break;
+		}
 		flags = sc->sc_flags;
+		nstate = sc->sc_nstate;
+		narg = sc->sc_narg;
 		sc->sc_flags = 0;
 		/* Steal the TX queue without holding the mutex on the bus. */
 		for (;;) {
@@ -736,7 +752,8 @@ rtw8189f_worker(void *arg)
 		 */
 		rtw8189f_rx_drain(sc);
 
-		if (flags & RTW8189F_F_SCANNEXT) {
+		if ((flags & RTW8189F_F_SCANNEXT) &&
+		    !(flags & RTW8189F_F_NEWSTATE)) {
 			int s = splnet();
 
 			if (sc->sc_ic.ic_state == IEEE80211_S_SCAN)
@@ -745,7 +762,7 @@ rtw8189f_worker(void *arg)
 		}
 
 		if (flags & RTW8189F_F_NEWSTATE)
-			rtw8189f_newstate_cb(sc);
+			rtw8189f_newstate_cb(sc, nstate, narg);
 
 		for (;;) {
 			MBUFQ_DEQUEUE(&locq, m);
