@@ -120,6 +120,13 @@ struct rtw8189f_softc {
 	/* eFuse logical map (parsed from the physical map). */
 	uint8_t			sc_efuse_map[RTW8189F_HWSET_MAX_SIZE];
 
+	/* TX power (vendor phy_set_tx_power_level_8188F equivalents; the
+	 * per-channel index = base[group] + diff, clamped to 0..63). */
+	uint8_t			sc_txpwr_cck_base[6];	/* CCK groups 0-5 */
+	uint8_t			sc_txpwr_ofdm_base[5];	/* OFDM/BW40 groups 0-4 */
+	int8_t			sc_txpwr_ofdm_diff;	/* OFDM-1T diff */
+	int8_t			sc_txpwr_bw20_diff;	/* BW20-1T diff */
+
 	/* Firmware image, loaded once the root filesystem is up. */
 	void			*sc_fw;
 	size_t			sc_fwsize;
@@ -136,6 +143,7 @@ struct rtw8189f_softc {
 	uint32_t		sc_rx_beacons;
 	uint32_t		sc_rx_errors;
 	uint32_t		sc_tx_frames;
+	uint32_t		sc_txrpt_seq;	/* SW_DEFINE for C2H TX reports */
 };
 
 /* rtw8189f_sdio.c */

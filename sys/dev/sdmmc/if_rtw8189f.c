@@ -616,8 +616,15 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc)
 	enum ieee80211_state nstate = sc->sc_nstate, ostate = ic->ic_state;
 	int arg = sc->sc_narg;
 
-	DNPRINTF(sc, RTW8189F_DBG_INIT, "newstate %d -> %d ch %d\n", ostate,
-	    nstate, ieee80211_chan2ieee(ic, ic->ic_curchan));
+	/* Real state transitions on the always-on INIT bit; the per-channel
+	 * scan hops (1 -> 1) would otherwise flood the console (they stay on
+	 * DBG_RX). */
+	if (ostate != nstate)
+		DNPRINTF(sc, RTW8189F_DBG_INIT, "newstate %d -> %d ch %d\n",
+		    ostate, nstate, ieee80211_chan2ieee(ic, ic->ic_curchan));
+	else
+		DNPRINTF(sc, RTW8189F_DBG_RX, "newstate %d -> %d ch %d\n",
+		    ostate, nstate, ieee80211_chan2ieee(ic, ic->ic_curchan));
 
 	switch (nstate) {
 	case IEEE80211_S_SCAN:

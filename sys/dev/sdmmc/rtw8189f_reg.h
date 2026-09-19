@@ -64,6 +64,8 @@
 #define RTW8189F_SDIO_REG_HISR			0x0018
 #define RTW8189F_SDIO_REG_RX0_REQ_LEN		0x001c
 #define RTW8189F_SDIO_REG_FREE_TXPG		0x0020
+#define RTW8189F_SDIO_REG_AC_OQT_FREEPG		0x002a	/* TX OQT free (AC) */
+#define RTW8189F_SDIO_REG_NOAC_OQT_FREEPG	0x002b	/* TX OQT free (no-AC) */
 #define RTW8189F_SDIO_REG_HRPWM1		0x0080
 
 /* HISR / HIMR bits. */
@@ -158,15 +160,19 @@
 #define RTW8189F_RQPN_NPQ(x)			((x) & 0xff)
 #define RTW8189F_RQPN_LD_RQPN			__BIT(31)
 
-/* NORMAL_PAGE_NUM_* / TX_TOTAL_PAGE_NUMBER_8188F: BCNQ 0x08, WOW 0x00. */
+/*
+ * NORMAL_PAGE_NUM_* / TX_TOTAL_PAGE_NUMBER_8188F: vendor reserves
+ * BCNQ_PAGE_NUM_8188F = MAX_BEACON_LEN/128 + 6 = 10 pages (WOWLAN 0),
+ * so TX total is 0xFF - 10 = 0xF5 and the boundary is 0xF6.
+ */
 #define RTW8189F_PAGE_NUM_HPQ			0x0c
 #define RTW8189F_PAGE_NUM_LPQ			0x02
 #define RTW8189F_PAGE_NUM_NPQ			0x02
-#define RTW8189F_TX_TOTAL_PAGE_NUMBER		0xf7	/* 0xFF - 8 - 0 */
+#define RTW8189F_TX_TOTAL_PAGE_NUMBER		0xf5	/* 0xFF - 10 - 0 */
 #define RTW8189F_NUM_PUBQ \
 	(RTW8189F_TX_TOTAL_PAGE_NUMBER - RTW8189F_PAGE_NUM_HPQ - \
 	 RTW8189F_PAGE_NUM_LPQ - RTW8189F_PAGE_NUM_NPQ)
-#define RTW8189F_TX_PAGE_BOUNDARY		0xf8	/* TX_TOTAL + 1 */
+#define RTW8189F_TX_PAGE_BOUNDARY		0xf6	/* TX_TOTAL + 1 */
 #define RTW8189F_RX_DMA_BOUNDARY		0x3f7f	/* 0x4000 - 0x80 - 1 */
 
 /* Queue-to-TXDMA-ring mapping (REG_TRXDMA_CTRL). */
@@ -291,6 +297,20 @@
 #define RTW8189F_TXAGC_CCK1			0x0e08	/* bits[15:8] = 1M */
 #define RTW8189F_TXAGC_CCK2_11			0x086c	/* 2M b1 / 5.5M b2 / 11M b3 */
 
+/*
+ * TX power PG section of the eFuse logical map (vendor pg_txpwr_saddr):
+ * 18 bytes for path A: CCK-1T base for 6 CCK channel groups (1-2, 3-5,
+ * 6-8, 9-11, 12-13, 14), OFDM-1T/BW40 base for 5 groups (1-2, 3-5, 6-8,
+ * 9-11, 12-14), then 4-bit signed diffs; byte 18 holds BW20-1T (MSB) and
+ * OFDM-1T (LSB).  Bases > 63 are invalid and fall back to the IC-default
+ * table (rtl8188f_pg_txpwr_def_info).
+ */
+#define RTW8189F_EFUSE_TXPWR_OFF		0x10
+#define RTW8189F_TXPWR_MAX			63
+#define RTW8189F_TXPWR_DEF_CCK			0x22
+#define RTW8189F_TXPWR_DEF_OFDM			0x27
+#define RTW8189F_TXPWR_DEF_OFDM_DIFF		4
+
 /* System interrupt mask register (8188F). */
 #define RTW8189F_REG_HSIMR			0x0058
 
@@ -305,12 +325,20 @@
 /* dword0: [15:0] packet size, [23:16] offset (= descriptor size). */
 #define RTW8189F_TXDW0_PKTLEN_M			0x0000ffff
 #define RTW8189F_TXDW0_OFFSET_S			16
-/* dword1: [12:8] queue select. */
+#define RTW8189F_TXDW0_BMC			__BIT(24)
+/* dword1: [12:8] queue select, [20:16] rate id. */
 #define RTW8189F_TXDW1_QSEL_S			8
-/* dword3: BIT8 use_rate. */
+#define RTW8189F_TXDW1_RATEID_S			16
+/* dword2: BIT19 SPE_RPT (firmware CCX TX report request). */
+#define RTW8189F_TXDW2_SPE_RPT			__BIT(19)
+/* dword3: BIT8 use_rate, BIT17 retry_limit_enable, [23:18] data retry limit. */
 #define RTW8189F_TXDW3_USE_RATE			__BIT(8)
+#define RTW8189F_TXDW3_RETRY_LIMIT_EN		__BIT(17)
+#define RTW8189F_TXDW3_DATA_RETRY_LIMIT_S	18
 /* dword4: [6:0] TX rate. */
 #define RTW8189F_TXDW4_RATE_M			0x7f
+/* dword6: [11:0] SW_DEFINE, echoed in the C2H TX report. */
+#define RTW8189F_TXDW6_SW_DEFINE_M		0x00000fff
 /* dword7: [15:0] SDIO checksum. */
 #define RTW8189F_TXDW7_CHKSUM_M			0x0000ffff
 /* dword8: BIT15 hwseq enable. */
@@ -318,8 +346,9 @@
 /* dword9: [23:12] sequence. */
 #define RTW8189F_TXDW9_SEQ_S			12
 
-/* TX rate indices (DESC8188F_RATE*). */
+/* TX rate indices (DESC8188F_RATE*) and rate-adaptive table ids. */
 #define RTW8189F_RATE_1M			0x00
 #define RTW8189F_RATE_6M			0x04
+#define RTW8189F_RATEID_G			7	/* RATEID_IDX_G */
 
 #endif /* !_DEV_SDMMC_RTW8189F_REG_H_ */

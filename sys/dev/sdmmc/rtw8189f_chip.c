@@ -65,6 +65,9 @@ __KERNEL_RCSID(0, "$NetBSD$");
  * association-attempt volumes only.  Never leave non-zero: sustained scan
  * floods kill console input within minutes. */
 int rtw8189f_debug = 0x30;
+
+static void	rtw8189f_txpwr_parse(struct rtw8189f_softc *);
+static void	rtw8189f_set_txpower(struct rtw8189f_softc *, unsigned);
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -989,26 +992,34 @@ rtw8189f_chip_init(struct rtw8189f_softc *sc)
 	rtw8189f_mac_write_4(sc, RTW8189F_BB_RFMOD,
 	    v | RTW8189F_BB_RFMOD_CCK_EN | RTW8189F_BB_RFMOD_OFDM_EN);
 
-	/* 17. Default channel 1 + 20 MHz RF bandwidth settings. */
+	/* 17. TX power indices parsed from the eFuse PG section (with
+	 * IC-default fallbacks) BEFORE the first channel switch programs
+	 * them; then default channel 1 + 20 MHz RF bandwidth settings. */
+	rtw8189f_txpwr_parse(sc);
 	rtw8189f_rf_write20(sc, 0x87, 0x065);
 	rtw8189f_rf_write20(sc, 0x1c, 0x000);
 	rtw8189f_rf_write20(sc, 0xdf, 0x140);
 	rtw8189f_rf_write20(sc, 0x1b, 0x0c6c);
 	rtw8189f_set_channel(sc, 1);
 
-	/* 18. TX power indices: fixed mid-range values (0x26) for all
-	 * rates; per-channel efuse calibration is a follow-up. */
-	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_OFDM6_18, 0x26262626);
-	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_OFDM24_54, 0x26262626);
-	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_CCK1,
-	    (rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK1) & ~0x0000ff00) | 0x2600);
-	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_CCK2_11, 0x26262600);
-
 	/* 19. Enable MAC TX/RX, NAV upper bound (30ms / 128us). */
 	v8 = rtw8189f_mac_read_1(sc, RTW8189F_REG_CR);
 	rtw8189f_mac_write_1(sc, RTW8189F_REG_CR,
 	    v8 | RTW8189F_MACTXEN | RTW8189F_MACRXEN);
 	rtw8189f_mac_write_1(sc, RTW8189F_REG_NAV_UPPER, (30000 + 127) / 128);
+
+	/* Vendor CONFIG_XMIT_ACK init tail: let the firmware report
+	 * management-frame TX status (C2H CCX_TX_RPT); without this bit
+	 * SPE_RPT requests are silently ignored. */
+	v = rtw8189f_mac_read_2(sc, RTW8189F_REG_FWHW_TXQ_CTRL);
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_FWHW_TXQ_CTRL, v | __BIT(12));
+
+	/* Vendor EnableInterrupt8188FSdio init tail: C2H events already
+	 * posted before MAC RX went live would otherwise stall the
+	 * firmware's C2H scheduler.  (Per-event C2H packets arrive via the
+	 * RX FIFO on SDIO — CONFIG_FW_C2H_PKT — and need no mailbox
+	 * handling; this is only the one-time init clear.) */
+	rtw8189f_mac_write_1(sc, RTW8189F_REG_C2HEVT_CLEAR, 0x00);
 
 	/* 20. Our own address (MACID port 0). */
 	rtw8189f_mac_write_4(sc, RTW8189F_REG_MACID,
@@ -1021,7 +1032,144 @@ rtw8189f_chip_init(struct rtw8189f_softc *sc)
 
 	aprint_normal_dev(sc->sc_dev,
 	    "chip init done (rf18 0x%05x, rcr 0x%08x)\n", sc->sc_rf18, sc->sc_rcr);
+	/* Read back the TXAGC registers the first channel programmed. */
+	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	    "txagc rd: cck1 %08x cck2_11 %08x ofdm6_18 %08x ofdm24_54 %08x\n",
+	    rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK1),
+	    rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK2_11),
+	    rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_OFDM6_18),
+	    rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_OFDM24_54));
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* TX power (vendor hal_load_pg_txpwr_info / phy_set_tx_power_level)   */
+/* ------------------------------------------------------------------ */
+
+static int8_t
+rtw8189f_txpwr_diff_nib(uint8_t v, bool msb)
+{
+	uint8_t n = msb ? (v >> 4) : (v & 0xf);
+
+	/* 4-bit signed. */
+	return (n & 0x8) ? (int8_t)(n | 0xf0) : (int8_t)n;
+}
+
+/*
+ * Parse the TX power PG section (logical eFuse 0x10, path A) into the
+ * per-group bases.  Invalid bases (> 63) fall back to the 8188F
+ * IC-default table entry by entry, as the vendor's PG -> IC_DEF source
+ * fallback does.
+ */
+static void
+rtw8189f_txpwr_parse(struct rtw8189f_softc *sc)
+{
+	const uint8_t *pg = sc->sc_efuse_map + RTW8189F_EFUSE_TXPWR_OFF;
+	unsigned g;
+	int8_t ofdm_diff, bw20_diff;
+
+	for (g = 0; g < 6; g++)
+		sc->sc_txpwr_cck_base[g] =
+		    pg[g] <= RTW8189F_TXPWR_MAX ? pg[g] : RTW8189F_TXPWR_DEF_CCK;
+	for (g = 0; g < 5; g++)
+		sc->sc_txpwr_ofdm_base[g] =
+		    pg[6 + g] <= RTW8189F_TXPWR_MAX ?
+		    pg[6 + g] : RTW8189F_TXPWR_DEF_OFDM;
+
+	/* Byte 18: MSB = BW20-1T diff, LSB = OFDM-1T diff.  The 0xFF
+	 * (unprogrammed) form sign-extends to -1, exactly as the vendor
+	 * parser keeps it.  CCK-1T diff is never stored in PG (0). */
+	bw20_diff = rtw8189f_txpwr_diff_nib(pg[17], true);
+	ofdm_diff = rtw8189f_txpwr_diff_nib(pg[17], false);
+	sc->sc_txpwr_bw20_diff = bw20_diff;
+	sc->sc_txpwr_ofdm_diff = ofdm_diff;
+
+	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	    "txpwr: cck base %02x %02x %02x %02x %02x %02x, ofdm base "
+	    "%02x %02x %02x %02x %02x, diff ofdm %+d bw20 %+d\n",
+	    sc->sc_txpwr_cck_base[0], sc->sc_txpwr_cck_base[1],
+	    sc->sc_txpwr_cck_base[2], sc->sc_txpwr_cck_base[3],
+	    sc->sc_txpwr_cck_base[4], sc->sc_txpwr_cck_base[5],
+	    sc->sc_txpwr_ofdm_base[0], sc->sc_txpwr_ofdm_base[1],
+	    sc->sc_txpwr_ofdm_base[2], sc->sc_txpwr_ofdm_base[3],
+	    sc->sc_txpwr_ofdm_base[4], ofdm_diff, bw20_diff);
+}
+
+static unsigned
+rtw8189f_txpwr_clamp(int v)
+{
+
+	if (v < 0)
+		return 0;
+	if (v > RTW8189F_TXPWR_MAX)
+		return RTW8189F_TXPWR_MAX;
+	return (unsigned)v;
+}
+
+/*
+ * Program the per-rate TX power indices for one channel (vendor
+ * PHY_SetTxPowerIndex_8188F; re-run on every channel switch).
+ */
+static void
+rtw8189f_set_txpower(struct rtw8189f_softc *sc, unsigned chan)
+{
+	unsigned cck_g, ofdm_g, cck_idx, ofdm_idx;
+	uint32_t v;
+
+	if (chan < 1 || chan > 14)
+		return;
+
+	/* CCK groups: 1-2, 3-5, 6-8, 9-11, 12-13, 14. */
+	if (chan <= 2)
+		cck_g = 0;
+	else if (chan <= 5)
+		cck_g = 1;
+	else if (chan <= 8)
+		cck_g = 2;
+	else if (chan <= 11)
+		cck_g = 3;
+	else if (chan <= 13)
+		cck_g = 4;
+	else
+		cck_g = 5;
+	/* OFDM/BW40 groups: 1-2, 3-5, 6-8, 9-11, 12-14. */
+	if (chan <= 2)
+		ofdm_g = 0;
+	else if (chan <= 5)
+		ofdm_g = 1;
+	else if (chan <= 8)
+		ofdm_g = 2;
+	else if (chan <= 11)
+		ofdm_g = 3;
+	else
+		ofdm_g = 4;
+
+	cck_idx = rtw8189f_txpwr_clamp(sc->sc_txpwr_cck_base[cck_g]);
+	ofdm_idx = rtw8189f_txpwr_clamp(sc->sc_txpwr_ofdm_base[ofdm_g] +
+	    sc->sc_txpwr_ofdm_diff);
+
+	/* DIAGNOSTIC: TX at maximum power — if the AP still never ACKs,
+	 * the TX power path is exonerated and the problem is in the RF TX
+	 * chain (calibration/PA), not the TXAGC indices. */
+	cck_idx = RTW8189F_TXPWR_MAX;
+	ofdm_idx = RTW8189F_TXPWR_MAX;
+
+	/* CCK 1M (0xe08 byte1) and 2/5.5/11M (0x86c bytes1-3). */
+	v = rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK1);
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_CCK1,
+	    (v & ~0x0000ff00) | (cck_idx << 8));
+	v = rtw8189f_mac_read_4(sc, RTW8189F_TXAGC_CCK2_11);
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_CCK2_11,
+	    (v & ~0x00ffffff) | (cck_idx << 8) | (cck_idx << 16) |
+	    (cck_idx << 24));
+
+	/* OFDM 6/9/12/18M (0xe00) and 24/36/48/54M (0xe04). */
+	v = ofdm_idx | (ofdm_idx << 8) | (ofdm_idx << 16) | (ofdm_idx << 24);
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_OFDM6_18, v);
+	rtw8189f_mac_write_4(sc, RTW8189F_TXAGC_OFDM24_54, v);
+
+	DNPRINTF(sc, RTW8189F_DBG_RX, "txpwr ch %u cck %u ofdm %u\n",
+	    chan, cck_idx, ofdm_idx);
 }
 
 void
@@ -1034,7 +1182,12 @@ rtw8189f_set_channel(struct rtw8189f_softc *sc, unsigned chan)
 
 	want = (sc->sc_rf18 & ~0xff) | chan;
 	rtw8189f_rf_write20(sc, RTW8189F_RF_CHNLBW, want);
-	DNPRINTF(sc, RTW8189F_DBG_INIT,
+	/* Vendor reprograms TX power on every channel switch
+	 * (PHY_SetSwChnlBWMode8188F -> set_tx_power_level). */
+	rtw8189f_set_txpower(sc, chan);
+	/* DBG_RX: per-channel verification print, would flood at DBG_INIT
+	 * during scan. */
+	DNPRINTF(sc, RTW8189F_DBG_RX,
 	    "setchan %u rf18 want 0x%05x got 0x%05x\n", chan, want,
 	    rtw8189f_rf_read20(sc, RTW8189F_RF_CHNLBW));
 }
@@ -1093,9 +1246,11 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 	struct ieee80211_node *ni;
 	struct ieee80211_frame *wh;
 	uint8_t *buf = sc->sc_txbuf;
-	uint32_t len, pages, free_hi, free_pub;
+	uint32_t len, pages, free_hi, free_pub, rptseq;
 	unsigned rate;
 	int tries;
+
+	rptseq = (uint32_t)-1;
 
 	ni = M_GETCTX(m, struct ieee80211_node *);
 	if (ni == NULL) {
@@ -1121,6 +1276,25 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 	le32enc(buf + 4, RTW8189F_TXDESC_QSEL_MGNT << RTW8189F_TXDW1_QSEL_S);
 	le32enc(buf + 12, RTW8189F_TXDW3_USE_RATE);
 	le32enc(buf + 16, rate & RTW8189F_TXDW4_RATE_M);
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT) {
+		/* Vendor MGNT_FRAMETAG fill: rate table for retries and a
+		 * bounded retry count.  Unicast mgmt also asks the firmware
+		 * for a CCX TX report (C2H 0x03); the echoed SW_DEFINE says
+		 * which frame a report belongs to.  Broadcast/multicast gets
+		 * the BMC flag instead. */
+		le32enc(buf + 4, le32dec(buf + 4) |
+		    (RTW8189F_RATEID_G << RTW8189F_TXDW1_RATEID_S));
+		le32enc(buf + 12, le32dec(buf + 12) |
+		    RTW8189F_TXDW3_RETRY_LIMIT_EN |
+		    (6u << RTW8189F_TXDW3_DATA_RETRY_LIMIT_S));
+		if ((wh->i_addr1[0] & 0x01) == 0) {
+			rptseq = sc->sc_txrpt_seq++ & RTW8189F_TXDW6_SW_DEFINE_M;
+			le32enc(buf + 8, RTW8189F_TXDW2_SPE_RPT);
+			le32enc(buf + 24, rptseq);
+		} else {
+			le32enc(buf + 0, le32dec(buf + 0) | RTW8189F_TXDW0_BMC);
+		}
+	}
 	le32enc(buf + 32, RTW8189F_TXDW8_HWSEQ_EN);
 	le16enc(buf + 28, rtw8189f_txdesc_chksum(buf));
 
@@ -1148,12 +1322,57 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 		goto out;
 	}
 
+	if ((rtw8189f_debug & RTW8189F_DBG_TX) &&
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT) {
+		/* Bounded probe: the firmware returns HIQ pages once the
+		 * frame has gone out.  Page recovery without a C2H TX report
+		 * points at the C2H channel; no recovery at all points at
+		 * the frame never leaving the queue. */
+		unsigned p;
+		uint8_t hi;
+
+		for (p = 0; p < 20; p++) {
+			hi = rtw8189f_sdiolocal_read_1(sc,
+			    RTW8189F_SDIO_REG_FREE_TXPG + 0);
+			if (hi >= free_hi)
+				break;
+			kpause("rtw8189fp", true, mstohz(5), NULL);
+		}
+		DNPRINTF(sc, RTW8189F_DBG_TX, "txpg %s hi %u->%u after %ums\n",
+		    hi >= free_hi ? "recovered" : "STUCK", free_hi, hi,
+		    p * 5);
+	}
+
+	DNPRINTF(sc, RTW8189F_DBG_TX,
+	    "txpg pre hi %u pub %u, post hi %u pub %u, oqt ac %u noac %u\n",
+	    free_hi, free_pub,
+	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 0),
+	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 6),
+	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_AC_OQT_FREEPG),
+	    rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_NOAC_OQT_FREEPG));
+
+	if ((rtw8189f_debug & RTW8189F_DBG_TX) && len >= RTW8189F_TXDESC_SIZE) {
+		/* Frame hex dump (up to 48 bytes): the mbuf content is the
+		 * ground truth for what the chip radiates. */
+		char hex[3 * 48 + 1];
+		const uint8_t *f = buf + RTW8189F_TXDESC_SIZE;
+		unsigned i, n = len - RTW8189F_TXDESC_SIZE;
+
+		if (n > 48)
+			n = 48;
+		for (i = 0; i < n; i++)
+			snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ",
+			    f[i]);
+		DNPRINTF(sc, RTW8189F_DBG_TX, "txdump %u: %s\n", len, hex);
+	}
+
 	if_statinc(ifp, if_opackets);
 	sc->sc_tx_frames++;
-	DNPRINTF(sc, RTW8189F_DBG_TX, "tx %s len %u rate %u ch %u\n",
+	DNPRINTF(sc, RTW8189F_DBG_TX, "tx %s len %u rate %u ch %u rpt %u\n",
 	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT
 	    ? "mgmt" : "data", len, rate,
-	    ieee80211_chan2ieee(&sc->sc_ic, sc->sc_ic.ic_curchan));
+	    ieee80211_chan2ieee(&sc->sc_ic, sc->sc_ic.ic_curchan),
+	    rptseq);
 out:
 	ieee80211_free_node(ni);
 	m_freem(m);
@@ -1233,8 +1452,30 @@ rtw8189f_rx_drain(struct rtw8189f_softc *sc)
 			off += (total + 7) & ~7u;
 
 			if (d2 & __BIT(28)) {		/* C2H event */
-				DNPRINTF(sc, RTW8189F_DBG_RX, "rx: c2h len %u\n",
-				    pkt_len);
+				char ph[4 * 10 + 1];
+				uint8_t id = buf[frame_off];
+				uint8_t cseq = buf[frame_off + 1];
+				uint8_t b0 = buf[frame_off + 2];
+				unsigned i, n;
+
+				/* CCX TX report (0x03): payload byte0 bit7 =
+				 * retry over, bit6 = lifetime over, byte6
+				 * echoes TXDESC SW_DEFINE (CCX_FwC2HTxRpt). */
+				n = pkt_len >= 2 && pkt_len - 2 < sizeof(ph) / 3
+				    ? pkt_len - 2 : 10;
+				if (n > 10)
+					n = 10;
+				for (i = 0; i < n; i++)
+					snprintf(ph + 3 * i, sizeof(ph) - 3 * i,
+					    "%02x ", buf[frame_off + 2 + i]);
+				DNPRINTF(sc, RTW8189F_DBG_INIT,
+				    "c2h id %02x seq %u len %u b0 %02x "
+				    "rpt %u %s%s\n", id, cseq, pkt_len, b0,
+				    pkt_len >= 8 ? buf[frame_off + 8] : 0, ph,
+				    id == 0x03 ?
+				    ((b0 & 0x80) ? " RETRY_OVER" :
+				     (b0 & 0x40) ? " LIFETIME_OVER" : " TXOK") :
+				    "");
 				continue;
 			}
 
