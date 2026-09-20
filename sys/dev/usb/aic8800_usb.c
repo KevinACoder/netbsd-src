@@ -743,15 +743,14 @@ aic8800u_cmd_cfm(struct aic8800u_softc *sc, uint16_t id, uint16_t dest_id,
 
 	KASSERT(sc->sc_transport_ready);
 
-	error = aic8800u_cmd_frame_and_write(sc, id, dest_id, src_id,
-	    param, param_len);
-	if (error != 0) {
-		aprint_error_dev(sc->sc_dev,
-		    "cmd %#x: bulk write failed (%d)\n", id, error);
-		return error;
-	}
-
 	if (sc->sc_personality == AIC8800U_BROM) {
+		error = aic8800u_cmd_frame_and_write(sc, id, dest_id, src_id,
+		    param, param_len);
+		if (error != 0) {
+			aprint_error_dev(sc->sc_dev,
+			    "cmd %#x: bulk write failed (%d)\n", id, error);
+			return error;
+		}
 		for (;;) {
 			uint32_t count;
 			bool found;
@@ -771,7 +770,11 @@ aic8800u_cmd_cfm(struct aic8800u_softc *sc, uint16_t id, uint16_t dest_id,
 
 	/*
 	 * App mode: the evt thread reads the pipe and completes the
-	 * command here.  One command in flight, bounded wait.
+	 * command here.  One command in flight, bounded wait.  The
+	 * expected CFM id is armed BEFORE the frame goes out: firmware
+	 * that answers within the write-completion latency must find
+	 * the waiter already posted, or the CFM gets misfiled as an
+	 * unsolicited event.
 	 */
 	KASSERT(sc->sc_evt_lwp != NULL);
 
@@ -782,7 +785,21 @@ aic8800u_cmd_cfm(struct aic8800u_softc *sc, uint16_t id, uint16_t dest_id,
 	sc->sc_cmd_cfm_buf = cfm;
 	sc->sc_cmd_cfm_len = cfm_len;
 	sc->sc_cmd_error = 0;
+	mutex_exit(&sc->sc_cmd_mtx);
 
+	error = aic8800u_cmd_frame_and_write(sc, id, dest_id, src_id,
+	    param, param_len);
+	if (error != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "cmd %#x: bulk write failed (%d)\n", id, error);
+		mutex_enter(&sc->sc_cmd_mtx);
+		sc->sc_cmd_active = false;
+		sc->sc_cmd_cfm_buf = NULL;
+		mutex_exit(&sc->sc_cmd_mtx);
+		return error;
+	}
+
+	mutex_enter(&sc->sc_cmd_mtx);
 	while (sc->sc_cmd_active && sc->sc_cmd_error == 0 && !sc->sc_dying) {
 		if (cv_timedwait(&sc->sc_cmd_cv, &sc->sc_cmd_mtx,
 		    mstohz(AIC8800_CMD_TIMEOUT_MS)) == EWOULDBLOCK)
@@ -828,6 +845,23 @@ aic8800u_data_write(struct aic8800u_softc *sc, size_t len)
 		return EIO;
 
 	return 0;
+}
+
+/*
+ * Fire-and-forget command: frame it and push it out, no CFM wait.  Used
+ * for SCANU_START_REQ, whose completion is reported by the async
+ * SCANU_START_CFM (0x1001) event -- this firmware build never sends the
+ * ADDTIONAL CFM (0x1009) the vendor driver waits for.
+ */
+int
+aic8800u_cmd_send(struct aic8800u_softc *sc, uint16_t id, uint16_t dest_id,
+    uint16_t src_id, const void *param, size_t param_len)
+{
+
+	KASSERT(sc->sc_transport_ready);
+
+	return aic8800u_cmd_frame_and_write(sc, id, dest_id, src_id,
+	    param, param_len);
 }
 
 int

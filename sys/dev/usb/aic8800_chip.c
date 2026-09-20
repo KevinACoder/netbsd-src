@@ -758,8 +758,6 @@ aic8800u_scan_start(struct aic8800u_softc *sc, const uint8_t *ssid,
 	struct aic8800u_scanu_start_req req;
 	struct aic8800u_mac_ssid *ssid_p;
 	unsigned i;
-	uint8_t cfm[3];
-	int error;
 
 	memset(&req, 0, sizeof(req));
 	for (i = 0; i < 13; i++)
@@ -779,18 +777,15 @@ aic8800u_scan_start(struct aic8800u_softc *sc, const uint8_t *ssid,
 
 	req.vif_idx = sc->sc_vif_idx;
 
-	error = aic8800u_cmd_cfm(sc, AIC8800_SCANU_START_REQ,
-	    AIC8800_TASK_SCANU, AIC8800_DRV_TASK_ID, &req, sizeof(req),
-	    AIC8800_SCANU_START_CFM_ADDTIONAL, cfm, sizeof(cfm));
-	if (error != 0)
-		return error;
-
-	if (cfm[1] != 0) {
-		aprint_error_dev(sc->sc_dev, "scanu start status %u\n",
-		    cfm[1]);
-		return EIO;
-	}
-	return 0;
+	/*
+	 * Fire and forget: this firmware build never answers with the
+	 * SCANU_START_CFM_ADDTIONAL (0x1009) the vendor driver waits
+	 * for; the async SCANU_START_CFM (0x1001) after the last
+	 * channel is the only completion signal.  Results arrive as
+	 * SCANU_RESULT_IND events in between.
+	 */
+	return aic8800u_cmd_send(sc, AIC8800_SCANU_START_REQ,
+	    AIC8800_TASK_SCANU, AIC8800_DRV_TASK_ID, &req, sizeof(req));
 }
 
 /*

@@ -247,6 +247,8 @@ int	aic8800u_cmd(struct aic8800u_softc *, uint16_t id, uint16_t dest_id,
 int	aic8800u_cmd_cfm(struct aic8800u_softc *, uint16_t id, uint16_t dest_id,
 	    uint16_t src_id, const void *param, size_t param_len,
 	    uint16_t cfm_id, void *cfm, size_t cfm_len);
+int	aic8800u_cmd_send(struct aic8800u_softc *, uint16_t id, uint16_t dest_id,
+	    uint16_t src_id, const void *param, size_t param_len);
 int	aic8800u_data_write(struct aic8800u_softc *, size_t len);
 int	aic8800u_threads_start(struct aic8800u_softc *);
 size_t	aic8800u_evt_dequeue(struct aic8800u_softc *,

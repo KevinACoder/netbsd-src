@@ -268,7 +268,7 @@ aic8800u_bringup_task(void *arg)
 	 * read files until the root file system is mounted -- which on
 	 * this board happens after USB enumeration (rtw89 lesson).
 	 */
-	for (attempt = 0; attempt < 120; attempt++) {
+	for (attempt = 0; attempt < 300; attempt++) {
 		if (sc->sc_dying)
 			break;
 		if (!sc->sc_transport_ready &&
@@ -330,6 +330,23 @@ aic8800u_app_attach(struct aic8800u_softc *sc)
 		return error;
 	}
 
+	/*
+	 * The evt/rx threads must exist BEFORE the first firmware
+	 * command: in app mode the evt thread owns the message IN pipe
+	 * and is what completes commands (the boot ROM read its own
+	 * CFMs; the app never answers on an unattended pipe).
+	 */
+	error = aic8800u_threads_start(sc);
+	if (error != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "cannot start transport threads (%d)\n", error);
+		usbd_abort_pipe(sc->sc_evt_pipe);
+		usbd_abort_pipe(sc->sc_data_in_pipe);
+		kpause("aictx", false, mstohz(50), NULL);
+		aic8800u_transport_fini(sc);
+		return error;
+	}
+
 	/* the firmware just booted; give the command engine some slack */
 	error = ENODEV;
 	for (i = 0; i < 5; i++) {
@@ -340,14 +357,9 @@ aic8800u_app_attach(struct aic8800u_softc *sc)
 	}
 	if (error != 0) {
 		aprint_error_dev(sc->sc_dev, "fw init failed (%d)\n", error);
-		aic8800u_transport_fini(sc);
-		return error;
-	}
-
-	error = aic8800u_threads_start(sc);
-	if (error != 0) {
-		aprint_error_dev(sc->sc_dev,
-		    "cannot start transport threads (%d)\n", error);
+		usbd_abort_pipe(sc->sc_evt_pipe);
+		usbd_abort_pipe(sc->sc_data_in_pipe);
+		kpause("aictx", false, mstohz(50), NULL);
 		aic8800u_transport_fini(sc);
 		return error;
 	}
@@ -808,7 +820,13 @@ static int
 aic8800u_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
     int arg)
 {
-	struct aic8800u_softc *sc = ic->ic_ifp->if_softc;
+	struct aic8800u_softc *sc = ic->ic_ifp != NULL ?
+	    ic->ic_ifp->if_softc : NULL;
+
+	/* Sanity: ic lives inside our softc; anything else means the
+	 * caller raced a detach and we must not touch softc fields. */
+	if (sc == NULL || &sc->sc_ic != ic)
+		return EIO;
 
 	/* Only kill the scan watchdog when leaving scan: the first
 	 * INIT->SCAN transition re-enters synchronously before the
