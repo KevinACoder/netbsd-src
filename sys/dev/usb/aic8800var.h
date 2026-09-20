@@ -143,6 +143,7 @@ int	aic8800u_start_app(struct aic8800u_softc *, uint32_t boot_addr);
 
 /* aic8800_chip.c */
 const char *aic8800u_personality_name(enum aic8800u_personality);
+bool	aic8800u_firmware_available(struct aic8800u_softc *);
 void	aic8800u_fw_download(struct aic8800u_softc *);
 
 #endif	/* _DEV_USB_AIC8800VAR_H_ */

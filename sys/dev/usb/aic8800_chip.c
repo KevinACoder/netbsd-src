@@ -135,6 +135,23 @@ aic8800u_free_file(uint8_t *data, size_t size)
 		kmem_free(data, size);
 }
 
+/*
+ * Probe whether firmware(9) can serve the packaged files yet -- on the
+ * ramdisk line the USB devices attach before mountroot, so the bring-up
+ * thread polls until the root file system is there.
+ */
+bool
+aic8800u_firmware_available(struct aic8800u_softc *sc)
+{
+	uint8_t *data;
+	size_t size;
+
+	if (aic8800u_load_file(sc, AIC8800_FW_PATCH_TABLE, &data, &size) != 0)
+		return false;
+	aic8800u_free_file(data, size);
+	return true;
+}
+
 static uint32_t
 aic8800u_le32(const uint8_t *p)
 {
@@ -517,18 +534,23 @@ aic8800u_fw_download(struct aic8800u_softc *sc)
 	uint32_t chip_id;
 	int error;
 
-	/* chip revision decides the file variant; only U02 is packaged */
+	/* chip revision decides the file variant: U02 and U03 both take
+	 * the _u02 file set (only U01 uses the unsuffixed files, which we
+	 * do not package).  The register's high half carries more fields,
+	 * so the revision is the vendor's (u8)(val >> 16) truncation. */
 	error = aic8800u_dbg_read32(sc, AIC8800_SYS_CHIPID_REG, &chip_id);
 	if (error != 0) {
 		aprint_error_dev(sc->sc_dev, "chip id read failed (%d)\n",
 		    error);
 		return;
 	}
-	sc->sc_chip_id = chip_id >> 16;
-	aprint_normal_dev(sc->sc_dev, "chip_id %#x\n", sc->sc_chip_id);
-	if (sc->sc_chip_id != AIC8800_CHIP_REV_U02) {
+	sc->sc_chip_id = (chip_id >> 16) & 0xff;
+	aprint_normal_dev(sc->sc_dev, "chip_id %#x (reg %#x)\n",
+	    sc->sc_chip_id, chip_id);
+	if (sc->sc_chip_id != AIC8800_CHIP_REV_U02 &&
+	    sc->sc_chip_id != AIC8800_CHIP_REV_U03) {
 		aprint_error_dev(sc->sc_dev,
-		    "chip revision %#x has no firmware packaged (need U02)\n",
+		    "chip revision %#x has no firmware packaged (need U02/U03)\n",
 		    sc->sc_chip_id);
 		return;
 	}
@@ -594,8 +616,18 @@ aic8800u_fw_download(struct aic8800u_softc *sc)
 
 	error = aic8800u_start_app(sc, AIC8800_RAM_FW_ADDR_U02);
 	if (error != 0) {
-		aprint_error_dev(sc->sc_dev, "start_app failed (%d)\n", error);
-		goto out;
+		/*
+		 * The firmware resets the device right after taking the
+		 * START_APP command, so the CFM often never makes it
+		 * back before the bus detach tears the transfer down
+		 * (seen on the board: EIO 30 ms in, re-enumeration as
+		 * the app personality 0.6 s later).  That is the same
+		 * "failure is the success sign" situation as the
+		 * modeswitch CSW; the real judge is the re-enumeration.
+		 */
+		aprint_normal_dev(sc->sc_dev, "start_app: CFM not observed"
+		    " (%d) -- expected, firmware is resetting\n", error);
+		error = 0;
 	}
 
 	aprint_normal_dev(sc->sc_dev,

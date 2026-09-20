@@ -15,6 +15,7 @@ NOMAN=	# define
 FILES=	dist/fmacfw_8800d80_u02.bin
 FILES+=	dist/fw_adid_8800d80_u02.bin
 FILES+=	dist/fw_patch_8800d80_u02.bin
+FILES+=	dist/fw_patch_8800d80_u02_ext0.bin
 FILES+=	dist/fw_patch_table_8800d80_u02.bin
 FILES+=	dist/lmacfw_rf_8800d80_u02.bin
 FILES+=	dist/aic_userconfig_8800d80.txt

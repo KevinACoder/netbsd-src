@@ -186,25 +186,17 @@ aic8800u_dump_layout(struct aic8800u_softc *sc)
 }
 
 /*
- * Thread exit path: clear the lwp pointer and tear the transport down
- * if detach already gave up on us (kthread_join from detach can
- * deadlock on an aborted transfer -- the rtw8189f lesson).  Whoever
- * observes the other side gone also destroys sc_load_mtx.
+ * Thread exit path: clear the lwp pointer so detach can reap the
+ * transport (detach owns the cleanup after it observes the thread
+ * gone -- no join, but a bounded wait after aborting the pipes).
  */
 static void
 aic8800u_bringup_done(struct aic8800u_softc *sc)
 {
-	bool last;
 
 	mutex_enter(&sc->sc_load_mtx);
 	sc->sc_bringup_lwp = NULL;
-	last = sc->sc_detached;
 	mutex_exit(&sc->sc_load_mtx);
-
-	if (last) {
-		aic8800u_transport_fini(sc);
-		mutex_destroy(&sc->sc_load_mtx);
-	}
 
 	kthread_exit(0);
 }
@@ -223,13 +215,20 @@ aic8800u_bringup_task(void *arg)
 	 */
 	for (attempt = 0; attempt < 120; attempt++) {
 		if (sc->sc_dying)
-			aic8800u_bringup_done(sc);
-		if (aic8800u_transport_init(sc) == 0)
 			break;
+		if (!sc->sc_transport_ready &&
+		    aic8800u_transport_init(sc) != 0)
+			goto retry;
+		if (aic8800u_firmware_available(sc))
+			break;
+retry:
 		kpause("aicfwup", false, mstohz(100), NULL);
 	}
-	if (!sc->sc_transport_ready) {
-		aprint_error_dev(sc->sc_dev, "transport init failed\n");
+	if (sc->sc_dying)
+		aic8800u_bringup_done(sc);
+	if (!sc->sc_transport_ready || !aic8800u_firmware_available(sc)) {
+		aprint_error_dev(sc->sc_dev,
+		    "transport or firmware never became ready\n");
 		aic8800u_bringup_done(sc);
 	}
 
@@ -333,24 +332,37 @@ static int
 aic8800u_detach(device_t self, int flags)
 {
 	struct aic8800u_softc *sc = device_private(self);
-	bool thread_running;
+	bool running;
+	int i;
 
 	mutex_enter(&sc->sc_load_mtx);
 	sc->sc_dying = true;
 	sc->sc_detached = true;
-	thread_running = sc->sc_bringup_lwp != NULL;
 	mutex_exit(&sc->sc_load_mtx);
 
-	if (thread_running) {
-		/*
-		 * Wake the thread out of any sync transfer; it clears
-		 * sc_bringup_lwp and tears the transport (and the lock)
-		 * down itself.
-		 */
-		if (sc->sc_evt_pipe != NULL)
-			usbd_abort_pipe(sc->sc_evt_pipe);
-		if (sc->sc_cmd_pipe != NULL)
-			usbd_abort_pipe(sc->sc_cmd_pipe);
+	if (sc->sc_transport_ready) {
+		/* wake the bring-up thread out of any sync transfer */
+		usbd_abort_pipe(sc->sc_evt_pipe);
+		usbd_abort_pipe(sc->sc_cmd_pipe);
+	}
+
+	/*
+	 * Bounded wait for the bring-up thread (it self-clears
+	 * sc_bringup_lwp); it unwinds on the aborted transfers.  If it
+	 * somehow hangs we leak the transport rather than use-after-free.
+	 */
+	running = false;
+	for (i = 0; i < 200; i++) {
+		mutex_enter(&sc->sc_load_mtx);
+		running = sc->sc_bringup_lwp != NULL;
+		mutex_exit(&sc->sc_load_mtx);
+		if (!running)
+			break;
+		kpause("aicdet", false, mstohz(10), NULL);
+	}
+	if (running) {
+		aprint_error_dev(self,
+		    "bring-up thread did not exit; leaking transport\n");
 	} else {
 		aic8800u_transport_fini(sc);
 		mutex_destroy(&sc->sc_load_mtx);

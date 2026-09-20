@@ -114,6 +114,7 @@ COPY	${NETBSDSRCDIR}/external/realtek/rtw8189f/dist/rtw8189f_fw.bin	libdata/firm
 COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fmacfw_8800d80_u02.bin	libdata/firmware/aic8800u/fmacfw_8800d80_u02.bin
 COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fw_adid_8800d80_u02.bin	libdata/firmware/aic8800u/fw_adid_8800d80_u02.bin
 COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fw_patch_8800d80_u02.bin	libdata/firmware/aic8800u/fw_patch_8800d80_u02.bin
+COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fw_patch_8800d80_u02_ext0.bin	libdata/firmware/aic8800u/fw_patch_8800d80_u02_ext0.bin
 COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/fw_patch_table_8800d80_u02.bin	libdata/firmware/aic8800u/fw_patch_table_8800d80_u02.bin
 COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/lmacfw_rf_8800d80_u02.bin	libdata/firmware/aic8800u/lmacfw_rf_8800d80_u02.bin
 COPY	${NETBSDSRCDIR}/external/aicsemi/aic8800/dist/aic_userconfig_8800d80.txt	libdata/firmware/aic8800u/aic_userconfig_8800d80.txt
