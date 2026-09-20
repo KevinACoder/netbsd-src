@@ -302,7 +302,9 @@ rtw89_work_enqueue_safe(struct work_struct *w)
 		return;
 	}
 
-	item = kmem_alloc(sizeof(*item), KM_NOSLEEP);
+	/* kmem_alloc() is thread-context only (DIAGNOSTIC asserts it); the
+	 * softint-safe primitive is kmem_intr_alloc(). */
+	item = kmem_intr_alloc(sizeof(*item), KM_NOSLEEP);
 	if (item == NULL) {
 		w->wk_queued = 0;
 		return;

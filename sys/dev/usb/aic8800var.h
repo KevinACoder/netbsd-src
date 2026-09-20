@@ -39,6 +39,7 @@
 #include <sys/mbuf.h>
 
 #include <net/if.h>
+#include <net/if_ether.h>
 #include <net/if_media.h>
 #include <net80211/ieee80211_var.h>
 
@@ -177,8 +178,15 @@ struct aic8800u_softc {
 	 * pattern: ic_newstate only snapshots and the worker drives the
 	 * chip; everything sleeps on USB, the state machine runs at
 	 * splnet from the worker.
+	 *
+	 * The ifnet MUST live inside a struct ethercom: ether_ioctl()
+	 * recovers it as (struct ethercom *)ifp, and with a bare ifnet
+	 * the ethercom fields (ec_multiaddrs et al) silently overlay
+	 * sc_ic -- net80211 then stomps them and the first multicast
+	 * join at ifconfig up writes through a garbage list head.
 	 */
-	struct ifnet		 sc_if;
+	struct ethercom		 sc_ec;
+#define sc_if			sc_ec.ec_if
 	struct ieee80211com	 sc_ic;
 	int			(*sc_newstate)(struct ieee80211com *,
 				    enum ieee80211_state, int);

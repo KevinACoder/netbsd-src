@@ -923,8 +923,14 @@ aic8800u_scan_timo(void *arg)
 }
 
 /*
- * Scan finish, driver-driven (the iwm(4) model): nothing in the stack
- * completes a firmware scan for us.
+ * Firmware scan completion (the async SCANU_START_CFM, or the watchdog).
+ * End the net80211 scan pass, then clear F_SCAN/F_ASCAN for good: the old
+ * stack's auto-sequencer would otherwise loop here forever when nothing
+ * matches (no configured nwkey against a WPA2-only air), leaving F_SCAN
+ * set, and while it is set both ifconfig list scan and the supplicant's
+ * table read answer EINPROGRESS.  The ic_scan table is the userland-facing
+ * BSS cache of this full-mac driver; each firmware pass refreshes it
+ * regardless of the flag (see aic8800u_scan_result).
  */
 static void
 aic8800u_scan_done(struct aic8800u_softc *sc)
@@ -940,6 +946,7 @@ aic8800u_scan_done(struct aic8800u_softc *sc)
 	s = splnet();
 	if (ic->ic_state == IEEE80211_S_SCAN)
 		ieee80211_end_scan(ic);
+	ic->ic_flags &= ~(IEEE80211_F_SCAN | IEEE80211_F_ASCAN);
 	splx(s);
 }
 
@@ -1073,10 +1080,12 @@ aic8800u_scan_result(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 
 	scan.sp_chan = scan.sp_bchan = chan;
 
-	if ((ic->ic_flags & IEEE80211_F_SCAN) != 0)
-		ieee80211_add_scan(ic, &scan, &wh,
-		    IEEE80211_FC0_SUBTYPE_BEACON,
-		    ind->rssi < 0 ? -ind->rssi : ind->rssi, 0);
+	/* Feed unconditionally: with F_SCAN cleared after every pass (see
+	 * aic8800u_scan_done) the flag no longer tracks the firmware scan,
+	 * and each pass must keep the cache fresh. */
+	ieee80211_add_scan(ic, &scan, &wh,
+	    IEEE80211_FC0_SUBTYPE_BEACON,
+	    ind->rssi < 0 ? -ind->rssi : ind->rssi, 0);
 }
 
 /* SM_CONNECT_IND: the firmware finished the association. */
