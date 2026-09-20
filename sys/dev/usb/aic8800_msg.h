@@ -32,6 +32,9 @@
 #ifndef _DEV_USB_AIC8800MSG_H_
 #define _DEV_USB_AIC8800MSG_H_
 
+#include <sys/types.h>
+#include <sys/cdefs.h>		/* offsetof */
+
 /*
  * AIC8800D80 lmac_msg protocol facts, transcribed from the vendor SDK
  * (os/aic8800) per the AIC8800D80 ground truth.  These are interface
@@ -206,5 +209,328 @@ struct aic8800u_patch_info {
  */
 #define AIC8800_PATCH_TBL_COUNT	3
 extern const uint32_t aic8800u_patch_tbl[AIC8800_PATCH_TBL_COUNT][2];
+
+/* ---- fullmac command ids (lmac_msg.h enums; task<<10 | index) -------- */
+
+/* MM task */
+#define AIC8800_MM_RESET_REQ		0x000
+#define AIC8800_MM_RESET_CFM		0x001
+#define AIC8800_MM_START_REQ		0x002
+#define AIC8800_MM_START_CFM		0x003
+#define AIC8800_MM_ADD_IF_REQ		0x006
+#define AIC8800_MM_ADD_IF_CFM		0x007
+#define AIC8800_MM_KEY_ADD_REQ		0x024
+#define AIC8800_MM_KEY_ADD_CFM		0x025
+#define AIC8800_MM_KEY_DEL_REQ		0x026
+#define AIC8800_MM_KEY_DEL_CFM		0x027
+
+/* SCANU task (firmware-managed scan) */
+#define AIC8800_SCANU_START_REQ		0x1000
+#define AIC8800_SCANU_START_CFM		0x1001	/* async: scan finished */
+#define AIC8800_SCANU_RESULT_IND	0x1004	/* one per BSS */
+/* the START_REQ command CFM is the ADDTIONAL id, not SCANU_START_CFM */
+#define AIC8800_SCANU_START_CFM_ADDTIONAL 0x1009
+#define AIC8800_SCANU_CANCEL_REQ	0x100a
+#define AIC8800_SCANU_CANCEL_CFM	0x100b
+
+/* ME task */
+#define AIC8800_ME_CONFIG_REQ		0x1400
+#define AIC8800_ME_CONFIG_CFM		0x1401
+#define AIC8800_ME_CHAN_CONFIG_REQ	0x1402
+#define AIC8800_ME_CHAN_CONFIG_CFM	0x1403
+#define AIC8800_ME_SET_CONTROL_PORT_REQ	0x1404
+#define AIC8800_ME_SET_CONTROL_PORT_CFM	0x1405
+
+/* SM task (firmware connection manager) */
+#define AIC8800_SM_CONNECT_REQ		0x1800
+#define AIC8800_SM_CONNECT_CFM		0x1801
+#define AIC8800_SM_CONNECT_IND		0x1802
+#define AIC8800_SM_DISCONNECT_REQ	0x1803
+#define AIC8800_SM_DISCONNECT_CFM	0x1804
+#define AIC8800_SM_DISCONNECT_IND	0x1805
+
+/* ---- shared tag types (lmac_mac.h) ---------------------------------- */
+/*
+ * The vendor message structs are NOT packed; every struct below mirrors
+ * the member order of the vendor definition, so the compiler reproduces
+ * the vendor's natural-alignment layout byte for byte (verified against
+ * a probe compiled with the vendor headers).  A CTASSERT pins each size.
+ * Multi-byte fields are little-endian on the wire.
+ */
+
+struct aic8800u_mac_addr {
+	uint16_t	a[3];		/* vendor: u16_l array[3], align 2 */
+};
+
+struct aic8800u_mac_ssid {
+	uint8_t		length;
+	uint8_t		array[32];
+};
+
+struct aic8800u_mac_chan_def {
+	uint16_t	freq;		/* MHz */
+	uint8_t		band;		/* 0 = 2.4G, 1 = 5G */
+	uint8_t		flags;		/* CHAN_* */
+	int8_t		tx_power;	/* dBm */
+};
+
+#define AIC8800_MAC_SEC_KEY_LEN	32
+struct aic8800u_mac_sec_key {
+	uint8_t		length;
+	uint32_t	array[AIC8800_MAC_SEC_KEY_LEN / 4];
+};
+
+#define AIC8800_PHY_CFG_BUF_SIZE	16
+struct aic8800u_phy_cfg_tag {
+	uint32_t	parameters[AIC8800_PHY_CFG_BUF_SIZE];
+};
+
+/* capability tags, verbatim member order from lmac_mac.h */
+#define AIC8800_MAX_MCS_LEN		16
+struct aic8800u_mac_htcapability {
+	uint16_t	ht_capa_info;
+	uint8_t		a_mpdu_param;
+	uint8_t		mcs_rate[AIC8800_MAX_MCS_LEN];
+	uint16_t	ht_extended_capa;
+	uint32_t	tx_beamforming_capa;
+	uint8_t		asel_capa;
+};
+
+struct aic8800u_mac_vhtcapability {
+	uint32_t	vht_capa_info;
+	uint16_t	rx_mcs_map;
+	uint16_t	rx_highest;
+	uint16_t	tx_mcs_map;
+	uint16_t	tx_highest;
+};
+
+#define AIC8800_HE_MAC_CAPA_LEN	6
+#define AIC8800_HE_PHY_CAPA_LEN	11
+#define AIC8800_HE_PPE_THRES_MAX_LEN	25
+struct aic8800u_mac_hecapability {
+	uint8_t		mac_cap_info[AIC8800_HE_MAC_CAPA_LEN];
+	uint8_t		phy_cap_info[AIC8800_HE_PHY_CAPA_LEN];
+	struct {
+		uint16_t	rx_mcs_80;
+		uint16_t	tx_mcs_80;
+		uint16_t	rx_mcs_160;
+		uint16_t	tx_mcs_160;
+		uint16_t	rx_mcs_80p80;
+		uint16_t	tx_mcs_80p80;
+	} mcs_supp;
+	uint8_t		ppe_thres[AIC8800_HE_PPE_THRES_MAX_LEN];
+};
+
+#define AIC8800_SCAN_SSID_MAX		3
+#define AIC8800_SCAN_CHANNEL_MAX	(14 + 28)
+#define AIC8800_SM_ASSOC_IE_LEN		800
+#define AIC8800_AC_MAX			4	/* BK, BE, VI, VO */
+
+#define AIC8800_MAC_BAND_2G4		0
+#define AIC8800_MAC_BAND_5G		1
+#define AIC8800_PHY_BW_20		0
+
+/* mac_connection_flags */
+#define AIC8800_CONNECT_CONTROL_PORT_HOST (1u << 0)
+#define AIC8800_CONNECT_CONTROL_PORT_NO_ENC (1u << 1)
+#define AIC8800_CONNECT_DISABLE_HT	(1u << 2)
+#define AIC8800_CONNECT_WPA_WPA2_IN_USE	(1u << 3)
+
+/* mac_cipher_suite */
+#define AIC8800_CIPHER_CCMP		2
+
+/* ---- command param structs ------------------------------------------ */
+
+struct aic8800u_mm_start_req {
+	struct aic8800u_phy_cfg_tag phy_cfg;
+	uint32_t	uapsd_timeout;
+	uint16_t	lp_clk_accuracy;
+};
+
+struct aic8800u_mm_add_if_req {
+	uint8_t		type;		/* 0 = STA */
+	struct aic8800u_mac_addr addr;
+	uint8_t		p2p;
+};
+
+struct aic8800u_mm_add_if_cfm {
+	uint8_t		status;
+	uint8_t		inst_nbr;
+	uint16_t	pad;
+};
+
+struct aic8800u_mm_key_add_req {
+	uint8_t		key_idx;	/* group keys only */
+	uint8_t		sta_idx;	/* pairwise: AP sta idx; group: 0xFF */
+	struct aic8800u_mac_sec_key key;
+	uint8_t		cipher_suite;
+	uint8_t		inst_nbr;
+	uint8_t		spp;
+	uint8_t		pairwise;
+};
+
+struct aic8800u_mm_key_add_cfm {
+	uint8_t		status;
+	uint8_t		hw_key_idx;
+};
+
+struct aic8800u_me_config_req {
+	struct aic8800u_mac_htcapability ht_cap;
+	struct aic8800u_mac_vhtcapability vht_cap;
+	struct aic8800u_mac_hecapability he_cap;
+	uint16_t	tx_lft;
+	uint8_t		phy_bw_max;	/* PHY_CHNL_BW_* */
+	uint8_t		ht_supp;
+	uint8_t		vht_supp;
+	uint8_t		he_supp;
+	uint8_t		he_ul_on;
+	uint8_t		ps_on;		/* power save master switch */
+	uint8_t		ant_div_on;
+	uint8_t		dpsm;
+};
+
+struct aic8800u_me_chan_config_req {
+	struct aic8800u_mac_chan_def chan2G4[14];
+	struct aic8800u_mac_chan_def chan5G[28];
+	uint8_t		chan2G4_cnt;
+	uint8_t		chan5G_cnt;
+};
+
+struct aic8800u_me_set_control_port_req {
+	uint8_t		sta_idx;
+	uint8_t		control_port_open;
+};
+
+struct aic8800u_scanu_start_req {
+	struct aic8800u_mac_chan_def chan[AIC8800_SCAN_CHANNEL_MAX];
+	struct aic8800u_mac_ssid ssid[AIC8800_SCAN_SSID_MAX];
+	struct aic8800u_mac_addr bssid;	/* all ones = wildcard */
+	uint32_t	add_ies;	/* host memory address, unused on USB */
+	uint16_t	add_ie_len;
+	uint8_t		vif_idx;
+	uint8_t		chan_cnt;
+	uint8_t		ssid_cnt;
+	uint8_t		no_cck;
+	uint32_t	duration;	/* us, 0 = firmware default dwell */
+};
+
+/* scanu_start_cfm: { vif_idx, status, result_cnt } = 3 bytes */
+
+struct aic8800u_scanu_result_ind {
+	uint16_t	length;		/* mgmt frame bytes (no FCS) */
+	uint16_t	framectrl;
+	uint16_t	center_freq;	/* MHz */
+	uint8_t		band;
+	uint8_t		sta_idx;	/* 0xFF if unknown */
+	uint8_t		inst_nbr;	/* 0xFF if unknown */
+	int8_t		rssi;		/* dBm */
+	uint32_t	payload[];	/* the complete beacon/probe-rsp frame */
+};
+
+struct aic8800u_sm_connect_req {
+	struct aic8800u_mac_ssid ssid;
+	struct aic8800u_mac_addr bssid;
+	struct aic8800u_mac_chan_def chan;	/* freq = (uint16_t)-1 if unknown */
+	uint32_t	flags;		/* AIC8800_CONNECT_* */
+	uint16_t	ctrl_port_ethertype;	/* host order 0x888e */
+	uint16_t	ie_len;
+	uint16_t	listen_interval;
+	uint8_t		dont_wait_bcmc;
+	uint8_t		auth_type;	/* 0 = open */
+	uint8_t		uapsd_queues;
+	uint8_t		vif_idx;
+	uint32_t	ie_buf[64];
+};
+
+/* sm_connect_cfm: { status } = 1 byte; 0 = procedure started */
+
+struct aic8800u_sm_connect_ind {
+	uint16_t	status_code;	/* WLAN status; 0 = connected */
+	struct aic8800u_mac_addr bssid;
+	uint8_t		roamed;
+	uint8_t		vif_idx;
+	uint8_t		ap_idx;		/* firmware STA entry for the AP */
+	uint8_t		ch_idx;
+	uint8_t		qos;
+	uint8_t		acm;
+	uint16_t	assoc_req_ie_len;
+	uint16_t	assoc_rsp_ie_len;
+	uint32_t	assoc_ie_buf[AIC8800_SM_ASSOC_IE_LEN / 4];
+	uint16_t	aid;
+	uint8_t		band;
+	uint16_t	center_freq;
+	uint8_t		width;
+	uint32_t	center_freq1;
+	uint32_t	center_freq2;
+	uint32_t	ac_param[AIC8800_AC_MAX];
+};
+
+struct aic8800u_sm_disconnect_req {
+	uint16_t	reason_code;
+	uint8_t		vif_idx;
+};
+
+/* ---- data plane (ipc_shared.h hostdesc + aicwf_usb.c framing) ------- */
+
+struct aic8800u_hostdesc {
+	uint16_t	packet_len;	/* ethernet frame bytes */
+	uint16_t	flags_ext;
+	uint32_t	status_desc_addr;	/* need_cfm: (1<<31)|slot */
+	uint8_t		eth_dest_addr[6];
+	uint8_t		eth_src_addr[6];
+	uint16_t	ethertype;
+	uint8_t		ac;		/* 0=BK 1=BE 2=VI 3=VO */
+	uint8_t		tid;		/* 0xFF if not QoS */
+	uint8_t		vif_idx;
+	uint8_t		staid;		/* 0xFF if unknown */
+	uint16_t	flags;		/* TXU_CNTRL_* : mgmt = BIT(3) */
+};
+
+#define AIC8800_TXU_CNTRL_MGMT		(1u << 3)
+
+/* TX data frame (data OUT EP):
+ *   [0..1] total length INCLUDING this 4-byte header
+ *   [2]    0x01 (data)
+ *   [3]    0x00
+ *   [4..31] hostdesc      [32..] ethernet frame (raw 802.11 for mgmt)
+ *   zero-padded to 4; a frame whose total length is a multiple of 512
+ *   gets one extra zero byte (short-packet boundary). */
+#define AIC8800_DATA_TX_BUF_MAX	2048
+
+/* RX data frame (data IN EP): one packet per transfer.
+ *   [0..1] 802.11 MPDU length (excluding the 60B hardware header)
+ *   [2]    flags byte (msg frames have bit 4 set)
+ *   [4..59] hw_rxhdr (56 bytes) + 4 pad/word-align
+ *   [60..] 802.11 MPDU
+ * status word u32 @36: decr_status = bit2..4, fcs_err = bit 8. */
+#define AIC8800_RX_MPDU_OFF		60
+#define AIC8800_RX_STATUS_OFF		36
+#define AIC8800_RX_DECR_STATUS(w)	(((w) >> 2) & 7)
+#define AIC8800_RX_FCS_ERR(w)		(((w) >> 8) & 1)
+/* decr_status values */
+#define AIC8800_DECR_UNENC		0
+#define AIC8800_DECR_CCMP128		3
+/* signed RSSI in dBm; primary at hw_rxhdr+17, fallback at +14 */
+#define AIC8800_RX_RSSI1_OFF		17
+#define AIC8800_RX_RSSI_LEG_OFF		14
+
+_Static_assert(sizeof(struct aic8800u_mac_chan_def) == 6, "chan_def");
+_Static_assert(sizeof(struct aic8800u_mac_sec_key) == 36, "sec_key");
+_Static_assert(sizeof(struct aic8800u_mm_start_req) == 72, "mm_start");
+_Static_assert(sizeof(struct aic8800u_mm_add_if_req) == 10, "mm_add_if");
+_Static_assert(sizeof(struct aic8800u_mm_key_add_req) == 44, "mm_key_add");
+_Static_assert(sizeof(struct aic8800u_me_config_req) == 112, "me_config");
+_Static_assert(sizeof(struct aic8800u_me_chan_config_req) == 254, "me_chan");
+_Static_assert(sizeof(struct aic8800u_scanu_start_req) == 376, "scanu");
+_Static_assert(sizeof(struct aic8800u_scanu_result_ind) == 12, "scanu_ind");
+_Static_assert(sizeof(struct aic8800u_sm_connect_req) == 320, "sm_connect");
+_Static_assert(sizeof(struct aic8800u_sm_connect_ind) == 852, "sm_connect_ind");
+_Static_assert(sizeof(struct aic8800u_sm_disconnect_req) == 4, "sm_disconnect");
+_Static_assert(sizeof(struct aic8800u_hostdesc) == 28, "hostdesc");
+_Static_assert(offsetof(struct aic8800u_sm_connect_ind, assoc_ie_buf) == 20,
+    "sm_connect_ind ie");
+_Static_assert(offsetof(struct aic8800u_sm_connect_ind, aid) == 820, "aid");
+_Static_assert(offsetof(struct aic8800u_scanu_start_req, bssid) == 352,
+    "scanu bssid");
 
 #endif	/* _DEV_USB_AIC8800MSG_H_ */

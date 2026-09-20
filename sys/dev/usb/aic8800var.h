@@ -33,6 +33,14 @@
 #define _DEV_USB_AIC8800VAR_H_
 
 #include <sys/mutex.h>
+#include <sys/condvar.h>
+#include <sys/callout.h>
+#include <sys/queue.h>
+#include <sys/mbuf.h>
+
+#include <net/if.h>
+#include <net/if_media.h>
+#include <net80211/ieee80211_var.h>
 
 #include <dev/usb/usbdi.h>
 
@@ -89,6 +97,29 @@ struct aic8800u_patch_table {
 	uint32_t		*data;		/* kmem_alloc'ed, len * 2 words */
 };
 
+/* worker flags (sc_flags, guarded by sc_work_mtx) */
+#define AIC8800U_F_NEWSTATE	0x01
+#define AIC8800U_F_TX		0x02
+#define AIC8800U_F_EVENT	0x04
+#define AIC8800U_F_EXIT		0x08
+#define AIC8800U_F_SCANTIMO	0x10	/* scan watchdog fired */
+
+/* pseudo event id for TX confirmations delivered through the event queue */
+#define AIC8800U_EVT_TXCFM	0xffff
+
+/* event queue entry: an unsolicited lmac_msg (or a TX CFM) for the worker */
+struct aic8800u_event {
+	TAILQ_ENTRY(aic8800u_event) ev_next;
+	uint16_t		ev_id;
+	uint8_t			*ev_data;	/* kmem'ed param copy */
+	size_t			ev_len;
+};
+
+#define AIC8800U_TXCFM_SLOTS	64	/* vendor USB_TXDESC_CNT */
+#define AIC8800U_EVTQ_MAX	128	/* bound scan-result bursts */
+
+MBUFQ_HEAD(aic8800u_txq);
+
 struct aic8800u_softc {
 	device_t		 sc_dev;
 	struct usbd_device	*sc_udev;
@@ -97,9 +128,9 @@ struct aic8800u_softc {
 	struct aic8800u_endpoints sc_ep;
 
 	/*
-	 * Synchronous lmac_msg command channel (the loader issues one
-	 * command at a time and waits for its CFM, exactly like the
-	 * vendor command manager in firmware-download phase).
+	 * Synchronous lmac_msg command channel.  BROM: the loader issues
+	 * one command at a time and reads CFM frames itself.  APP: the
+	 * command is posted here and the evt thread matches the CFM.
 	 */
 	struct usbd_pipe	*sc_cmd_pipe;	/* command OUT */
 	struct usbd_pipe	*sc_evt_pipe;	/* event/CFM IN */
@@ -109,15 +140,95 @@ struct aic8800u_softc {
 	uint8_t			*sc_evt_buf;	/* AIC8800_RX_BUF_MAX */
 	bool			 sc_transport_ready;
 
+	/*
+	 * APP command-wait state (sc_cmd_mtx).  Exactly one command may
+	 * be in flight; the evt thread fills sc_cmd_cfm_buf and signals
+	 * sc_cmd_cv when the CFM with sc_cmd_cfm_id arrives.
+	 */
+	kmutex_t		 sc_cmd_mtx;
+	kcondvar_t		 sc_cmd_cv;
+	bool			 sc_cmd_active;
+	uint16_t		 sc_cmd_cfm_id;
+	void			*sc_cmd_cfm_buf;
+	size_t			 sc_cmd_cfm_len;
+	int			 sc_cmd_error;
+
+	/*
+	 * Data endpoints (APP only).  Data OUT carries data/mgmt frames,
+	 * data IN delivers received MPDUs behind a 60-byte hardware
+	 * header (aic8800_msg.h for the framing).
+	 */
+	struct usbd_pipe	*sc_data_out_pipe;
+	struct usbd_pipe	*sc_data_in_pipe;
+	struct usbd_xfer	*sc_tx_xfer;
+	struct usbd_xfer	*sc_rx_xfer;
+	uint8_t			*sc_tx_buf;	/* AIC8800_DATA_TX_BUF_MAX */
+	uint8_t			*sc_rx_buf;	/* AIC8800_RX_BUF_MAX */
+	bool			 sc_data_ready;
+
+	/* transport threads (APP only; self-clear their lwp pointers) */
+	lwp_t			*sc_evt_lwp;
+	lwp_t			*sc_rx_lwp;
+	bool			 sc_app_started;
+
+	/*
+	 * net80211 front end (APP).  The worker follows the rtw8189f
+	 * pattern: ic_newstate only snapshots and the worker drives the
+	 * chip; everything sleeps on USB, the state machine runs at
+	 * splnet from the worker.
+	 */
+	struct ifnet		 sc_if;
+	struct ieee80211com	 sc_ic;
+	int			(*sc_newstate)(struct ieee80211com *,
+				    enum ieee80211_state, int);
+	uint8_t			 sc_mac_addr[IEEE80211_ADDR_LEN];
+
+	kmutex_t		 sc_work_mtx;	/* IPL_NET */
+	kcondvar_t		 sc_cv;
+	uint32_t		 sc_flags;
+	enum ieee80211_state	 sc_nstate;
+	int			 sc_narg;
+	lwp_t			*sc_worker;
+	struct callout		 sc_scan_to;	/* firmware scan watchdog */
+	struct aic8800u_txq	 sc_txq;
+
+	/* firmware events from the evt thread to the worker */
+	kmutex_t		 sc_evtq_mtx;
+	TAILQ_HEAD(, aic8800u_event) sc_evtq;
+	unsigned		 sc_evtq_count;
+
+	/* firmware runtime state */
+	uint8_t			 sc_vif_idx;	/* MM_ADD_IF result */
+	int			 sc_ap_idx;	/* -1 = not connected */
+	uint16_t		 sc_aid;
+	bool			 sc_connected;
+	bool			 sc_scanning;	/* firmware scan in flight */
+
+	/* need_cfm TX bookkeeping (EAPOL / management frames) */
+	struct mbuf		*sc_txcfm_m[AIC8800U_TXCFM_SLOTS];
+	unsigned		 sc_txcfm_free;
+	unsigned		 sc_txcfm_used;
+	uint32_t		 sc_txcfm_acked;
+	uint32_t		 sc_txcfm_retried;
+	uint32_t		 sc_txcfm_lost;
+
+	/* diagnostics */
+	uint32_t		 sc_rx_frames;
+	uint32_t		 sc_rx_fcserr;
+	uint32_t		 sc_rx_decrerr;
+	uint32_t		 sc_rx_amsdu;
+	uint32_t		 sc_mgmt_dropped;
+	uint32_t		 sc_evtq_dropped;
+
 	/* loader progress */
 	uint32_t		 sc_chip_id;
 	uint32_t		 sc_fw_version;
 
 	/*
-	 * Bring-up thread lifecycle.  The thread self-clears
-	 * sc_bringup_lwp before kthread_exit(); whoever observes the
-	 * other side gone (detached / thread exited) tears the
-	 * transport down (rtw8189f stop() deadlock lesson).
+	 * Bring-up thread lifecycle.  Threads self-clear their lwp
+	 * pointer before kthread_exit(); whoever observes the other side
+	 * gone (detached / thread exited) tears the transport down
+	 * (rtw8189f stop() deadlock lesson).
 	 */
 	kmutex_t		 sc_load_mtx;
 	lwp_t			*sc_bringup_lwp;
@@ -133,6 +244,15 @@ void	aic8800u_transport_fini(struct aic8800u_softc *);
 int	aic8800u_cmd(struct aic8800u_softc *, uint16_t id, uint16_t dest_id,
 	    uint16_t src_id, const void *param, size_t param_len,
 	    void *cfm, size_t cfm_len);
+int	aic8800u_cmd_cfm(struct aic8800u_softc *, uint16_t id, uint16_t dest_id,
+	    uint16_t src_id, const void *param, size_t param_len,
+	    uint16_t cfm_id, void *cfm, size_t cfm_len);
+int	aic8800u_data_write(struct aic8800u_softc *, size_t len);
+int	aic8800u_threads_start(struct aic8800u_softc *);
+size_t	aic8800u_evt_dequeue(struct aic8800u_softc *,
+	    struct aic8800u_event **);
+void	aic8800u_evt_release(struct aic8800u_softc *,
+	    struct aic8800u_event *);
 int	aic8800u_dbg_read32(struct aic8800u_softc *, uint32_t addr,
 	    uint32_t *val);
 int	aic8800u_dbg_write32(struct aic8800u_softc *, uint32_t addr,
@@ -145,5 +265,13 @@ int	aic8800u_start_app(struct aic8800u_softc *, uint32_t boot_addr);
 const char *aic8800u_personality_name(enum aic8800u_personality);
 bool	aic8800u_firmware_available(struct aic8800u_softc *);
 void	aic8800u_fw_download(struct aic8800u_softc *);
+int	aic8800u_fw_init(struct aic8800u_softc *);
+int	aic8800u_scan_start(struct aic8800u_softc *, const uint8_t *ssid,
+	    size_t ssid_len);
+int	aic8800u_connect(struct aic8800u_softc *, struct ieee80211_node *);
+void	aic8800u_disconnect(struct aic8800u_softc *);
+int	aic8800u_key_add(struct aic8800u_softc *, const uint8_t *key,
+	    size_t key_len, unsigned key_idx, bool pairwise);
+void	aic8800u_control_port(struct aic8800u_softc *, bool open);
 
 #endif	/* _DEV_USB_AIC8800VAR_H_ */

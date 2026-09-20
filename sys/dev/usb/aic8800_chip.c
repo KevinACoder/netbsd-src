@@ -57,6 +57,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/endian.h>
 #include <sys/kmem.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
@@ -637,4 +638,260 @@ out:
 		aprint_error_dev(sc->sc_dev, "firmware download failed (%d)\n",
 		    error);
 	aic8800u_patch_table_free(head);
+}
+
+/* ------------------------------------------------------------------ */
+/* App-runtime command wrappers (M2+)                                  */
+/* ------------------------------------------------------------------ */
+
+/* The channel set we announce to the firmware: 2.4 GHz 1-13, 5 GHz the
+ * common non-weather channels.  tx_power 20 dBm; the firmware clamps. */
+static const uint16_t aic8800u_chan_5g[] = {
+	36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120,
+	124, 128, 132, 136, 140, 149, 153, 157, 161, 165,
+};
+
+static void
+aic8800u_fill_chan(struct aic8800u_mac_chan_def *c, uint16_t freq)
+{
+
+	memset(c, 0, sizeof(*c));
+	c->freq = htole16(freq);
+	c->band = freq < 4000 ? AIC8800_MAC_BAND_2G4 : AIC8800_MAC_BAND_5G;
+	c->tx_power = 20;
+}
+
+/*
+ * Firmware bring-up after the app personality attached: reset, ME
+ * configuration (power save off, legacy rates only -- net80211 here has
+ * no HT), channel table, interface, start.  Mirrors the vendor
+ * registration + open sequence (rwnx_cfg80211_init / rwnx_open).
+ */
+int
+aic8800u_fw_init(struct aic8800u_softc *sc)
+{
+	struct aic8800u_mm_start_req start;
+	struct aic8800u_mm_add_if_req addif;
+	struct aic8800u_mm_add_if_cfm addcfm;
+	struct aic8800u_me_config_req cfg;
+	struct aic8800u_me_chan_config_req chans;
+	uint8_t vercfm[16];
+	unsigned i;
+	int error;
+
+	/* MM_RESET */
+	error = aic8800u_cmd(sc, AIC8800_MM_RESET_REQ, AIC8800_TASK_MM,
+	    AIC8800_DRV_TASK_ID, NULL, 0, NULL, 0);
+	if (error != 0)
+		return error;
+
+	/* MM_VERSION (informational) */
+	error = aic8800u_cmd(sc, 0x004 /* MM_VERSION_REQ */, AIC8800_TASK_MM,
+	    AIC8800_DRV_TASK_ID, NULL, 0, vercfm, sizeof(vercfm));
+	if (error == 0)
+		aprint_normal_dev(sc->sc_dev,
+		    "fw version %08x lmac %08x\n",
+		    le32dec(&vercfm[8]), le32dec(&vercfm[0]));
+
+	/* ME_CONFIG: legacy 20MHz STA, power save off */
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.ps_on = 0;
+	cfg.dpsm = 0;
+	cfg.phy_bw_max = AIC8800_PHY_BW_20;
+	error = aic8800u_cmd(sc, AIC8800_ME_CONFIG_REQ, AIC8800_TASK_ME,
+	    AIC8800_DRV_TASK_ID, &cfg, sizeof(cfg), NULL, 0);
+	if (error != 0)
+		return error;
+
+	/* ME_CHAN_CONFIG */
+	memset(&chans, 0, sizeof(chans));
+	for (i = 0; i < 13; i++)
+		aic8800u_fill_chan(&chans.chan2G4[i], 2412 + 5 * i);
+	chans.chan2G4_cnt = 13;
+	for (i = 0; i < __arraycount(aic8800u_chan_5g); i++)
+		aic8800u_fill_chan(&chans.chan5G[i], aic8800u_chan_5g[i]);
+	chans.chan5G_cnt = __arraycount(aic8800u_chan_5g);
+	error = aic8800u_cmd(sc, AIC8800_ME_CHAN_CONFIG_REQ, AIC8800_TASK_ME,
+	    AIC8800_DRV_TASK_ID, &chans, sizeof(chans), NULL, 0);
+	if (error != 0)
+		return error;
+
+	/* MM_ADD_IF: our STA interface; the CFM hands back the vif index */
+	memset(&addif, 0, sizeof(addif));
+	addif.type = 0;		/* MM_STA */
+	memcpy(addif.addr.a, sc->sc_mac_addr, sizeof(addif.addr.a));
+	memset(&addcfm, 0, sizeof(addcfm));
+	error = aic8800u_cmd(sc, AIC8800_MM_ADD_IF_REQ, AIC8800_TASK_MM,
+	    AIC8800_DRV_TASK_ID, &addif, sizeof(addif), &addcfm,
+	    sizeof(addcfm));
+	if (error != 0)
+		return error;
+	if (addcfm.status != 0) {
+		aprint_error_dev(sc->sc_dev, "add_if status %u\n",
+		    addcfm.status);
+		return EIO;
+	}
+	sc->sc_vif_idx = addcfm.inst_nbr;
+
+	/* MM_START */
+	memset(&start, 0, sizeof(start));
+	error = aic8800u_cmd(sc, AIC8800_MM_START_REQ, AIC8800_TASK_MM,
+	    AIC8800_DRV_TASK_ID, &start, sizeof(start), NULL, 0);
+	if (error != 0)
+		return error;
+
+	aprint_normal_dev(sc->sc_dev,
+	    "fw init done: vif %u, %u + %u channels\n",
+	    sc->sc_vif_idx, chans.chan2G4_cnt, chans.chan5G_cnt);
+	return 0;
+}
+
+/*
+ * One firmware scan over the whole channel set.  The command answers
+ * with SCANU_START_CFM_ADDTIONAL; results arrive as SCANU_RESULT_IND
+ * events and the async SCANU_START_CFM (0x1001) marks the end.
+ */
+int
+aic8800u_scan_start(struct aic8800u_softc *sc, const uint8_t *ssid,
+    size_t ssid_len)
+{
+	struct aic8800u_scanu_start_req req;
+	struct aic8800u_mac_ssid *ssid_p;
+	unsigned i;
+	uint8_t cfm[3];
+	int error;
+
+	memset(&req, 0, sizeof(req));
+	for (i = 0; i < 13; i++)
+		aic8800u_fill_chan(&req.chan[i], 2412 + 5 * i);
+	for (i = 0; i < __arraycount(aic8800u_chan_5g); i++)
+		aic8800u_fill_chan(&req.chan[13 + i], aic8800u_chan_5g[i]);
+	req.chan_cnt = 13 + __arraycount(aic8800u_chan_5g);
+
+	memset(req.bssid.a, 0xff, sizeof(req.bssid.a));
+
+	if (ssid != NULL && ssid_len > 0 && ssid_len <= 32) {
+		ssid_p = &req.ssid[0];
+		ssid_p->length = ssid_len;
+		memcpy(ssid_p->array, ssid, ssid_len);
+		req.ssid_cnt = 1;
+	}
+
+	req.vif_idx = sc->sc_vif_idx;
+
+	error = aic8800u_cmd_cfm(sc, AIC8800_SCANU_START_REQ,
+	    AIC8800_TASK_SCANU, AIC8800_DRV_TASK_ID, &req, sizeof(req),
+	    AIC8800_SCANU_START_CFM_ADDTIONAL, cfm, sizeof(cfm));
+	if (error != 0)
+		return error;
+
+	if (cfm[1] != 0) {
+		aprint_error_dev(sc->sc_dev, "scanu start status %u\n",
+		    cfm[1]);
+		return EIO;
+	}
+	return 0;
+}
+
+/*
+ * Firmware-SME connection: the firmware performs open-system auth and
+ * association; completion arrives as SM_CONNECT_IND.
+ */
+int
+aic8800u_connect(struct aic8800u_softc *sc, struct ieee80211_node *ni)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct aic8800u_sm_connect_req req;
+	uint8_t cfm[1];
+	int error;
+
+	memset(&req, 0, sizeof(req));
+
+	if (ni->ni_esslen > 0 && ni->ni_esslen <= 32) {
+		req.ssid.length = ni->ni_esslen;
+		memcpy(req.ssid.array, ni->ni_essid, ni->ni_esslen);
+	}
+	memcpy(req.bssid.a, ni->ni_bssid, sizeof(req.bssid.a));
+	if (ni->ni_chan != IEEE80211_CHAN_ANYC && ni->ni_chan->ic_freq != 0)
+		aic8800u_fill_chan(&req.chan, ni->ni_chan->ic_freq);
+	else
+		req.chan.freq = htole16((uint16_t)-1);
+
+	req.flags = htole32(AIC8800_CONNECT_CONTROL_PORT_HOST);
+	if ((ic->ic_flags & IEEE80211_F_WPA) != 0)
+		req.flags |= htole32(AIC8800_CONNECT_WPA_WPA2_IN_USE);
+	req.ctrl_port_ethertype = htole16(0x888e);
+	req.auth_type = 0;	/* open */
+	req.uapsd_queues = 0;
+	req.vif_idx = sc->sc_vif_idx;
+
+	error = aic8800u_cmd(sc, AIC8800_SM_CONNECT_REQ, AIC8800_TASK_SM,
+	    AIC8800_DRV_TASK_ID, &req, sizeof(req), cfm, sizeof(cfm));
+	if (error != 0)
+		return error;
+
+	if (cfm[0] != 0) {
+		aprint_error_dev(sc->sc_dev, "sm_connect status %u\n", cfm[0]);
+		return EIO;
+	}
+	return 0;
+}
+
+void
+aic8800u_disconnect(struct aic8800u_softc *sc)
+{
+	struct aic8800u_sm_disconnect_req req;
+	uint8_t cfm[1];
+
+	memset(&req, 0, sizeof(req));
+	req.reason_code = htole16(3);	/* WLAN_REASON_DEAUTH_LEAVING */
+	req.vif_idx = sc->sc_vif_idx;
+	(void)aic8800u_cmd(sc, AIC8800_SM_DISCONNECT_REQ, AIC8800_TASK_SM,
+	    AIC8800_DRV_TASK_ID, &req, sizeof(req), cfm, sizeof(cfm));
+}
+
+int
+aic8800u_key_add(struct aic8800u_softc *sc, const uint8_t *key,
+    size_t key_len, unsigned key_idx, bool pairwise)
+{
+	struct aic8800u_mm_key_add_req req;
+	struct aic8800u_mm_key_add_cfm cfm;
+	int error;
+
+	if (key_len == 0 || key_len > 32)
+		return EINVAL;
+
+	memset(&req, 0, sizeof(req));
+	req.key_idx = key_idx;
+	req.sta_idx = pairwise ? sc->sc_ap_idx : 0xff;
+	req.key.length = key_len;
+	memcpy(req.key.array, key, key_len);
+	req.cipher_suite = AIC8800_CIPHER_CCMP;
+	req.inst_nbr = sc->sc_vif_idx;
+	req.pairwise = pairwise;
+
+	memset(&cfm, 0, sizeof(cfm));
+	error = aic8800u_cmd(sc, AIC8800_MM_KEY_ADD_REQ, AIC8800_TASK_MM,
+	    AIC8800_DRV_TASK_ID, &req, sizeof(req), &cfm, sizeof(cfm));
+	if (error != 0)
+		return error;
+	if (cfm.status != 0) {
+		aprint_error_dev(sc->sc_dev, "key add (pairwise %d) status"
+		    " %u\n", pairwise, cfm.status);
+		return EIO;
+	}
+	return 0;
+}
+
+void
+aic8800u_control_port(struct aic8800u_softc *sc, bool open)
+{
+	struct aic8800u_me_set_control_port_req req;
+
+	memset(&req, 0, sizeof(req));
+	req.sta_idx = sc->sc_ap_idx;
+	req.control_port_open = open;
+	(void)aic8800u_cmd(sc, AIC8800_ME_SET_CONTROL_PORT_REQ,
+	    AIC8800_TASK_ME, AIC8800_DRV_TASK_ID, &req, sizeof(req),
+	    NULL, 0);
 }
