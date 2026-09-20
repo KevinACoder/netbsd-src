@@ -418,6 +418,10 @@ aic8800u_app_attach(struct aic8800u_softc *sc)
 	ifp->if_percpuq = if_percpuq_create(ifp);
 	if_register(ifp);
 
+	/* the rx thread gates on this; release it only once the ifnet is
+	 * fully registered */
+	sc->sc_if_attached = true;
+
 	if_set_sadl(ifp, sc->sc_mac_addr, IEEE80211_ADDR_LEN, false);
 	memcpy(ic->ic_myaddr, sc->sc_mac_addr, IEEE80211_ADDR_LEN);
 
@@ -940,15 +944,42 @@ aic8800u_scan_done(struct aic8800u_softc *sc)
 }
 
 /*
+ * Copy one wire TLV into a fixed-size local buffer, clamping the body to
+ * the buffer capacity.  ieee80211_add_scan()/ieee80211_setup_rates() copy
+ * out of the scanparams with no length validation of their own -- the
+ * normal RX path clamps through IEEE80211_VERIFY_ELEMENT() before they
+ * ever see a frame -- so a raw wire TLV must never be handed to them.
+ */
+static uint8_t *
+aic8800u_tlv_copy(uint8_t *dst, size_t cap, const uint8_t *ie)
+{
+	size_t len = uimin((size_t)ie[1], cap - 2);
+
+	dst[0] = ie[0];
+	dst[1] = (uint8_t)len;
+	memcpy(&dst[2], &ie[2], len);
+	return dst;
+}
+
+/*
  * One SCANU_RESULT_IND: feed the BSS straight into the scan cache
  * (the bwfm(4) model).  The result carries the complete beacon frame;
- * parse its fixed fields and IEs into a scanparams.
+ * parse its fixed fields and IEs into a scanparams.  Everything the
+ * scanparams points at is a clamped local copy: the event body is only
+ * as trustworthy as the transfer it arrived in (truncation and stale
+ * tail bytes are real, see aic8800u_app_dispatch()).
  */
 static void
 aic8800u_scan_result(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	const struct aic8800u_scanu_result_ind *ind;
+	static uint8_t zero_ssid_tlv[2] = { IEEE80211_ELEMID_SSID, 0 };
+	static uint8_t zero_rates_tlv[2] = { IEEE80211_ELEMID_RATES, 0 };
+	uint8_t ssid_tlv[2 + IEEE80211_NWID_LEN];
+	uint8_t rates_tlv[2 + IEEE80211_RATE_MAXSIZE];
+	uint8_t xrates_tlv[2 + IEEE80211_RATE_MAXSIZE];
+	uint8_t tim_tlv[2 + 4];		/* add_scan reads count/period */
 	struct ieee80211_frame wh;
 	struct ieee80211_scanparams scan;
 	uint8_t *frame, *frm, *efrm, *sfrm;
@@ -980,6 +1011,10 @@ aic8800u_scan_result(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 
 	chan = ieee80211_mhz2ieee(le16toh(ind->center_freq),
 	    le16toh(ind->center_freq) > 4000 ? IEEE80211_CHAN_5GHZ : 0);
+	if (chan == 0 || isclr(ic->ic_chan_active, chan)) {
+		sc->sc_scan_clamped++;
+		return;
+	}
 
 	sfrm = frame + 36;		/* past tstamp/bintval/capinfo */
 	for (frm = sfrm; frm + 1 < efrm; frm += 2 + frm[1]) {
@@ -987,39 +1022,54 @@ aic8800u_scan_result(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 			break;
 		switch (frm[0]) {
 		case IEEE80211_ELEMID_SSID:
-			scan.sp_ssid = frm;
+			scan.sp_ssid = aic8800u_tlv_copy(ssid_tlv,
+			    sizeof(ssid_tlv), frm);
 			break;
 		case IEEE80211_ELEMID_RATES:
-			scan.sp_rates = frm;
+			scan.sp_rates = aic8800u_tlv_copy(rates_tlv,
+			    sizeof(rates_tlv), frm);
 			break;
 		case IEEE80211_ELEMID_DSPARMS:
-			if (frm[1] == 1)
+			if (frm[1] == 1 && frm[2] != 0)
 				chan = frm[2];
 			break;
 		case IEEE80211_ELEMID_TIM:
-			scan.sp_tim = frm;
-			scan.sp_timoff = frm - sfrm;
+			/* add_scan reads tim_count/tim_period behind the
+			 * IE header unconditionally; only offer a TIM of
+			 * the length the RX path would have verified. */
+			if (frm[1] >= 4) {
+				scan.sp_tim = aic8800u_tlv_copy(tim_tlv,
+				    sizeof(tim_tlv), frm);
+				scan.sp_timoff = frm - sfrm;
+			}
 			break;
 		case IEEE80211_ELEMID_XRATES:
-			scan.sp_xrates = frm;
+			scan.sp_xrates = aic8800u_tlv_copy(xrates_tlv,
+			    sizeof(xrates_tlv), frm);
 			break;
 		case IEEE80211_ELEMID_ERP:
 			if (frm[1] == 1)
 				scan.sp_erp = frm[2];
 			break;
 		case IEEE80211_ELEMID_RSN:
-			scan.sp_wpa = frm;
+			scan.sp_wpa = frm;	/* saveie() copies in-call */
 			break;
 		case IEEE80211_ELEMID_COUNTRY:
-			scan.sp_country = frm;
+			scan.sp_country = frm;	/* not copied by add_scan */
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (frm[1] > 5 && frm[2] == 0x00 && frm[3] == 0x50 &&
 			    frm[4] == 0xf2 && frm[5] == 2)
-				scan.sp_wme = frm;
+				scan.sp_wme = frm;	/* saveie() copies */
 			break;
 		}
 	}
+
+	/* add_scan()/setup_rates() dereference these unconditionally. */
+	if (scan.sp_ssid == NULL)
+		scan.sp_ssid = zero_ssid_tlv;
+	if (scan.sp_rates == NULL)
+		scan.sp_rates = zero_rates_tlv;
 
 	scan.sp_chan = scan.sp_bchan = chan;
 
@@ -1218,7 +1268,8 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 	body_off = hdr_len + ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0 ? 8 : 0);
 
 	if (m->m_pkthdr.len < (int)(body_off + 8) ||
-	    m->m_pkthdr.len > (int)(body_off + 8 + MCLBYTES)) {
+	    m->m_pkthdr.len > (int)(body_off + 8 + AIC8800_DATA_TX_BUF_MAX -
+	    4 - sizeof(*desc) - 14 - 8)) {
 		if_statinc(ifp, if_oerrors);
 		ieee80211_free_node(ni);
 		m_freem(m);

@@ -424,10 +424,18 @@ aic8800u_scan_evt_buf(struct aic8800u_softc *sc, uint32_t count,
 		if (pkt_len == 0)
 			break;
 
+		/* a frame past the end of the transfer is a truncation */
+		if (off + 4 + pkt_len > count)
+			break;
+
 		if ((buf[off + 2] & AIC8800_USB_TYPE_CFG) == AIC8800_USB_TYPE_CFG &&
 		    type == AIC8800_USB_TYPE_CFG_CMD_RSP) {
+			if (pkt_len < 12)
+				break;
 			msg_id = buf[off + 4] | (buf[off + 5] << 8);
 			msg_param_len = buf[off + 10] | (buf[off + 11] << 8);
+			if (msg_param_len > pkt_len - 12)
+				msg_param_len = pkt_len - 12;
 
 			if (msg_id == cfm_id) {
 				size_t copy = msg_param_len;
@@ -533,30 +541,50 @@ aic8800u_app_dispatch(struct aic8800u_softc *sc, uint32_t count)
 		if (pkt_len == 0)
 			break;
 
+		/*
+		 * A frame claiming more than this transfer holds is a
+		 * truncation: everything from here on is stale content of
+		 * an earlier transfer.  Never parse or queue it -- stale
+		 * TLVs with garbage lengths are how the heap gets smashed
+		 * downstream (ieee80211_add_scan trusts its caller).
+		 */
+		if (off + 4 + pkt_len > count) {
+			sc->sc_evt_trunc++;
+			break;
+		}
+
 		if ((buf[off + 2] & AIC8800_USB_TYPE_CFG) == AIC8800_USB_TYPE_CFG &&
 		    type == AIC8800_USB_TYPE_CFG_CMD_RSP) {
 			bool taken = false;
 
-			msg_id = buf[off + 4] | (buf[off + 5] << 8);
-			msg_param_len = buf[off + 10] | (buf[off + 11] << 8);
+			if (pkt_len >= 12) {
+				msg_id = buf[off + 4] | (buf[off + 5] << 8);
+				msg_param_len = buf[off + 10] |
+				    (buf[off + 11] << 8);
+				/* the param lives at frame offset 12; the
+				 * claim must fit inside the received frame */
+				if (msg_param_len > pkt_len - 12)
+					msg_param_len = pkt_len - 12;
 
-			mutex_enter(&sc->sc_cmd_mtx);
-			if (sc->sc_cmd_active && msg_id == sc->sc_cmd_cfm_id) {
-				size_t copy = uimin(msg_param_len,
-				    sc->sc_cmd_cfm_len);
+				mutex_enter(&sc->sc_cmd_mtx);
+				if (sc->sc_cmd_active &&
+				    msg_id == sc->sc_cmd_cfm_id) {
+					size_t copy = uimin(msg_param_len,
+					    sc->sc_cmd_cfm_len);
 
-				if (copy > 0 && sc->sc_cmd_cfm_buf != NULL)
-					memcpy(sc->sc_cmd_cfm_buf,
-					    &buf[off + 16], copy);
-				sc->sc_cmd_active = false;
-				cv_broadcast(&sc->sc_cmd_cv);
-				taken = true;
+					if (copy > 0 && sc->sc_cmd_cfm_buf != NULL)
+						memcpy(sc->sc_cmd_cfm_buf,
+						    &buf[off + 16], copy);
+					sc->sc_cmd_active = false;
+					cv_broadcast(&sc->sc_cmd_cv);
+					taken = true;
+				}
+				mutex_exit(&sc->sc_cmd_mtx);
+
+				if (!taken)
+					aic8800u_evt_enqueue(sc, msg_id,
+					    &buf[off + 16], msg_param_len);
 			}
-			mutex_exit(&sc->sc_cmd_mtx);
-
-			if (!taken)
-				aic8800u_evt_enqueue(sc, msg_id, &buf[off + 16],
-				    msg_param_len);
 		} else if (type == AIC8800_USB_TYPE_CFG_DATA_CFM) {
 			/* TX confirmation: 8-byte {status, used_idx} */
 			if (pkt_len >= 8)
@@ -614,6 +642,12 @@ aic8800u_rx_frame(struct aic8800u_softc *sc, uint32_t count)
 	size_t hdr_len;
 	int8_t rssi1, rssileg;
 	int rssi, s;
+
+	/* the rx thread runs from before ieee80211_ifattach (the fw_init
+	 * command chain needs the evt thread earlier still); frames that
+	 * sneak in before the interface exists have nowhere to go */
+	if (!sc->sc_if_attached)
+		return;
 
 	if (buf[2] & 0x10)		/* msg frame on the wrong endpoint */
 		return;

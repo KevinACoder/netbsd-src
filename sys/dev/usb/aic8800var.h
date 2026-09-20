@@ -170,6 +170,7 @@ struct aic8800u_softc {
 	lwp_t			*sc_evt_lwp;
 	lwp_t			*sc_rx_lwp;
 	bool			 sc_app_started;
+	bool			 sc_if_attached;	/* rx gate, see below */
 
 	/*
 	 * net80211 front end (APP).  The worker follows the rtw8189f
@@ -219,6 +220,8 @@ struct aic8800u_softc {
 	uint32_t		 sc_rx_amsdu;
 	uint32_t		 sc_mgmt_dropped;
 	uint32_t		 sc_evtq_dropped;
+	uint32_t		 sc_evt_trunc;	/* frame claimed past the URB */
+	uint32_t		 sc_scan_clamped;	/* TLVs clamped/dropped */
 
 	/* loader progress */
 	uint32_t		 sc_chip_id;
