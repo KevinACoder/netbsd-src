@@ -89,10 +89,3 @@ options 	NFS_BOOT_RWSIZE=32768
 options 	RTW8189F_DEBUG
 rtw8189f*	at sdmmc?
 
-# --- heap corruption hunt (aic8800u M2 round 2, 2026-09-20): a roaming
-# overflow smashes random net80211/ifnet structures (urtwn0 ic, aic8800u0
-# if_flags) every boot.  Red zones + poison make the corrupter panic at
-# its own kmem free.  Remove once the guilty site is fixed.
-options 	DIAGNOSTIC	# implies KMEM_SIZE (wrong-size free checks)
-options 	KMEM_REDZONE
-options 	KMEM_POISON
