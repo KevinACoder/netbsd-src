@@ -658,6 +658,16 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc,
 		if (ostate != nstate) {
 			rtw8189f_set_channel(sc,
 			    ieee80211_chan2ieee(ic, ic->ic_curchan));
+			if (ic->ic_opmode == IEEE80211_M_MONITOR) {
+				/* Monitor capture: RCR_DEFAULT keeps the CBSSID
+				 * bits set and no BSSID is programmed in
+				 * monitor mode, so the MAC would drop every
+				 * frame.  Widen like a scan window and leave
+				 * the filter that way (net80211 routes monitor
+				 * frames to bpf). */
+				rtw8189f_scan_rx_fltr(sc, true);
+				break;
+			}
 			/* Program the BSSID before AUTH too: the unwidened
 			 * filter re-enables BSSID checking and the auth
 			 * response must pass it (vendor joins with the
