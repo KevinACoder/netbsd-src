@@ -94,9 +94,76 @@ int aic8800u_dbg_payload_mode;
  * length.  0 disables the padding (diagnostic only).
  */
 int aic8800u_dbg_min_tx = AIC8800U_TX_MIN_PAYLOAD;
+/*
+ * The firmware decrypts CCMP, so every received data frame reaches the
+ * host without a host-visible key; net80211's F_DROPUNENC policy (which
+ * wpa_supplicant sets on every WPA association) then discards all of
+ * them -- EAPOL passes through the PAE exemption, so the 4-way completes
+ * and only the data plane dies.  By default the driver takes the policy
+ * over (see aic8800u_ioctl / aic8800u_rx_frame).  Set to 1 to leave the
+ * flag on the ieee80211com untouched: repro/closure A/B runs only.
+ */
+int aic8800u_dbg_driver_dropunenc;
+/* print the first N received data frames (0 = off) */
+int aic8800u_dbg_rx_debug;
+/* print the first N submitted data frames (0 = off) */
+int aic8800u_dbg_tx_debug;
+/*
+ * Request a TX confirmation for NON-EAPOL data frames too.  Diagnostic
+ * only: data traffic is acked by the AP at L2, not by the firmware, and
+ * at load rates the 64 CFM slots are the bottleneck -- keep it off for
+ * iperf runs.  Useful to tell "frame never left the chip" from "AP
+ * rejected/re-tried it" for ARP/ICMP.
+ */
+int aic8800u_dbg_cfm_all;
+
+/* the single board instance, for the hw.aic8800.stats handler */
+static struct aic8800u_softc *aic8800u_dbg_sc;
+
+static int
+aic8800u_dbg_stats_sysctl(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	struct aic8800u_softc *sc = aic8800u_dbg_sc;
+	struct ieee80211com *ic;
+	char buf[640];
+	int error;
+
+	if (sc == NULL)
+		return ENXIO;
+	ic = &sc->sc_ic;
+
+	snprintf(buf, sizeof(buf),
+	    "rx_frames=%u rx_fcserr=%u rx_decrerr=%u rx_decrypted=%u "
+	    "rx_unenc_drop=%u\n"
+	    "tx_frames=%u tx_errors=%u mgmt_dropped=%u evtq_dropped=%u "
+	    "evt_trunc=%u scan_clamped=%u\n"
+	    "txcfm: submitted=%u acked=%u retried=%u lost=%u last_used=%u\n"
+	    "key: ptk=%u gtk=%u fail=%u cp_open=%u cp_fail=%u cp_state=%d\n"
+	    "ic: flags=%#x state=%d def_txkey=%d dropunenc_req=%d\n",
+	    sc->sc_rx_frames, sc->sc_rx_fcserr, sc->sc_rx_decrerr,
+	    sc->sc_rx_decrypted, sc->sc_rx_unenc_drop,
+	    sc->sc_tx_frames, sc->sc_tx_errors, sc->sc_mgmt_dropped,
+	    sc->sc_evtq_dropped, sc->sc_evt_trunc, sc->sc_scan_clamped,
+	    sc->sc_txcfm_submitted, sc->sc_txcfm_acked, sc->sc_txcfm_retried,
+	    sc->sc_txcfm_lost, sc->sc_txcfm_last_used,
+	    sc->sc_key_ptk, sc->sc_key_gtk, sc->sc_key_fail,
+	    sc->sc_cp_open, sc->sc_cp_fail, sc->sc_cp_state,
+	    ic->ic_flags, ic->ic_state, ic->ic_def_txkey,
+	    sc->sc_dropunenc);
+
+	node = *rnode;
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error != 0 || newp == NULL)
+		return error;
+
+	return 0;
+}
 
 void
-aic8800u_dbg_sysctl_init(void)
+aic8800u_dbg_sysctl_init(struct aic8800u_softc *sc)
 {
 	const struct sysctlnode *rnode, *cnode;
 	static int done;
@@ -104,6 +171,8 @@ aic8800u_dbg_sysctl_init(void)
 
 	if (done)
 		return;
+
+	aic8800u_dbg_sc = sc;
 
 	error = sysctl_createv(NULL, 0, NULL, &rnode,
 	    0, CTLTYPE_NODE, "aic8800",
@@ -149,6 +218,48 @@ aic8800u_dbg_sysctl_init(void)
 	    "minimum descriptor packet_len; short frames are padded (0 = off)"),
 	    NULL, 0, &aic8800u_dbg_min_tx,
 	    sizeof(aic8800u_dbg_min_tx), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "driver_dropunenc", SYSCTL_DESCR(
+	    "1 = leave F_DROPUNENC to net80211 (A/B only); 0 = driver owns it"),
+	    NULL, 0, &aic8800u_dbg_driver_dropunenc,
+	    sizeof(aic8800u_dbg_driver_dropunenc), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "rx_debug", SYSCTL_DESCR(
+	    "print the first N received data frames (0 = off)"),
+	    NULL, 0, &aic8800u_dbg_rx_debug,
+	    sizeof(aic8800u_dbg_rx_debug), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "tx_debug", SYSCTL_DESCR(
+	    "print the first N submitted data frames (0 = off)"),
+	    NULL, 0, &aic8800u_dbg_tx_debug,
+	    sizeof(aic8800u_dbg_tx_debug), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "cfm_all", SYSCTL_DESCR(
+	    "1 = request TX CFM for all data frames (diagnostic, load cost)"),
+	    NULL, 0, &aic8800u_dbg_cfm_all,
+	    sizeof(aic8800u_dbg_cfm_all), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	/* read-only roll-up; the board has a single instance */
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READONLY, CTLTYPE_STRING,
+	    "stats", SYSCTL_DESCR("aic8800u counters and ieee80211 state"),
+	    aic8800u_dbg_stats_sysctl, 0, NULL, AIC8800_STATS_LEN,
+	    CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
 	done = 1;
 	return;
 fail:
@@ -1083,8 +1194,14 @@ aic8800u_control_port(struct aic8800u_softc *sc, bool open)
 	error = aic8800u_cmd(sc, AIC8800_ME_SET_CONTROL_PORT_REQ,
 	    AIC8800_TASK_ME, AIC8800_DRV_TASK_ID, &req, sizeof(req),
 	    NULL, 0);
-	if (error != 0)
+	if (error != 0) {
+		sc->sc_cp_fail++;
 		aprint_error_dev(sc->sc_dev,
 		    "control port %s failed (%d)\n", open ? "open" : "close",
 		    error);
+		return;
+	}
+	sc->sc_cp_state = open;
+	if (open)
+		sc->sc_cp_open++;
 }

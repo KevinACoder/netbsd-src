@@ -224,6 +224,25 @@ struct aic8800u_softc {
 	bool			 sc_connected;
 	bool			 sc_scanning;	/* firmware scan in flight */
 
+	/*
+	 * The firmware decrypts CCMP, so frames handed to net80211 carry
+	 * no host-visible key and the stack's F_DROPUNENC policy (set by
+	 * wpa_supplicant on every WPA association) would discard every
+	 * received data frame.  The driver takes that policy over:
+	 * sc_dropunenc records that it was requested, the flag itself is
+	 * cleared on the ieee80211com, and rx_frame() enforces it against
+	 * the firmware's per-frame decryption status instead.
+	 */
+	bool			 sc_dropunenc;
+
+	/* key / control-port bookkeeping (hw.aic8800.stats) */
+	uint32_t		 sc_key_ptk;
+	uint32_t		 sc_key_gtk;
+	uint32_t		 sc_key_fail;
+	uint32_t		 sc_cp_open;
+	uint32_t		 sc_cp_fail;
+	bool			 sc_cp_state;
+
 	/* need_cfm TX bookkeeping (EAPOL / management frames) */
 	struct mbuf		*sc_txcfm_m[AIC8800U_TXCFM_SLOTS];
 	uint16_t		 sc_txcfm_plen[AIC8800U_TXCFM_SLOTS];
@@ -241,6 +260,12 @@ struct aic8800u_softc {
 	uint32_t		 sc_rx_fcserr;
 	uint32_t		 sc_rx_decrerr;
 	uint32_t		 sc_rx_amsdu;
+	uint32_t		 sc_rx_decrypted;	/* fw-decrypted, delivered */
+	uint32_t		 sc_rx_unenc_drop;	/* policy drop, see above */
+	uint32_t		 sc_rx_dbg_logged;	/* rx_debug prints done */
+	uint32_t		 sc_tx_dbg_logged;	/* tx_debug prints done */
+	uint32_t		 sc_tx_frames;		/* data frames submitted */
+	uint32_t		 sc_tx_errors;
 	uint32_t		 sc_mgmt_dropped;
 	uint32_t		 sc_evtq_dropped;
 	uint32_t		 sc_evt_trunc;	/* frame claimed past the URB */
@@ -301,9 +326,16 @@ void	aic8800u_disconnect(struct aic8800u_softc *);
 int	aic8800u_key_add(struct aic8800u_softc *, const uint8_t *key,
 	    size_t key_len, unsigned key_idx, bool pairwise);
 void	aic8800u_control_port(struct aic8800u_softc *, bool open);
-void	aic8800u_dbg_sysctl_init(void);
+void	aic8800u_dbg_sysctl_init(struct aic8800u_softc *);
 extern int	aic8800u_dbg_payload_mode;
 extern int	aic8800u_dbg_min_tx;
+extern int	aic8800u_dbg_driver_dropunenc;
+extern int	aic8800u_dbg_rx_debug;
+extern int	aic8800u_dbg_tx_debug;
+extern int	aic8800u_dbg_cfm_all;
+
+/* upper bound for the hw.aic8800.stats string */
+#define AIC8800_STATS_LEN	640
 
 /*
  * Short data frames (EAPOL-Key M4, ARP) are silently swallowed by the

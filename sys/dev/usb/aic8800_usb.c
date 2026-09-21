@@ -654,6 +654,7 @@ aic8800u_rx_frame(struct aic8800u_softc *sc, uint32_t count)
 	uint16_t mpdu_len = buf[0] | (buf[1] << 8);
 	uint32_t status;
 	size_t hdr_len;
+	bool decrypted = false;
 	int8_t rssi1, rssileg;
 	int rssi, s;
 
@@ -698,6 +699,17 @@ aic8800u_rx_frame(struct aic8800u_softc *sc, uint32_t count)
 	    IEEE80211_FC0_SUBTYPE_QOS)
 		hdr_len += 2;
 
+	/*
+	 * The hardware decryption status is the authority on whether this
+	 * frame was CCMP-protected on air; on this firmware the Protected
+	 * bit is CLEAR on frames it has already decapsulated (vendor
+	 * rwnx_rx.c uses hwvect.decr_status for exactly this decision).
+	 * The bit alone cannot tell a decrypted frame from a genuinely
+	 * unprotected one, and that ambiguity is what made the stack's
+	 * drop-unencrypted policy drop the entire receive data plane.
+	 */
+	decrypted = (AIC8800_RX_DECR_STATUS(status) == AIC8800_DECR_CCMP128);
+
 	m = m_gethdr(M_DONTWAIT, MT_DATA);
 	if (m == NULL)
 		return;
@@ -707,15 +719,27 @@ aic8800u_rx_frame(struct aic8800u_softc *sc, uint32_t count)
 		return;
 	}
 
+	/*
+	 * Tag the incoming interface.  ip_input()/in_arpinput() resolve
+	 * the receiving interface from this field, and every other
+	 * net80211 driver sets it right after the mbuf is built
+	 * (rtw88/urtwn/rtw89, and this lab's rtw8189f_chip.c).  Without
+	 * it the frames are accepted by net80211 and then silently
+	 * dropped by the network layer: ARP counters show them as
+	 * "could not be mapped to an interface" and dhcpcd still works
+	 * because it taps BPF rather than the IP input path.
+	 */
+	m_set_rcvif(m, &sc->sc_if);
+
 	rssi1 = (int8_t)buf[AIC8800_RX_RSSI1_OFF];
 	rssileg = (int8_t)buf[AIC8800_RX_RSSI_LEG_OFF];
 	rssi = rssi1 != 0 ? -rssi1 : -rssileg;
 	if (rssi < 0)
 		rssi = 0;
 
-	if ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0 &&
-	    AIC8800_RX_DECR_STATUS(status) == AIC8800_DECR_CCMP128) {
-		/* firmware already decrypted: drop the CCMP header */
+	if ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0 && decrypted) {
+		/* decapsulation half-done by the firmware: strip the CCMP
+		 * header it left behind */
 		if (hdr_len + 8 > mpdu_len) {
 			m_freem(m);
 			return;
@@ -726,14 +750,93 @@ aic8800u_rx_frame(struct aic8800u_softc *sc, uint32_t count)
 		wh = mtod(m, struct ieee80211_frame *);
 		wh->i_fc[1] &= ~IEEE80211_FC1_WEP;
 		m->m_len = m->m_pkthdr.len = mpdu_len - 8;
+		sc->sc_rx_decrypted++;
 	} else if ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0) {
 		/* encrypted but not decrypted for us */
 		m_freem(m);
 		sc->sc_rx_decrerr++;
 		return;
 	} else {
+		/* Firmware already decapsulated it (Protected bit clear,
+		 * CCMP header and MIC gone when decr_status says CCMP128);
+		 * or it is genuinely unprotected.  Either way it is
+		 * delivered as-is; the policy check below distinguishes
+		 * the two cases by decr_status. */
 		memcpy(mtod(m, void *), mpdu, mpdu_len);
 		m->m_len = m->m_pkthdr.len = mpdu_len;
+		if (decrypted)
+			sc->sc_rx_decrypted++;
+	}
+
+	/*
+	 * Data-plane drop-unencrypted policy, run here because the
+	 * firmware's CCMP is invisible to net80211 (see aic8800u_ioctl):
+	 * sc_dropunenc mirrors the IEEE80211_IOC_DROPUNENCRYPTED request
+	 * that wpa_supplicant makes for every WPA association.  EAPOL is
+	 * exempt, exactly like the stack's own PAE carve-out, so the
+	 * 4-way keeps working; anything else must have been decapsulated
+	 * by the firmware.  Management frames are not subject to the
+	 * policy.
+	 */
+	if (!aic8800u_dbg_driver_dropunenc && sc->sc_dropunenc && !decrypted &&
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA) {
+		uint8_t llc[8];
+
+		if (m->m_pkthdr.len >= hdr_len + sizeof(llc)) {
+			m_copydata(m, hdr_len, sizeof(llc), llc);
+			if (ntohs(*(const uint16_t *)&llc[6]) !=
+			    ETHERTYPE_PAE) {
+				m_freem(m);
+				sc->sc_rx_unenc_drop++;
+				return;
+			}
+		}
+	}
+
+	if (aic8800u_dbg_rx_debug > 0 && (unsigned)aic8800u_dbg_rx_debug >
+	    sc->sc_rx_dbg_logged &&
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA) {
+		uint8_t llc[8];
+		uint16_t etype = 0;
+
+		if (m->m_pkthdr.len >= hdr_len + sizeof(llc)) {
+			m_copydata(m, hdr_len, sizeof(llc), llc);
+			etype = ntohs(*(const uint16_t *)&llc[6]);
+		}
+		sc->sc_rx_dbg_logged++;
+		aprint_normal_dev(sc->sc_dev,
+		    "rx data a1=%02x:%02x:%02x:%02x:%02x:%02x "
+		    "a2=%02x:%02x:%02x:%02x:%02x:%02x "
+		    "a3=%02x:%02x:%02x:%02x:%02x:%02x "
+		    "fc=%02x%02x wep=%d decr=%u fwdec=%d len=%u etype=%#06x\n",
+		    wh->i_addr1[0], wh->i_addr1[1], wh->i_addr1[2],
+		    wh->i_addr1[3], wh->i_addr1[4], wh->i_addr1[5],
+		    wh->i_addr2[0], wh->i_addr2[1], wh->i_addr2[2],
+		    wh->i_addr2[3], wh->i_addr2[4], wh->i_addr2[5],
+		    wh->i_addr3[0], wh->i_addr3[1], wh->i_addr3[2],
+		    wh->i_addr3[3], wh->i_addr3[4], wh->i_addr3[5],
+		    wh->i_fc[0], wh->i_fc[1],
+		    (wh->i_fc[1] & IEEE80211_FC1_WEP) != 0,
+		    AIC8800_RX_DECR_STATUS(status), decrypted,
+		    m->m_pkthdr.len, etype);
+		/* ARP is the frame that must resolve: dump the ethernet
+		 * header the stack will see plus the ARP body.  Only what
+		 * the mbuf actually carries behind the 802.11 header may be
+		 * copied -- asking m_copydata() for more panics in the
+		 * mbuf chain walker (learned the hard way). */
+		if (etype == 0x0806) {
+			uint8_t hex[48];
+			unsigned n = m->m_pkthdr.len - hdr_len;
+			unsigned i;
+
+			if (n > sizeof(hex))
+				n = sizeof(hex);
+			m_copydata(m, hdr_len, n, hex);
+			aprint_normal_dev(sc->sc_dev, "rx arp payload:");
+			for (i = 0; i < n; i++)
+				aprint_normal(" %02x", hex[i]);
+			aprint_normal("\n");
+		}
 	}
 
 	s = splnet();

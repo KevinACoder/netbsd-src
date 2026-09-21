@@ -261,32 +261,45 @@ static void
 aic8800u_bringup_task(void *arg)
 {
 	struct aic8800u_softc *sc = arg;
-	int attempt;
+	int attempt, rounds;
 
 	/*
 	 * The loader runs on its own thread: the download waits for CFMs
 	 * that only arrive via the USB callbacks, and firmware(9) cannot
 	 * read files until the root file system is mounted -- which on
 	 * this board happens after USB enumeration (rtw89 lesson).
+	 *
+	 * Keep retrying instead of giving up after a fixed budget: the
+	 * START_APP re-enumeration to 8d81 has been flaky (2 of 5 cold
+	 * boots left the device ENODEV after a single 30 s window, with
+	 * drvctl unable to bring it back and a power cycle the only
+	 * recovery).  Each attempt is logged so a run can be judged from
+	 * the console alone.
 	 */
-	for (attempt = 0; attempt < 300; attempt++) {
+	for (rounds = 0; ; rounds++) {
+		for (attempt = 0; attempt < 300 && !sc->sc_dying; attempt++) {
+			if (sc->sc_transport_ready ||
+			    aic8800u_transport_init(sc) == 0) {
+				if (aic8800u_firmware_available(sc))
+					goto ready;
+			}
+			kpause("aicfwup", false, mstohz(100), NULL);
+		}
 		if (sc->sc_dying)
 			break;
-		if (!sc->sc_transport_ready &&
-		    aic8800u_transport_init(sc) != 0)
-			goto retry;
-		if (aic8800u_firmware_available(sc))
-			break;
-retry:
-		kpause("aicfwup", false, mstohz(100), NULL);
+		aprint_normal_dev(sc->sc_dev,
+		    "bringup round %d: still waiting for transport and "
+		    "firmware (device present: %s)\n", rounds + 1,
+		    sc->sc_transport_ready ? "yes" : "no");
 	}
-	if (sc->sc_dying)
+
+	aic8800u_bringup_done(sc);
+	return;
+
+ready:
+	if (sc->sc_dying || !sc->sc_transport_ready ||
+	    !aic8800u_firmware_available(sc))
 		aic8800u_bringup_done(sc);
-	if (!sc->sc_transport_ready || !aic8800u_firmware_available(sc)) {
-		aprint_error_dev(sc->sc_dev,
-		    "transport or firmware never became ready\n");
-		aic8800u_bringup_done(sc);
-	}
 
 	/* let the freshly re-enumerated device settle (KI-036 family) */
 	kpause("aicsettle", false, mstohz(200), NULL);
@@ -523,7 +536,7 @@ aic8800u_attach(device_t parent, device_t self, void *aux)
 		(void)aic8800u_app_attach(sc);
 	}
 
-	aic8800u_dbg_sysctl_init();
+	aic8800u_dbg_sysctl_init(sc);
 	pmf_device_register(self, NULL, NULL);
 	usbd_add_drv_event(USB_EVENT_DRIVER_ATTACH, sc->sc_udev, sc->sc_dev);
 }
@@ -812,6 +825,23 @@ aic8800u_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 
 	default:
 		error = ieee80211_ioctl(ic, cmd, data);
+		/*
+		 * The firmware decrypts CCMP; every frame the driver hands
+		 * to net80211 therefore looks unencrypted (no host key) and
+		 * the stack's drop-unencrypted policy -- which wpa_supplicant
+		 * turns on for any WPA association via
+		 * IEEE80211_IOC_DROPUNENCRYPTED -- would discard the entire
+		 * receive data plane while EAPOL sails through the PAE
+		 * exemption (4-way passes, ARP/ICMP die both ways).
+		 * Take the policy over: remember that it was requested,
+		 * clear it on the ieee80211com and enforce it in rx_frame()
+		 * against the firmware's per-frame decryption status.
+		 */
+		if (!aic8800u_dbg_driver_dropunenc &&
+		    (ic->ic_flags & IEEE80211_F_DROPUNENC) != 0) {
+			sc->sc_dropunenc = true;
+			ic->ic_flags &= ~IEEE80211_F_DROPUNENC;
+		}
 		break;
 	}
 
@@ -1232,13 +1262,14 @@ aic8800u_txcfm(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 	else
 		sc->sc_txcfm_retried++;
 
-	/* Only EAPOL frames take CFM slots in this driver, so this prints
-	 * once per 4-way message: acknowledged=1 means the frame reached
-	 * the AP (content rejection is then a key problem); otherwise the
+	/* Only EAPOL frames take CFM slots by default (and all data under
+	 * the cfm_all diagnostic), so this prints once per 4-way message
+	 * in the normal case: acknowledged=1 means the frame reached the
+	 * AP (content rejection is then a key problem); otherwise the
 	 * frame never made it on air.  plen identifies the message
 	 * (121 = M2 with RSN IE, 99 = M4). */
 	aprint_normal_dev(sc->sc_dev,
-	    "EAPOL cfm: used=%u slot=%u plen=%u st=%#x ack=%u retry=%u "
+	    "TX cfm: used=%u slot=%u plen=%u st=%#x ack=%u retry=%u "
 	    "lost=%u\n",
 	    used, slot, sc->sc_txcfm_plen[slot], status, sc->sc_txcfm_acked,
 	    sc->sc_txcfm_retried, sc->sc_txcfm_lost);
@@ -1317,12 +1348,14 @@ aic8800u_key_sync(struct aic8800u_softc *sc)
 		    true);
 		if (error != 0) {
 			splx(s);
+			sc->sc_key_fail++;
 			aprint_error_dev(sc->sc_dev,
 			    "PTK install failed (%d); closing control port\n",
 			    error);
 			goto failed;
 		}
 		have_ptk = true;
+		sc->sc_key_ptk++;
 		aprint_normal_dev(sc->sc_dev,
 		    "PTK installed (%zu bytes)\n", (size_t)wk->wk_keylen);
 	}
@@ -1335,11 +1368,17 @@ aic8800u_key_sync(struct aic8800u_softc *sc)
 		    kid, false);
 		if (error != 0) {
 			splx(s);
+			sc->sc_key_fail++;
 			aprint_error_dev(sc->sc_dev,
 			    "GTK %u install failed (%d); closing control port\n",
 			    kid, error);
 			goto failed;
 		}
+		/* The success used to be invisible, which left "did the
+		 * firmware ever get a GTK?" open through two campaigns. */
+		sc->sc_key_gtk++;
+		aprint_normal_dev(sc->sc_dev, "GTK %u installed (%zu bytes)\n",
+		    kid, (size_t)wk->wk_keylen);
 	}
 	splx(s);
 
@@ -1393,7 +1432,16 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 	if ((wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_QOS) ==
 	    IEEE80211_FC0_SUBTYPE_QOS)
 		hdr_len += 2;
-	body_off = hdr_len + ((wh->i_fc[1] & IEEE80211_FC1_WEP) != 0 ? 8 : 0);
+	/*
+	 * The layout after ieee80211_encap() is [802.11 hdr][LLC/SNAP 8]
+	 * [payload]: the Protected bit is set for encrypted traffic, but
+	 * the 8-byte CCMP header only appears once ieee80211_crypto_encap()
+	 * runs -- and this driver deliberately never runs it (the firmware
+	 * owns CCMP).  Adding ic_header here read the ethertype 8 bytes
+	 * into the payload and shortened every ARP/IP frame (ARP went out
+	 * as etype 0x0001, plen 20 instead of 0x0806, 28).
+	 */
+	body_off = hdr_len;
 
 	if (m->m_pkthdr.len < (int)(body_off + 8) ||
 	    m->m_pkthdr.len > (int)(body_off + 8 + AIC8800_DATA_TX_BUF_MAX -
@@ -1491,9 +1539,16 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 	desc->staid = sc->sc_connected ? sc->sc_ap_idx : 0xff;
 	desc->flags = 0;
 
-	if (ethertype == 0x888e && sc->sc_connected) {
-		unsigned k;
+	/*
+	 * Confirmation request: EAPOL always (the 4-way is the thing that
+	 * must be observable), non-EAPOL data only under the cfm_all
+	 * diagnostic -- regular data is acked by the AP at L2 and the 64
+	 * slots are a bottleneck at load rates.
+	 */
+	if ((ethertype == 0x888e || aic8800u_dbg_cfm_all != 0) &&
+	    sc->sc_connected) {
 
+		unsigned k;
 		/*
 		 * Prefer a slot whose previous frame already got its
 		 * confirmation: the firmware echoes the submit index back, so
@@ -1563,6 +1618,28 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 		    emsg, aic8800u_dbg_payload_mode, len,
 		    le16toh(desc->packet_len), desc->ac, desc->tid,
 		    desc->vif_idx, desc->staid, cfm, slot, cfmidx);
+	else if (aic8800u_dbg_tx_debug > 0 &&
+	    (unsigned)aic8800u_dbg_tx_debug > sc->sc_tx_dbg_logged) {
+		sc->sc_tx_dbg_logged++;
+		aprint_normal_dev(sc->sc_dev,
+		    "tx data packet_len=%u plen=%zu ac=%u tid=%u sta=%u "
+		    "etype=%#06x da=%02x:%02x:%02x:%02x:%02x:%02x\n",
+		    le16toh(desc->packet_len), plen, desc->ac, desc->tid,
+		    desc->staid, ethertype,
+		    desc->eth_dest_addr[0], desc->eth_dest_addr[1],
+		    desc->eth_dest_addr[2], desc->eth_dest_addr[3],
+		    desc->eth_dest_addr[4], desc->eth_dest_addr[5]);
+		if (ethertype == 0x0806) {
+			uint8_t hex[28];
+			unsigned i;
+
+			m_copydata(m, payload_off, sizeof(hex), hex);
+			aprint_normal_dev(sc->sc_dev, "tx arp payload:");
+			for (i = 0; i < sizeof(hex); i++)
+				aprint_normal(" %02x", hex[i]);
+			aprint_normal("\n");
+		}
+	}
 
 	/* pad to 4; a multiple of 512 needs one extra byte (short packet) */
 	len = (len + 3) & ~3u;
@@ -1572,6 +1649,7 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 	error = aic8800u_data_write(sc, len);
 	if (error != 0) {
 		if_statinc(ifp, if_oerrors);
+		sc->sc_tx_errors++;
 		ieee80211_free_node(ni);
 		m_freem(m);
 		return;
@@ -1579,6 +1657,7 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 
 	if_statinc(ifp, if_opackets);
 	if_statadd(ifp, if_obytes, plen + 14);
+	sc->sc_tx_frames++;
 
 	/* Low-rate diagnostic for the 4-way: one line per EAPOL write so a
 	 * silent M2 can be told apart from one the AP rejects. */
