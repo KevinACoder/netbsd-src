@@ -195,8 +195,18 @@ rtw88_workqueue_worker(void *arg)
 	for (;;) {
 		mutex_enter(&rtw88_pending_mtx);
 		item = SIMPLEQ_FIRST(&rtw88_pending);
-		if (item != NULL)
+		if (item != NULL) {
 			SIMPLEQ_REMOVE_HEAD(&rtw88_pending, wi_entry);
+			/*
+			 * Clear the queued flag while the list is still
+			 * locked.  Clearing it after the unlock left a window
+			 * where a producer's queued-flag test failed but its
+			 * wakeup target was gone: the completion (say, a TX
+			 * buffer coming back) was then lost until the next
+			 * unrelated event enqueued the same work again.
+			 */
+			item->wi_work->wk_queued = 0;
+		}
 		mutex_exit(&rtw88_pending_mtx);
 
 		if (item == NULL) {
@@ -209,7 +219,6 @@ rtw88_workqueue_worker(void *arg)
 		kmem_free(item, sizeof(*item));
 
 		/* the item may requeue itself from inside wk_func() */
-		w->wk_queued = 0;
 		atomic_store_relaxed(&w->wk_running, 1);
 		w->wk_func(w);
 		atomic_store_relaxed(&w->wk_running, 0);
@@ -593,10 +602,31 @@ ieee80211_stop_queues(struct ieee80211_hw *hw)
 {
 }
 
+/*
+ * Hook the front end installs to observe firmware TX reports (the
+ * ieee80211_tx_status_irqsafe calls from rtw_tx_report_tx_status): AMRR
+ * needs the ack/no-ack verdicts.  Single adapter, like the rest of the
+ * shadow mac80211 layer.
+ */
+static void (*rtw88_txrpt_hook)(void *, bool);
+static void *rtw88_txrpt_ctx;
+
+void
+rtw88_txrpt_sethook(void (*fn)(void *, bool), void *ctx)
+{
+
+	rtw88_txrpt_hook = fn;
+	rtw88_txrpt_ctx = ctx;
+}
+
 void
 ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 
+	if (rtw88_txrpt_hook != NULL)
+		rtw88_txrpt_hook(rtw88_txrpt_ctx,
+		    (info->flags & IEEE80211_TX_STAT_ACK) != 0);
 	rtw88_skb_free(skb);
 }
 

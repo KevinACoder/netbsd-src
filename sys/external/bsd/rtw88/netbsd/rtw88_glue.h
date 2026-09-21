@@ -53,6 +53,13 @@ void	rtw88_workqueue_ready(void);
  */
 int	rtw88_call_async(void (*)(void *), void *);
 
+/*
+ * Observe firmware TX reports: fn(ctx, acked) runs for every
+ * ieee80211_tx_status_irqsafe the chip code raises from a C2H CCX report
+ * (worker thread context).  This is the rate-control feedback path.
+ */
+void	rtw88_txrpt_sethook(void (*fn)(void *, bool), void *ctx);
+
 /* mac80211 stand-in: one hw/wiphy, one STA vif, one peer sta */
 struct ieee80211_hw *rtw88_mac80211_alloc(void *);
 void	rtw88_mac80211_free(struct ieee80211_hw *);

@@ -62,9 +62,24 @@ void	rtw88_chip_detach(struct rtw88_chip *);
 int	rtw88_chip_start(struct rtw88_chip *);
 void	rtw88_chip_stop(struct rtw88_chip *);
 int	rtw88_chip_set_channel(struct rtw88_chip *, unsigned int);
-int	rtw88_chip_tx(struct rtw88_chip *, struct mbuf *, bool);
+/*
+ * txrate is the net80211 rate in 0.5 Mb/s units (the ni_txrate-indexed
+ * rs_rates[] value); unicast data frames are announced to the firmware
+ * with the CCX report bit so rate-control feedback comes back via C2H.
+ */
+int	rtw88_chip_tx(struct rtw88_chip *, struct mbuf *, bool, unsigned int);
 void	rtw88_chip_set_callbacks(struct rtw88_chip *, void *, rtw88_rx_cb_t,
 	    rtw88_scan_cb_t);
+/*
+ * Flow control between the net80211 front end and the transport: can the
+ * data pipe accept another frame right now, and wake the front end once
+ * buffers came back.  The wake callback runs in the submit worker.
+ */
+bool	rtw88_chip_tx_space(struct rtw88_chip *);
+void	rtw88_chip_set_txspace_cb(struct rtw88_chip *, void *,
+	    void (*)(void *));
+/* one-line transport health summary for the front end's stats node */
+void	rtw88_chip_tx_stats(const struct rtw88_chip *, char *, size_t);
 void	rtw88_chip_set_assoc(struct rtw88_chip *, const uint8_t *, bool);
 void	rtw88_chip_set_bssid(struct rtw88_chip *, const uint8_t *);
 bool	rtw88_chip_ready(const struct rtw88_chip *);

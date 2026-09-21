@@ -55,7 +55,14 @@
 #define	TX_DESC_QSEL_MAX	20
 
 #define	RTW88_TX_EP_MAX		4
-#define	RTW88_TX_XFER_NUM	8
+/*
+ * Depth budget for the bulk OUT transfers.  The even split over three
+ * pipes left the data pipe (which carries every TCP/UDP frame, see the
+ * RQPN table) with two 16K buffers, and a bulk upload stalled it within
+ * seconds.  rtw88_usb_attach() gives all but two of these to the data
+ * pipe.
+ */
+#define	RTW88_TX_XFER_NUM	24
 #define	RTW88_TX_BUFSZ		(16 * 1024)
 #define	RTW88_RX_XFER_NUM	2
 #define	RTW88_RX_BUFSZ		32768
@@ -111,6 +118,13 @@ struct rtw88_usb {
 	struct sk_buff_head	tx_queue[RTW88_TX_EP_MAX];
 	struct work_struct	tx_work;
 	bool			tx_stopped;
+
+	/* debug/health counters, read out via hw.rtw88u*.stats */
+	unsigned int		tx_nofree;	/* submit found no free buffer */
+	unsigned int		tx_qdepth_max;	/* max frames queued on data pipe */
+	unsigned int		tx_reclaimed;	/* buffers returned by submit */
+	unsigned int		txeof_errors;	/* completion with error status */
+	unsigned int		tx_reports;	/* skbs queued for fw TX report */
 };
 
 struct rtw88_chip {
@@ -123,6 +137,10 @@ struct rtw88_chip {
 	void			*rx_ctx;
 	rtw88_rx_cb_t		rx_cb;
 	rtw88_scan_cb_t		scan_cb;
+
+	/* called by the TX submit path after it returned free buffers */
+	void			*txspace_ctx;
+	void			(*txspace_cb)(void *);
 
 	bool			started;
 	bool			assoc;
@@ -145,6 +163,7 @@ rtw88_usb_from_dev(struct rtw_dev *rtwdev)
 /* rtw88_usb.c */
 int	rtw88_usb_attach(struct rtw88_chip *, struct usbd_interface *);
 void	rtw88_usb_detach(struct rtw88_chip *);
+bool	rtw88_usb_tx_space(struct rtw88_usb *);
 const struct rtw_hci_ops *rtw88_usb_get_ops(void);
 
 /* rtw88_chip.c: runs on the rtw88 workqueue, feeding the net80211 driver */

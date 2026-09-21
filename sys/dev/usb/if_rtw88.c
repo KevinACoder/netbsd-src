@@ -68,6 +68,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/device.h>
 #include <sys/module.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/callout.h>
 #include <sys/mutex.h>
 #include <sys/pmf.h>
@@ -79,6 +80,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <net/if_types.h>
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_proto.h>
+#include <net80211/ieee80211_amrr.h>
 
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -89,6 +91,17 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include "rtw88_glue.h"
 #include "rtw88_chipvar.h"
+
+/*
+ * Flow control between this interface and the USB transport.  0 restores
+ * the fire-into-an-unbounded-queue behaviour (repro/closure A/B only):
+ * the data pipe then drains at wire speed into if_snd and the queueing
+ * delay alone pushed ping RTT into the seconds under load.
+ */
+int rtw88u_dbg_backpressure = 1;
+/* defined in rtw88_chip.c, wired into the hw.rtw88u*.stats node below */
+extern int rtw88u_dbg_forced_rate;
+extern int rtw88u_dbg_tx_report;
 
 struct rtw88_softc {
 	device_t		sc_dev;
@@ -105,6 +118,18 @@ struct rtw88_softc {
 				    enum ieee80211_state, int);
 	callout_t		sc_scan_to;
 	kmutex_t		sc_media_mtx;
+
+	/*
+	 * Rate control: AMRR state, fed by firmware CCX TX reports
+	 * (rtw88_txrpt) and evaluated on a 500ms clock (rtw88_amrr_tick),
+	 * the same split iwm(4) uses with its firmware reports.
+	 */
+	struct ieee80211_amrr	sc_amrr;
+	struct ieee80211_amrr_node sc_amn;
+	callout_t		sc_amrr_to;
+	unsigned int		sc_txrpt_acked;
+	unsigned int		sc_txrpt_nacked;
+	unsigned int		sc_txrpt_print;
 
 	int			sc_dying;
 	bool			sc_attached;
@@ -128,6 +153,9 @@ static void	rtw88_bringup_task(void *);
 static void	rtw88_newstate_cb(void *);
 static void	rtw88_next_scan(void *);
 static void	rtw88_rx_frame(void *, const uint8_t *, size_t, int);
+static void	rtw88_txrpt(void *, bool);
+static void	rtw88_tx_space(void *);
+static void	rtw88_amrr_tick(void *);
 static int	rtw88_init(struct ifnet *);
 static void	rtw88_stop(struct ifnet *, int);
 static void	rtw88_start(struct ifnet *);
@@ -135,6 +163,7 @@ static void	rtw88_watchdog(struct ifnet *);
 static int	rtw88_ioctl(struct ifnet *, u_long, void *);
 static int	rtw88_reset(struct ifnet *);
 static int	rtw88_newstate(struct ieee80211com *, enum ieee80211_state, int);
+static void	rtw88_sysctl_init(struct rtw88_softc *);
 
 static int
 rtw88_match(device_t parent, cfdata_t match, void *aux)
@@ -276,6 +305,16 @@ rtw88_bringup_task(void *arg)
 		return;
 	}
 	rtw88_chip_set_callbacks(sc->sc_chip, sc, rtw88_rx_frame, NULL);
+	rtw88_chip_set_txspace_cb(sc->sc_chip, sc, rtw88_tx_space);
+	rtw88_txrpt_sethook(rtw88_txrpt, sc);
+
+	sc->sc_amrr.amrr_min_success_threshold =
+	    IEEE80211_AMRR_MIN_SUCCESS_THRESHOLD;
+	sc->sc_amrr.amrr_max_success_threshold =
+	    IEEE80211_AMRR_MAX_SUCCESS_THRESHOLD;
+	callout_init(&sc->sc_amrr_to, 0);
+	callout_setfunc(&sc->sc_amrr_to, rtw88_amrr_tick, sc);
+	rtw88_sysctl_init(sc);
 
 	/*
 	 * Set up the 802.11 device.
@@ -367,6 +406,7 @@ rtw88_detach(device_t self, int flags)
 	s = splusb();
 	sc->sc_dying = 1;
 	callout_halt(&sc->sc_scan_to, NULL);
+	callout_halt(&sc->sc_amrr_to, NULL);
 
 	if (sc->sc_chip != NULL) {
 		if (sc->sc_chip_started)
@@ -380,6 +420,8 @@ rtw88_detach(device_t self, int flags)
 		ieee80211_ifdetach(ic);
 		if_detach(ifp);
 		mutex_destroy(&sc->sc_media_mtx);
+		callout_destroy(&sc->sc_amrr_to);
+		rtw88_txrpt_sethook(NULL, NULL);
 		sc->sc_attached = false;
 	}
 	splx(s);
@@ -481,6 +523,8 @@ rtw88_start(struct ifnet *ifp)
 	}
 
 	for (;;) {
+		unsigned int txrate = 0;
+
 		is_mgmt = false;
 		ni = NULL;
 
@@ -492,6 +536,22 @@ rtw88_start(struct ifnet *ifp)
 		} else if (ic->ic_state == IEEE80211_S_RUN) {
 			struct ether_header *eh;
 			struct ieee80211_frame *wh;
+
+			/*
+			 * Backpressure: when the data pipe is out of buffers,
+			 * stop draining if_snd and let the transport's reclaim
+			 * callback (rtw88_tx_space) re-open the queue.  Without
+			 * this every frame ended up parked in an unbounded
+			 * queue behind a two-buffer pipe, which is where the
+			 * seconds-long RTTs under load came from.
+			 */
+			if ((ifp->if_flags & IFF_OACTIVE) != 0)
+				break;
+			if (rtw88u_dbg_backpressure != 0 &&
+			    !rtw88_chip_tx_space(sc->sc_chip)) {
+				ifp->if_flags |= IFF_OACTIVE;
+				break;
+			}
 
 			IFQ_POLL(&ifp->if_snd, m);
 			if (m == NULL)
@@ -534,9 +594,15 @@ rtw88_start(struct ifnet *ifp)
 		}
 
 		/* rtw88_chip_tx() always consumes the mbuf */
-		error = rtw88_chip_tx(sc->sc_chip, m, is_mgmt);
-		if (error != 0)
+		if (!is_mgmt && ni->ni_txrate < ni->ni_rates.rs_nrates)
+			txrate = ni->ni_rates.rs_rates[ni->ni_txrate] &
+			    IEEE80211_RATE_VAL;
+		error = rtw88_chip_tx(sc->sc_chip, m, is_mgmt, txrate);
+		if (error != 0) {
 			if_statinc(ifp, if_oerrors);
+		} else if (!is_mgmt) {
+			if_statinc(ifp, if_opackets);
+		}
 
 		if (ni != NULL)
 			ieee80211_free_node(ni);
@@ -550,6 +616,85 @@ rtw88_watchdog(struct ifnet *ifp)
 
 	ifp->if_timer = 0;
 	ieee80211_watchdog(&sc->sc_ic);
+}
+
+/* ------------------------------------------------------------------ */
+/* Rate control and flow-control callbacks                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Firmware TX report (CCX) verdict: runs on the rtw88 workqueue, once per
+ * data frame the firmware acknowledged -- or failed to acknowledge -- on
+ * the air.  Feed AMRR the way iwm(4) feeds its tx_cmd statistics.  The
+ * first few verdicts are printed: they are the board-level proof that the
+ * report chain is alive (and that frames really reach the AP).
+ */
+static void
+rtw88_txrpt(void *ctx, bool acked)
+{
+	struct rtw88_softc *sc = ctx;
+
+	if (acked)
+		sc->sc_txrpt_acked++;
+	else
+		sc->sc_amn.amn_retrycnt++;
+
+	sc->sc_amn.amn_txcnt++;
+
+	if (sc->sc_txrpt_print < 5) {
+		sc->sc_txrpt_print++;
+		aprint_normal_dev(sc->sc_dev, "tx report %s (%u acked/%u "
+		    "nacked)\n", acked ? "acked" : "NACKED",
+		    sc->sc_txrpt_acked, sc->sc_txrpt_nacked);
+	}
+}
+
+/*
+ * The transport returned TX buffers: re-open the interface queue.  Runs on
+ * the rtw88 workqueue; if_schedule_deferred_start() moves the actual
+ * rtw88_start call to a context that is allowed to take it.
+ */
+static void
+rtw88_tx_space(void *ctx)
+{
+	struct rtw88_softc *sc = ctx;
+	struct ifnet *ifp = &sc->sc_if;
+
+	if ((ifp->if_flags & IFF_OACTIVE) != 0) {
+		ifp->if_flags &= ~IFF_OACTIVE;
+		if_schedule_deferred_start(ifp);
+	}
+}
+
+/*
+ * AMRR clock: pick the rate from the accumulated tx/ack statistics, like
+ * iwm_calib_timeout().  Rate changes are printed once so a board log shows
+ * what the link actually converged to.
+ */
+static void
+rtw88_amrr_tick(void *arg)
+{
+	struct rtw88_softc *sc = arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+	unsigned int orate;
+	int s;
+
+	s = splnet();
+	if (!sc->sc_dying && ic->ic_state == IEEE80211_S_RUN &&
+	    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL &&
+	    ic->ic_fixed_rate == -1) {
+		orate = ic->ic_bss->ni_txrate;
+		ieee80211_amrr_choose(&sc->sc_amrr, ic->ic_bss, &sc->sc_amn);
+		if (ic->ic_bss->ni_txrate != orate)
+			aprint_normal_dev(sc->sc_dev,
+			    "AMRR rate -> %u Mb/s (txcnt=%u retrycnt=%u)\n",
+			    (ic->ic_bss->ni_rates.rs_rates[
+			    ic->ic_bss->ni_txrate] & IEEE80211_RATE_VAL) / 2,
+			    sc->sc_amn.amn_txcnt, sc->sc_amn.amn_retrycnt);
+	}
+	splx(s);
+
+	callout_schedule(&sc->sc_amrr_to, mstohz(500));
 }
 
 /* ------------------------------------------------------------------ */
@@ -620,13 +765,25 @@ rtw88_newstate_cb(void *arg)
 			rtw88_chip_set_bssid(sc->sc_chip,
 			    ic->ic_bss->ni_bssid);
 		}
-		if (nstate == IEEE80211_S_RUN)
+		if (nstate == IEEE80211_S_RUN) {
 			rtw88_chip_set_assoc(sc->sc_chip, ic->ic_bss->ni_bssid,
 			    true);
+			/*
+			 * New peer: reset rate control and start from the
+			 * lowest rate, then let the AMRR clock adapt (iwm
+			 * does the same in its association path).
+			 */
+			ieee80211_amrr_node_init(&sc->sc_amrr, &sc->sc_amn);
+			ic->ic_bss->ni_txrate = 0;
+			sc->sc_amn.amn_txcnt = 0;
+			sc->sc_amn.amn_retrycnt = 0;
+			callout_schedule(&sc->sc_amrr_to, mstohz(500));
+		}
 		break;
 
 	case IEEE80211_S_INIT:
 		rtw88_chip_set_assoc(sc->sc_chip, ic->ic_bss->ni_bssid, false);
+		callout_stop(&sc->sc_amrr_to);
 		break;
 	}
 	splx(s);
@@ -780,4 +937,130 @@ rtw88_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 
 	splx(s);
 	return error;
+}
+/* ------------------------------------------------------------------ */
+/* Diagnostics: hw.rtw88u.<unit> knobs and one-line stats              */
+/* ------------------------------------------------------------------ */
+
+/* the single board instance, for the hw.rtw88u*.stats handler */
+static struct rtw88_softc *rtw88_dbg_sc;
+
+static uint64_t
+rtw88_if_counter(struct ifnet *ifp, if_stat_t which)
+{
+	net_stat_ref_t nsr = IF_STAT_GETREF(ifp);
+	uint64_t v;
+
+	/* nsr is an opaque per-CPU counter array; no bounds-checked type */
+	memcpy(&v, (const uint64_t *)nsr + which, sizeof(v));
+	IF_STAT_PUTREF(ifp);
+	return v;
+}
+
+static int
+rtw88_sysctl_stats(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct rtw88_softc *sc = rtw88_dbg_sc;
+	struct ieee80211com *ic;
+	struct ifnet *ifp;
+	char buf[512];
+	char usbstats[192];
+	uint64_t opkts, oerrs;
+	int error;
+
+	if (sc == NULL)
+		return ENXIO;
+	ic = &sc->sc_ic;
+
+	ifp = ic->ic_ifp;
+	opkts = rtw88_if_counter(ifp, if_opackets);
+	oerrs = rtw88_if_counter(ifp, if_oerrors);
+
+	usbstats[0] = '\0';
+	if (sc->sc_chip != NULL)
+		rtw88_chip_tx_stats(sc->sc_chip, usbstats, sizeof(usbstats));
+
+	snprintf(buf, sizeof(buf),
+	    "%s"
+	    "if: opackets=%llu oerrors=%llu oactive=%d "
+	    "if_snd_len=%d\n"
+	    "amrr: txcnt=%u retrycnt=%u ni_txrate=%u fixed=%d\n"
+	    "txrpt: acked=%u nacked=%u forced_rate=%d tx_report=%d\n"
+	    "ic: state=%d flags=%#x\n",
+	    usbstats,
+	    (unsigned long long)opkts,
+	    (unsigned long long)oerrs,
+	    (ifp->if_flags & IFF_OACTIVE) != 0,
+	    ifp->if_snd.ifq_len,
+	    sc->sc_amn.amn_txcnt, sc->sc_amn.amn_retrycnt,
+	    ic->ic_bss != NULL ? ic->ic_bss->ni_txrate : 0,
+	    ic->ic_fixed_rate,
+	    sc->sc_txrpt_acked, sc->sc_txrpt_nacked,
+	    rtw88u_dbg_forced_rate, rtw88u_dbg_tx_report,
+	    ic->ic_state, ic->ic_flags);
+
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error != 0 || newp == NULL)
+		return error;
+
+	return 0;
+}
+
+static void
+rtw88_sysctl_init(struct rtw88_softc *sc)
+{
+	const struct sysctlnode *rnode, *cnode;
+	static int done;
+	int error;
+
+	if (done)
+		return;
+	done = 1;
+	rtw88_dbg_sc = sc;
+
+	error = sysctl_createv(NULL, 0, NULL, &rnode,
+	    0, CTLTYPE_NODE, device_xname(sc->sc_dev),
+	    SYSCTL_DESCR("rtw88u board-debug controls"),
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "backpressure", SYSCTL_DESCR(
+	    "1 = stop draining if_snd when the data pipe is out of buffers "
+	    "(0 = A/B repro of the unbounded-queue behaviour)"),
+	    NULL, 0, &rtw88u_dbg_backpressure,
+	    sizeof(rtw88u_dbg_backpressure), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "forced_rate", SYSCTL_DESCR(
+	    "override AMRR data rate, 0.5 Mb/s units (108 = 54M, 12 = 6M, "
+	    "0 = AMRR)"),
+	    NULL, 0, &rtw88u_dbg_forced_rate,
+	    sizeof(rtw88u_dbg_forced_rate), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "tx_report", SYSCTL_DESCR(
+	    "1 = CCX report bit on unicast data frames (AMRR feedback); "
+	    "0 = fire-and-forget"),
+	    NULL, 0, &rtw88u_dbg_tx_report,
+	    sizeof(rtw88u_dbg_tx_report), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READONLY, CTLTYPE_STRING,
+	    "stats", SYSCTL_DESCR("transport and rate-control counters"),
+	    rtw88_sysctl_stats, 0, NULL, 512, CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	return;
+fail:
+	aprint_error_dev(sc->sc_dev, "sysctl_createv failed (%d)\n", error);
 }

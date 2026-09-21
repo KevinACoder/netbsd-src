@@ -285,12 +285,64 @@ rtw88_chip_set_channel(struct rtw88_chip *chip, unsigned int chan)
 }
 
 /*
- * TX: the packet info is filled in here rather than by mac80211, so the rate
- * is a fixed legacy OFDM/CCK rate.  Management frames use the lowest basic
- * rate, like the Linux driver does when it has no rate control to consult.
+ * net80211 rate (0.5 Mb/s units, from ni_rates) -> rtw88 TX descriptor
+ * rate code.  Covers the 11b + 11g ratesets this driver advertises.
+ */
+static const struct {
+	uint16_t	rate;		/* 0.5 Mb/s units */
+	uint8_t		desc;
+} rtw88_rate_map[] = {
+	{  2, DESC_RATE1M },
+	{  4, DESC_RATE2M },
+	{ 11, DESC_RATE5_5M },
+	{ 22, DESC_RATE11M },
+	{ 12, DESC_RATE6M },
+	{ 18, DESC_RATE9M },
+	{ 24, DESC_RATE12M },
+	{ 36, DESC_RATE18M },
+	{ 48, DESC_RATE24M },
+	{ 72, DESC_RATE36M },
+	{ 96, DESC_RATE48M },
+	{ 108, DESC_RATE54M },
+};
+
+static uint8_t
+rtw88_desc_rate(unsigned int rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < sizeof(rtw88_rate_map) / sizeof(rtw88_rate_map[0]);
+	    i++)
+		if (rtw88_rate_map[i].rate == rate)
+			return rtw88_rate_map[i].desc;
+	return DESC_RATE6M;
+}
+
+/*
+ * If nonzero, overrides the AMRR-chosen data rate (0.5 Mb/s units).
+ */
+int rtw88u_dbg_forced_rate;
+/*
+ * TX report switch.  Linux does NOT set IEEE80211_TX_CTL_REQ_TX_STATUS on
+ * plain data frames (mac80211 only marks frames that explicitly wait for
+ * a status; rtw88's write_port_tx_complete fake-acks everything else) --
+ * rate adaptation lives in the firmware there.  Boot1 2026-09-21 showed
+ * what happens with the report bit on every frame: the per-frame CCX C2H
+ * flood chokes the firmware and the station goes deaf for minutes at a
+ * time (idle ping RTT 7s avg, +91 dups; under load 37-53% loss, iperf3
+ * control exchanges timing out after minutes).  Keep it off by default;
+ * =1 is the AMRR-feedback experiment (A/B only).
+ */
+int rtw88u_dbg_tx_report;
+
+/*
+ * TX: the packet info is filled in here rather than by mac80211, so the
+ * rate is the AMRR-chosen legacy rate (rtw88_rate_map) for unicast data
+ * and the lowest basic rate for management frames.
  */
 static int
-rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
+rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt,
+    unsigned int txrate)
 {
 	struct rtw_dev *rtwdev = &chip->rtwdev;
 	struct rtw_tx_pkt_info pkt_info = {0};
@@ -360,14 +412,41 @@ rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 		pkt_info.rate = DESC_RATE1M;
 	} else {
 		pkt_info.qsel = TX_DESC_QSEL_TID0;	/* best effort */
+
 		/*
-		 * No rate control in this port, so transmit at a rate the link
-		 * budget can actually carry: 54M left most data frames
-		 * unacknowledged, which shows up as the AP retrying its own
-		 * frames to us and ping replies arriving several times over.
-		 * 6M keeps ~9dB more margin; rate adaptation is the follow-up.
+		 * Rate: forced knob wins; with the AMRR experiment enabled
+		 * the report feedback picks the rate; otherwise a fixed 6M
+		 * (the historical best-behaved legacy rate on this link --
+		 * 54M needs the firmware rate adaptation that Linux gets
+		 * from its own firmware-RA path, not ported here).
 		 */
-		pkt_info.rate = DESC_RATE6M;
+		if (rtw88u_dbg_forced_rate != 0)
+			pkt_info.rate = rtw88_desc_rate(rtw88u_dbg_forced_rate);
+		else if (rtw88u_dbg_tx_report != 0)
+			pkt_info.rate = rtw88_desc_rate(txrate);
+		else
+			pkt_info.rate = DESC_RATE6M;
+
+		/*
+		 * Ask the firmware to acknowledge every unicast data frame
+		 * over C2H (CCX report): AMRR feedback + per-frame "reached
+		 * the AP" proof.  SEE THE WARNING ABOVE -- with the report
+		 * bit on every data frame the firmware drowns in its own
+		 * C2H reports under sustained traffic; A/B knob only.  skbs
+		 * handed to the report queue are freed by the report
+		 * handler, so rtw88_usb_tx_submit() branches on the
+		 * REQ_TX_STATUS flag for ownership.
+		 */
+		if (!pkt_info.bmc && rtw88u_dbg_tx_report != 0) {
+			pkt_info.report = true;
+			pkt_info.sn =
+			    (atomic_inc_return(&rtwdev->tx_report.sn) << 2) &
+			    0xfc;
+			IEEE80211_SKB_CB(skb)->flags |=
+			    IEEE80211_TX_CTL_REQ_TX_STATUS;
+			*IEEE80211_SKB_CB(skb)->status.status_driver_data =
+			    pkt_info.sn;
+		}
 	}
 
 	error = rtw_hci_tx_write(rtwdev, &pkt_info, skb);
@@ -381,10 +460,39 @@ rtw88_chip_tx_frame(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
 }
 
 int
-rtw88_chip_tx(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt)
+rtw88_chip_tx(struct rtw88_chip *chip, struct mbuf *m, bool is_mgmt,
+    unsigned int txrate)
 {
 
-	return rtw88_chip_tx_frame(chip, m, is_mgmt);
+	return rtw88_chip_tx_frame(chip, m, is_mgmt, txrate);
+}
+
+bool
+rtw88_chip_tx_space(struct rtw88_chip *chip)
+{
+
+	return rtw88_usb_tx_space(&chip->usb);
+}
+
+void
+rtw88_chip_set_txspace_cb(struct rtw88_chip *chip, void *ctx,
+    void (*cb)(void *))
+{
+
+	chip->txspace_ctx = ctx;
+	chip->txspace_cb = cb;
+}
+
+void
+rtw88_chip_tx_stats(const struct rtw88_chip *chip, char *buf, size_t len)
+{
+	const struct rtw88_usb *usb = &chip->usb;
+
+	snprintf(buf, len,
+	    "usb: nofree=%u qdepth_max=%u reclaimed=%u txeof_err=%u "
+	    "reports=%u\n",
+	    usb->tx_nofree, usb->tx_qdepth_max, usb->tx_reclaimed,
+	    usb->txeof_errors, usb->tx_reports);
 }
 
 void

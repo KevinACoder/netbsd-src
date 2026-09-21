@@ -83,9 +83,6 @@ static void	rtw88_usb_rx_submit(struct rtw88_rx_xfer *);
 /* register access                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Diagnostic counter: tx ring full events. */
-static unsigned int rtw88_tx_nobuf;
-
 /*
  * Register accesses go through vendor control requests; on the 8821C the
  * always-powered sections additionally need one byte written to 0x4e0 after
@@ -304,10 +301,19 @@ rtw88_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	struct rtw88_tx_xfer *tx = priv;
 	struct rtw88_usb *usb = tx->usb;
 
-	if (tx->skb != NULL) {
-		rtw88_skb_free(tx->skb);
-		tx->skb = NULL;
-	}
+	/*
+	 * The skb stays with the xfer: the report decision (and, in the old
+	 * code, the free) needs thread context -- rtw88_skb queues and the
+	 * firmware TX report queue both want a sleeping mutex, and this
+	 * callback runs in softint.  rtw88_usb_tx_submit() disposes of the
+	 * skb and returns the buffer under tx_mtx.
+	 */
+	if (status != USBD_NORMAL_COMPLETION &&
+	    status != USBD_CANCELLED)
+		usb->txeof_errors++;
+	if (status == USBD_TIMEOUT)
+		rtw_err(usb->rtwdev, "%s: TX timeout (frame dropped)\n",
+		    __func__);
 
 	if (status == USBD_STALLED)
 		usbd_clear_endpoint_stall_async(tx->pipe);
@@ -327,6 +333,8 @@ rtw88_usb_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 static void
 rtw88_usb_tx_submit(struct rtw88_usb *usb)
 {
+	struct rtw88_chip *chip = rtw88_chip_from_dev(usb->rtwdev);
+	bool reclaimed = false;
 	int i;
 
 	mutex_enter(&usb->tx_mtx);
@@ -334,17 +342,48 @@ rtw88_usb_tx_submit(struct rtw88_usb *usb)
 	/* Return the transfers whose completion arrived since the last pass. */
 	for (i = 0; i < RTW88_TX_XFER_NUM; i++) {
 		struct rtw88_tx_xfer *tx = &usb->tx[i];
+		struct sk_buff *skb = tx->skb;
 
-		if (tx->done) {
-			tx->done = 0;
-			TAILQ_INSERT_TAIL(&usb->tx_free[tx->ep], tx, next);
+		if (!tx->done)
+			continue;
+		tx->done = 0;
+
+		/*
+		 * The skb was left in place by the completion callback
+		 * (softint -- see rtw88_usb_txeof): free it here, or hand it
+		 * to the firmware TX report queue, which frees it when the
+		 * C2H report matches (or the purge timer expires).
+		 */
+		if (skb != NULL) {
+			struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+
+			if (info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS) {
+				rtw_tx_report_enqueue(usb->rtwdev, skb,
+				    *info->status.status_driver_data);
+				usb->tx_reports++;
+			} else {
+				rtw88_skb_free(skb);
+			}
+			tx->skb = NULL;
 		}
+
+		TAILQ_INSERT_TAIL(&usb->tx_free[tx->ep], tx, next);
+		reclaimed = true;
+		usb->tx_reclaimed++;
 	}
 
 	for (i = 0; i < usb->n_tx_pipe; i++) {
 		struct sk_buff *skb;
 		struct rtw88_tx_xfer *tx;
 		usbd_status err;
+
+		/* watermark of the data pipe queue, before this pass drains it */
+		if (i == usb->qsel_to_ep[TX_DESC_QSEL_TID0]) {
+			unsigned int depth = skb_queue_len(&usb->tx_queue[i]);
+
+			if (depth > usb->tx_qdepth_max)
+				usb->tx_qdepth_max = depth;
+		}
 
 		while ((skb = rtw88_skb_dequeue(&usb->tx_queue[i])) != NULL) {
 			tx = TAILQ_FIRST(&usb->tx_free[i]);
@@ -355,12 +394,13 @@ rtw88_usb_tx_submit(struct rtw88_usb *usb)
 				 * used to be dropped here, which silently ate every
 				 * data frame once a pipe stalled.
 				 */
-				if (rtw88_tx_nobuf < 3) {
+				usb->tx_nofree++;
+				if (usb->tx_nofree <= 3 ||
+				    (usb->tx_nofree % 100) == 0)
 					rtw_err(usb->rtwdev,
-					    "%s: no free tx buffer on pipe %d\n",
-					    __func__, i);
-					rtw88_tx_nobuf++;
-				}
+					    "%s: no free tx buffer on pipe %d "
+					    "(count %u)\n",
+					    __func__, i, usb->tx_nofree);
 				rtw88_skb_queue_head(&usb->tx_queue[i], skb);
 				break;
 			}
@@ -394,6 +434,13 @@ rtw88_usb_tx_submit(struct rtw88_usb *usb)
 		}
 	}
 	mutex_exit(&usb->tx_mtx);
+
+	/*
+	 * The data pipe freed buffers again: re-open the interface queue.
+	 * Called without tx_mtx, the callback only touches ifnet flags.
+	 */
+	if (reclaimed && chip->txspace_cb != NULL)
+		chip->txspace_cb(chip->txspace_ctx);
 }
 
 static void
@@ -430,8 +477,34 @@ rtw88_usb_tx_write(struct rtw_dev *rtwdev, struct rtw_tx_pkt_info *pkt_info,
 	rtw_tx_fill_tx_desc(rtwdev, pkt_info, tx_desc);
 	rtw_tx_fill_txdesc_checksum(rtwdev, pkt_info, tx_desc);
 
+	/*
+	 * Queue under tx_mtx: the consumer (rtw88_usb_tx_submit) dequeues
+	 * and re-queues under the same lock, and the two run on different
+	 * CPUs -- if_output on the sender, the worker on completions.  An
+	 * unprotected TAILQ insert loses the queue head under load and the
+	 * pipe then starves forever.
+	 */
+	mutex_enter(&usb->tx_mtx);
 	rtw88_skb_queue_tail(&usb->tx_queue[ep], skb);
+	mutex_exit(&usb->tx_mtx);
 	return 0;
+}
+
+bool
+rtw88_usb_tx_space(struct rtw88_usb *usb)
+{
+	int ep = usb->qsel_to_ep[TX_DESC_QSEL_TID0];
+	bool space;
+
+	if (usb->tx_stopped)
+		return false;
+	if (ep < 0 || ep >= usb->n_tx_pipe)
+		return false;
+
+	mutex_enter(&usb->tx_mtx);
+	space = !TAILQ_EMPTY(&usb->tx_free[ep]);
+	mutex_exit(&usb->tx_mtx);
+	return space;
 }
 
 static void
@@ -839,7 +912,7 @@ rtw88_usb_attach(struct rtw88_chip *chip, struct usbd_interface *iface)
 {
 	struct rtw88_usb *usb = &chip->usb;
 	struct rtw_dev *rtwdev = &chip->rtwdev;
-	int i, ret;
+	int i, ret, ep, data_ep;
 
 	usb->rtwdev = rtwdev;
 	netbsd_mutex_init(&usb->reg_mtx);
@@ -857,24 +930,36 @@ rtw88_usb_attach(struct rtw88_chip *chip, struct usbd_interface *iface)
 		return ret;
 
 	/*
-	 * TX buffers are bound to one bulk OUT pipe each, spread as evenly as
-	 * possible over the pipes the device exposes.
+	 * TX buffers are bound to one bulk OUT pipe each.  The even split of
+	 * the old round-robin gave the data pipe -- which carries every
+	 * TCP/UDP frame, see the RQPN table -- only two buffers, and a bulk
+	 * upload exhausted them within seconds.  Give two to each of the
+	 * mgmt/H2C pipes and the rest to the data pipe.
 	 */
-	for (i = 0; i < RTW88_TX_XFER_NUM; i++) {
-		int ep = i % usb->n_tx_pipe;
+	data_ep = usb->qsel_to_ep[TX_DESC_QSEL_TID0];
+	if (data_ep < 0 || data_ep >= usb->n_tx_pipe)
+		data_ep = 0;
+	i = 0;
+	for (ep = 0; ep < usb->n_tx_pipe; ep++) {
+		unsigned int cnt = (ep == data_ep) ?
+		    RTW88_TX_XFER_NUM - 2 * (usb->n_tx_pipe - 1) : 2;
 
-		ret = usbd_create_xfer(usb->tx_pipe[ep], RTW88_TX_BUFSZ,
-		    USBD_FORCE_SHORT_XFER, 0, &usb->tx[i].xfer);
-		if (ret != 0) {
-			rtw_err(rtwdev, "%s: tx xfer %d failed: %s\n", __func__,
-			    i, usbd_errstr(ret));
-			return ret;
+		while (cnt-- > 0 && i < RTW88_TX_XFER_NUM) {
+			ret = usbd_create_xfer(usb->tx_pipe[ep],
+			    RTW88_TX_BUFSZ, USBD_FORCE_SHORT_XFER, 0,
+			    &usb->tx[i].xfer);
+			if (ret != 0) {
+				rtw_err(rtwdev, "%s: tx xfer %d failed: %s\n",
+				    __func__, i, usbd_errstr(ret));
+				return ret;
+			}
+			usb->tx[i].buf = usbd_get_buffer(usb->tx[i].xfer);
+			usb->tx[i].usb = usb;
+			usb->tx[i].pipe = usb->tx_pipe[ep];
+			usb->tx[i].ep = ep;
+			TAILQ_INSERT_TAIL(&usb->tx_free[ep], &usb->tx[i], next);
+			i++;
 		}
-		usb->tx[i].buf = usbd_get_buffer(usb->tx[i].xfer);
-		usb->tx[i].usb = usb;
-		usb->tx[i].pipe = usb->tx_pipe[ep];
-		usb->tx[i].ep = ep;
-		TAILQ_INSERT_TAIL(&usb->tx_free[ep], &usb->tx[i], next);
 	}
 
 	for (i = 0; i < RTW88_RX_XFER_NUM; i++) {
