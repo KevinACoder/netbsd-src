@@ -223,6 +223,8 @@ extern const uint32_t aic8800u_patch_tbl[AIC8800_PATCH_TBL_COUNT][2];
 #define AIC8800_MM_KEY_ADD_CFM		0x025
 #define AIC8800_MM_KEY_DEL_REQ		0x026
 #define AIC8800_MM_KEY_DEL_CFM		0x027
+#define AIC8800_MM_GET_MAC_ADDR_REQ	0x073	/* cfm: 6-byte mac_addr */
+#define AIC8800_MM_GET_MAC_ADDR_CFM	0x074
 
 /* SCANU task (firmware-managed scan) */
 #define AIC8800_SCANU_START_REQ		0x1000

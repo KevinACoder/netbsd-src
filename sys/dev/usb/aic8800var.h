@@ -104,6 +104,7 @@ struct aic8800u_patch_table {
 #define AIC8800U_F_EVENT	0x04
 #define AIC8800U_F_EXIT		0x08
 #define AIC8800U_F_SCANTIMO	0x10	/* scan watchdog fired */
+#define AIC8800U_F_KEYSYNC	0x20	/* mirror net80211 keys to firmware */
 
 /* pseudo event id for TX confirmations delivered through the event queue */
 #define AIC8800U_EVT_TXCFM	0xffff
@@ -195,8 +196,18 @@ struct aic8800u_softc {
 	kmutex_t		 sc_work_mtx;	/* IPL_NET */
 	kcondvar_t		 sc_cv;
 	uint32_t		 sc_flags;
-	enum ieee80211_state	 sc_nstate;
-	int			 sc_narg;
+	/*
+	 * Pending state transitions, FIFO (sc_work_mtx).  A single slot
+	 * loses hops: connect_ind queues S_ASSOC then S_RUN back to back,
+	 * and the overwritten S_ASSOC made the stack see an illegal
+	 * S_AUTH->S_RUN transition that skipped the association-complete
+	 * notification wpa_supplicant waits for.
+	 */
+#define AIC8800U_NSTATEQ_MAX	8
+	enum ieee80211_state	 sc_nstateq[AIC8800U_NSTATEQ_MAX];
+	int			 sc_nargq[AIC8800U_NSTATEQ_MAX];
+	unsigned		 sc_nstateq_head;
+	unsigned		 sc_nstateq_tail;
 	lwp_t			*sc_worker;
 	struct callout		 sc_scan_to;	/* firmware scan watchdog */
 	struct aic8800u_txq	 sc_txq;
@@ -215,11 +226,15 @@ struct aic8800u_softc {
 
 	/* need_cfm TX bookkeeping (EAPOL / management frames) */
 	struct mbuf		*sc_txcfm_m[AIC8800U_TXCFM_SLOTS];
+	uint16_t		 sc_txcfm_plen[AIC8800U_TXCFM_SLOTS];
 	unsigned		 sc_txcfm_free;
 	unsigned		 sc_txcfm_used;
 	uint32_t		 sc_txcfm_acked;
 	uint32_t		 sc_txcfm_retried;
 	uint32_t		 sc_txcfm_lost;
+	uint32_t		 sc_txcfm_submitted;
+	uint32_t		 sc_txcfm_last_submit;
+	uint32_t		 sc_txcfm_last_used;
 
 	/* diagnostics */
 	uint32_t		 sc_rx_frames;
@@ -286,5 +301,15 @@ void	aic8800u_disconnect(struct aic8800u_softc *);
 int	aic8800u_key_add(struct aic8800u_softc *, const uint8_t *key,
 	    size_t key_len, unsigned key_idx, bool pairwise);
 void	aic8800u_control_port(struct aic8800u_softc *, bool open);
+void	aic8800u_dbg_sysctl_init(void);
+extern int	aic8800u_dbg_payload_mode;
+extern int	aic8800u_dbg_min_tx;
+
+/*
+ * Short data frames (EAPOL-Key M4, ARP) are silently swallowed by the
+ * firmware unless the descriptor advertises at least roughly this many
+ * bytes; measured on the board: 113 dropped, 135 passed, 120 passed.
+ */
+#define AIC8800U_TX_MIN_PAYLOAD	140
 
 #endif	/* _DEV_USB_AIC8800VAR_H_ */

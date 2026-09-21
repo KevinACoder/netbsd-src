@@ -132,6 +132,7 @@ static void	aic8800u_disconnect_ind(struct aic8800u_softc *);
 static void	aic8800u_txcfm(struct aic8800u_softc *,
 		    struct aic8800u_event *);
 static void	aic8800u_key_update_end(struct ieee80211com *);
+static void	aic8800u_key_sync(struct aic8800u_softc *);
 
 static int
 aic8800u_match(device_t parent, cfdata_t match, void *aux)
@@ -522,6 +523,7 @@ aic8800u_attach(device_t parent, device_t self, void *aux)
 		(void)aic8800u_app_attach(sc);
 	}
 
+	aic8800u_dbg_sysctl_init();
 	pmf_device_register(self, NULL, NULL);
 	usbd_add_drv_event(USB_EVENT_DRIVER_ATTACH, sc->sc_udev, sc->sc_dev);
 }
@@ -841,8 +843,17 @@ aic8800u_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 		return sc->sc_newstate(ic, nstate, arg);
 
 	mutex_enter(&sc->sc_work_mtx);
-	sc->sc_nstate = nstate;
-	sc->sc_narg = arg;
+	{
+		unsigned next =
+		    (sc->sc_nstateq_tail + 1) % AIC8800U_NSTATEQ_MAX;
+
+		if (next == sc->sc_nstateq_head)	/* overflow: drop oldest */
+			sc->sc_nstateq_head =
+			    (sc->sc_nstateq_head + 1) % AIC8800U_NSTATEQ_MAX;
+		sc->sc_nstateq[sc->sc_nstateq_tail] = nstate;
+		sc->sc_nargq[sc->sc_nstateq_tail] = arg;
+		sc->sc_nstateq_tail = next;
+	}
 	sc->sc_flags |= AIC8800U_F_NEWSTATE;
 	cv_broadcast(&sc->sc_cv);
 	mutex_exit(&sc->sc_work_mtx);
@@ -891,7 +902,8 @@ aic8800u_newstate_cb(struct aic8800u_softc *sc, enum ieee80211_state nstate,
 		 * never answers is caught by the net80211 mgt timer and
 		 * sends us back to S_SCAN.
 		 */
-		if (ostate != IEEE80211_S_AUTH && ostate != IEEE80211_S_ASSOC)
+		if ((ostate != IEEE80211_S_AUTH && ostate != IEEE80211_S_ASSOC
+		    ) && !sc->sc_connected)
 			(void)aic8800u_connect(sc, ic->ic_bss);
 		break;
 
@@ -1106,18 +1118,63 @@ aic8800u_connect_ind(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 	ap_idx = ind->ap_idx;
 	aid = le16toh(ind->aid) & 0x3fff;
 
-	s = splnet();
-	if (status_code == 0) {
-		sc->sc_connected = true;
-		sc->sc_ap_idx = ap_idx;
-		sc->sc_aid = aid;
-		if (ic->ic_bss != NULL)
-			ic->ic_bss->ni_associd = sc->sc_aid;
+	/*
+	 * The indication carries the association request/response IEs the
+	 * firmware actually exchanged.  hostapd validates EAPOL-Key 2/4
+	 * against the RSN IE it saw in the association request, so dump
+	 * both heads: a request IE different from what the connect request
+	 * supplied means the firmware rewrote it and the 4-way can never
+	 * complete.
+	 */
+	{
+		const uint8_t *ies = (const uint8_t *)ind->assoc_ie_buf;
+		unsigned req_len = le16toh(ind->assoc_req_ie_len);
+		unsigned rsp_len = le16toh(ind->assoc_rsp_ie_len);
+		unsigned avail = sizeof(ind->assoc_ie_buf);
+		unsigned i;
+
+		if (req_len > avail)
+			req_len = avail;
+		if (rsp_len > avail - req_len)
+			rsp_len = avail - req_len;
+
 		aprint_normal_dev(sc->sc_dev,
-		    "connected: ap sta %u, aid %#x\n", sc->sc_ap_idx,
-		    sc->sc_aid);
-		ieee80211_new_state(ic, IEEE80211_S_RUN, -1);
-	} else {
+		    "assoc ies: req_len=%u rsp_len=%u\n", req_len, rsp_len);
+		for (i = 0; i + 1 < req_len && i < 24; i += 2)
+			aprint_normal_dev(sc->sc_dev,
+			    "assoc req[%u]: %02x %02x\n", i, ies[i], ies[i + 1]);
+		for (i = 0; i + 1 < rsp_len && i < 24; i += 2)
+			aprint_normal_dev(sc->sc_dev,
+			    "assoc rsp[%u]: %02x %02x\n", i,
+			    ies[req_len + i], ies[req_len + i + 1]);
+	}
+
+	s = splnet();
+		if (status_code == 0) {
+			sc->sc_connected = true;
+			sc->sc_ap_idx = ap_idx;
+			sc->sc_aid = aid;
+			if (ic->ic_bss != NULL)
+				ic->ic_bss->ni_associd = sc->sc_aid;
+			aprint_normal_dev(sc->sc_dev,
+			    "connected: ap sta %u, aid %#x\n", sc->sc_ap_idx,
+			    sc->sc_aid);
+			/*
+			 * The transition table calls a direct S_AUTH->S_RUN
+			 * invalid: it only prints "invalid transition" and
+			 * skips the body that fires ieee80211_notify_node_join
+			 * -- wpa_supplicant would never see the association
+			 * complete (no RTM_IEEE80211_ASSOC, no link up).
+			 * Walk the legal S_ASSOC hop and enter RUN with the
+			 * ASSOC_RESP arg like a software-SME driver.  The
+			 * AUTH/ASSOC_REQ frames the stack queues along the
+			 * way are dropped by if_start (firmware performs the
+			 * real exchange).
+			 */
+			ieee80211_new_state(ic, IEEE80211_S_ASSOC, -1);
+			ieee80211_new_state(ic, IEEE80211_S_RUN,
+			    IEEE80211_FC0_SUBTYPE_ASSOC_RESP);
+		} else {
 		aprint_normal_dev(sc->sc_dev,
 		    "connect failed: status %u\n", status_code);
 		ieee80211_new_state(ic, IEEE80211_S_SCAN, 0);
@@ -1156,6 +1213,7 @@ aic8800u_txcfm(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 	used = le32dec(&ev->ev_data[4]);
 
 	slot = used % AIC8800U_TXCFM_SLOTS;
+	sc->sc_txcfm_last_used = used;
 	m = sc->sc_txcfm_m[slot];
 	sc->sc_txcfm_m[slot] = NULL;
 	if (m == NULL) {
@@ -1167,11 +1225,23 @@ aic8800u_txcfm(struct aic8800u_softc *sc, struct aic8800u_event *ev)
 		ieee80211_free_node(ni);
 	m_freem(m);
 
-	/* union rwnx_hw_txstatus: bit0 tx_done, bit3 acknowledged */
+	/* union rwnx_hw_txstatus: bit0 tx_done, bit1 retry_required,
+	 * bit2 sw_retry_required, bit3 acknowledged */
 	if (status & (1u << 3))
 		sc->sc_txcfm_acked++;
 	else
 		sc->sc_txcfm_retried++;
+
+	/* Only EAPOL frames take CFM slots in this driver, so this prints
+	 * once per 4-way message: acknowledged=1 means the frame reached
+	 * the AP (content rejection is then a key problem); otherwise the
+	 * frame never made it on air.  plen identifies the message
+	 * (121 = M2 with RSN IE, 99 = M4). */
+	aprint_normal_dev(sc->sc_dev,
+	    "EAPOL cfm: used=%u slot=%u plen=%u st=%#x ack=%u retry=%u "
+	    "lost=%u\n",
+	    used, slot, sc->sc_txcfm_plen[slot], status, sc->sc_txcfm_acked,
+	    sc->sc_txcfm_retried, sc->sc_txcfm_lost);
 }
 
 static void
@@ -1206,37 +1276,81 @@ aic8800u_handle_events(struct aic8800u_softc *sc)
 /*
  * Keys: net80211 installs PTK/GTK into its software-crypto tables with
  * no driver hook -- except the cs_key_update_* bracket around every key
- * ioctl.  At update end, mirror every installed key into the firmware
- * (it owns the on-air CCMP) and open the control port.
+ * ioctl or node key teardown.  net80211 holds its node/crypto spin
+ * locks across this callback (seen on the board: a synchronous MM_KEY_ADD
+ * here cv_wait()s "with spin-mutex held" and panics), so do nothing but
+ * flag the worker; aic8800u_key_sync() mirrors the final table state to
+ * the firmware once no net80211 lock is held.
  */
 static void
 aic8800u_key_update_end(struct ieee80211com *ic)
 {
 	struct aic8800u_softc *sc = ic->ic_ifp->if_softc;
-	struct ieee80211_key *wk;
-	unsigned kid;
-	int error;
 
 	if (!sc->sc_connected || sc->sc_ap_idx < 0)
 		return;
 
+	mutex_enter(&sc->sc_work_mtx);
+	sc->sc_flags |= AIC8800U_F_KEYSYNC;
+	cv_broadcast(&sc->sc_cv);
+	mutex_exit(&sc->sc_work_mtx);
+}
+
+/* Worker context: push the current net80211 keys into the firmware (it
+ * owns the on-air CCMP) and open the control port. */
+static void
+aic8800u_key_sync(struct aic8800u_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_key *wk;
+	unsigned kid;
+	int error, s;
+	bool have_ptk = false;
+
+	if (!sc->sc_connected || sc->sc_ap_idx < 0)
+		return;
+
+	s = splnet();
 	wk = &ic->ic_bss->ni_ucastkey;
 	if (wk->wk_cipher != NULL && wk->wk_keylen > 0) {
 		error = aic8800u_key_add(sc, wk->wk_key, wk->wk_keylen, 0,
 		    true);
-		if (error == 0)
-			aprint_normal_dev(sc->sc_dev,
-			    "PTK installed (%zu bytes)\n",
-			    (size_t)wk->wk_keylen);
-		aic8800u_control_port(sc, true);
+		if (error != 0) {
+			splx(s);
+			aprint_error_dev(sc->sc_dev,
+			    "PTK install failed (%d); closing control port\n",
+			    error);
+			goto failed;
+		}
+		have_ptk = true;
+		aprint_normal_dev(sc->sc_dev,
+		    "PTK installed (%zu bytes)\n", (size_t)wk->wk_keylen);
 	}
 
 	for (kid = 0; kid < IEEE80211_WEP_NKID; kid++) {
 		wk = &ic->ic_nw_keys[kid];
-		if (wk->wk_cipher != NULL && wk->wk_keylen > 0)
-			(void)aic8800u_key_add(sc, wk->wk_key, wk->wk_keylen,
-			    kid, false);
+		if (wk->wk_cipher == NULL || wk->wk_keylen == 0)
+			continue;
+		error = aic8800u_key_add(sc, wk->wk_key, wk->wk_keylen,
+		    kid, false);
+		if (error != 0) {
+			splx(s);
+			aprint_error_dev(sc->sc_dev,
+			    "GTK %u install failed (%d); closing control port\n",
+			    kid, error);
+			goto failed;
+		}
 	}
+	splx(s);
+
+	/* Open only after PTK and all currently supplied GTKs succeeded.
+	 * A later key-update ioctl may supply GTKs separately. */
+	if (have_ptk)
+		aic8800u_control_port(sc, true);
+	return;
+
+failed:
+	aic8800u_control_port(sc, false);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1260,11 +1374,16 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 	struct aic8800u_hostdesc *desc;
 	uint8_t *buf = sc->sc_tx_buf;
 	uint8_t *mp;
-	size_t hdr_len, body_off, plen, len;
+	size_t hdr_len, body_off, plen, txplen, len;
+	size_t payload_off;
 	uint16_t ethertype;
 	bool cfm = false;
-	unsigned slot = 0;
+	unsigned slot = 0, cfmidx = 0;
 	int error;
+	uint8_t eap[17];		/* EAPOL header + EAPOL-Key head */
+	unsigned key_info = 0;
+	uint64_t replay = 0;
+	const char *emsg = "?";
 
 	ni = M_GETCTX(m, struct ieee80211_node *);
 
@@ -1278,7 +1397,9 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 
 	if (m->m_pkthdr.len < (int)(body_off + 8) ||
 	    m->m_pkthdr.len > (int)(body_off + 8 + AIC8800_DATA_TX_BUF_MAX -
-	    4 - sizeof(*desc) - 14 - 8)) {
+	    4 - sizeof(*desc) - 8 -
+	    ((aic8800u_dbg_payload_mode == 1 ||
+	      aic8800u_dbg_payload_mode == 2) ? 14 : 0))) {
 		if_statinc(ifp, if_oerrors);
 		ieee80211_free_node(ni);
 		m_freem(m);
@@ -1288,8 +1409,59 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 	ethertype = (mp[body_off + 6] << 8) | mp[body_off + 7];
 	plen = m->m_pkthdr.len - body_off - 8;	/* Ethernet payload bytes */
 
-	/* total wire length includes the 4-byte header */
-	len = 4 + sizeof(*desc) + 14 + plen;
+	payload_off = body_off + 8;
+	if (ethertype == 0x888e && plen >= sizeof(eap)) {
+		m_copydata(m, payload_off, sizeof(eap), eap);
+		key_info = (eap[5] << 8) | eap[6];
+		for (unsigned i = 9; i < 17; i++)
+			replay = (replay << 8) | eap[i];
+		if (eap[1] != 3)
+			emsg = "eapol";
+		else if (key_info & 0x0080)	/* Ack */
+			emsg = (key_info & 0x0100) ? "M3" : "M1";
+		else if (key_info & 0x0100)	/* MIC */
+			emsg = (key_info & 0x0200) ? "M4" : "M2";
+		else
+			emsg = "key?";
+	}
+
+	/*
+	 * The payload handed to the firmware is the ETHERNET PAYLOAD ONLY
+	 * (after the 14-byte header, vendor skb_pull(skb, 14) at
+	 * rwnx_tx.c); the L2 addresses live in the descriptor and the
+	 * firmware builds the 802.11 header plus LLC/SNAP itself.  The air
+	 * capture (20260921 m3cap round) showed the earlier behaviour of
+	 * embedding a rebuilt Ethernet header as a double encapsulation --
+	 * LLC/SNAP(0x888e) + full Ethernet header + EAPOL body -- which the
+	 * AP cannot parse: every M2 was dropped and M1 retransmitted
+	 * forever.
+	 */
+	/* Mode 1 reproduces the captured double Ethernet encapsulation.  Mode
+	 * 2 keeps payload bytes unchanged but advertises the alternate length
+	 * interpretation used by some AIC USB builds. */
+	txplen = plen;
+	if (aic8800u_dbg_payload_mode == 1)
+		txplen += 14;
+	else if (aic8800u_dbg_payload_mode == 2)
+		txplen += 14;
+	/*
+	 * Pad the payload so the advertised packet_len reaches
+	 * AIC8800U_TX_MIN_PAYLOAD (hw.aic8800.min_tx overrides, 0 disables).
+	 * The firmware silently drops short frames: EAPOL-Key M4 at
+	 * packet_len 113 was never confirmed while M2 at 135 was, and the
+	 * same rule kept ARP off the air.  Padding is protocol-legal: EAPOL
+	 * and ARP carry their own length fields.
+	 */
+	if (aic8800u_dbg_min_tx > 0) {
+		size_t want = (size_t)aic8800u_dbg_min_tx;
+		size_t hardmax = AIC8800_DATA_TX_BUF_MAX - 4 - sizeof(*desc) - 8;
+
+		if (want > hardmax)
+			want = hardmax;
+		if (txplen < want)
+			txplen = want;
+	}
+	len = 4 + sizeof(*desc) + txplen;
 	memset(buf, 0, len + 8);
 	buf[0] = len & 0xff;
 	buf[1] = (len >> 8) & 0x0f;
@@ -1297,32 +1469,100 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 	buf[3] = 0x00;
 
 	desc = (struct aic8800u_hostdesc *)&buf[4];
-	desc->packet_len = htole16(14 + plen);
+	desc->packet_len = htole16((uint16_t)txplen);
 	memcpy(desc->eth_dest_addr, wh->i_addr3, 6);	/* RA = AP */
 	memcpy(desc->eth_src_addr, wh->i_addr2, 6);	/* TA = us */
-	desc->ethertype = htole16(ethertype);
-	desc->ac = 1;			/* BE */
-	desc->tid = 0xff;
+	/*
+	 * Vendor stores the on-wire header bytes verbatim here (their
+	 * eth_t.h_proto assignment), so the firmware reads this field
+	 * big-endian and matches EAPOL as 0x888e.  htole16() put the
+	 * bytes in the opposite order and the firmware stopped
+	 * recognizing EAPOL -- M2 went out as an ordinary data frame and
+	 * the AP kept retransmitting M1.
+	 */
+	desc->ethertype = (uint16_t)((mp[body_off + 7] << 8) |
+	    mp[body_off + 6]);
+	/* Vendor classifies EAPOL priority 7 as VO/TID 7.  Non-EAPOL data
+	 * must carry a real TID too: 0xff (non-QoS) frames are silently
+	 * dropped by this firmware (ARP never reached the air, 20260921). */
+	desc->ac = (ethertype == 0x888e) ? 3 : 1;
+	desc->tid = (ethertype == 0x888e) ? 7 : 0;
 	desc->vif_idx = sc->sc_vif_idx;
 	desc->staid = sc->sc_connected ? sc->sc_ap_idx : 0xff;
 	desc->flags = 0;
 
 	if (ethertype == 0x888e && sc->sc_connected) {
-		slot = sc->sc_txcfm_free % AIC8800U_TXCFM_SLOTS;
-		if (sc->sc_txcfm_m[slot] == NULL) {
-			cfm = true;
-			desc->status_desc_addr =
-			    htole32(0x80000000u | slot);
+		unsigned k;
+
+		/*
+		 * Prefer a slot whose previous frame already got its
+		 * confirmation: the firmware echoes the submit index back, so
+		 * reusing an occupied slot would misattribute the late
+		 * confirmation to the new frame.  A permanently lost
+		 * confirmation must not wedge the counter either -- that is
+		 * how the M4 investigation went blind (the free index stalled
+		 * on an occupied slot and every later EAPOL frame was sent
+		 * with cfm=0).
+		 */
+		for (k = 0; k < AIC8800U_TXCFM_SLOTS; k++) {
+			slot = (sc->sc_txcfm_free + k) %
+			    AIC8800U_TXCFM_SLOTS;
+			if (sc->sc_txcfm_m[slot] == NULL)
+				break;
 		}
+		if (k == AIC8800U_TXCFM_SLOTS) {
+			struct ieee80211_node *sni;
+
+			slot = sc->sc_txcfm_free % AIC8800U_TXCFM_SLOTS;
+			k = 0;
+			sni = M_GETCTX(sc->sc_txcfm_m[slot],
+			    struct ieee80211_node *);
+			if (sni != NULL)
+				ieee80211_free_node(sni);
+			m_freem(sc->sc_txcfm_m[slot]);
+			sc->sc_txcfm_m[slot] = NULL;
+			sc->sc_txcfm_lost++;
+			aprint_normal_dev(sc->sc_dev,
+			    "EAPOL cfm: all slots busy, reusing %u\n", slot);
+		}
+		cfm = true;
+		cfmidx = sc->sc_txcfm_free + k;
+		desc->status_desc_addr = htole32(0x80000000u | cfmidx);
 	}
 
-	/* Ethernet header: dst = addr3 (DA), src = addr2 (TA) */
-	memcpy(&buf[4 + sizeof(*desc)], wh->i_addr3, 6);
-	memcpy(&buf[4 + sizeof(*desc) + 6], wh->i_addr2, 6);
-	buf[4 + sizeof(*desc) + 12] = ethertype >> 8;
-	buf[4 + sizeof(*desc) + 13] = ethertype & 0xff;
-	m_copydata(m, body_off + 8, plen,
-	    &buf[4 + sizeof(*desc) + 14]);
+	if (aic8800u_dbg_payload_mode == 1) {
+		uint8_t *p = &buf[4 + sizeof(*desc)];
+		memcpy(p, wh->i_addr3, 6);
+		memcpy(p + 6, wh->i_addr2, 6);
+		p[12] = mp[body_off + 6];
+		p[13] = mp[body_off + 7];
+		m_copydata(m, payload_off, plen, p + 14);
+	} else {
+		m_copydata(m, payload_off, plen, &buf[4 + sizeof(*desc)]);
+	}
+
+	if (ethertype == 0x888e)
+		/* NB: one addr per line -- ether_sprintf() shares a single
+		 * static buffer, so three calls in one printf all print the
+		 * third address. */
+		aprint_normal_dev(sc->sc_dev,
+		    "EAPOL wire: msg=%s fc=%02x%02x hdr=%zu plen=%zu "
+		    "ki=%#06x replay=%llu "
+		    "a2=%02x:%02x:%02x:%02x:%02x:%02x "
+		    "a1=%02x:%02x:%02x:%02x:%02x:%02x\n",
+		    emsg, wh->i_fc[0], wh->i_fc[1], hdr_len, plen,
+		    key_info, (unsigned long long)replay,
+		    wh->i_addr2[0], wh->i_addr2[1], wh->i_addr2[2],
+		    wh->i_addr2[3], wh->i_addr2[4], wh->i_addr2[5],
+		    wh->i_addr1[0], wh->i_addr1[1], wh->i_addr1[2],
+		    wh->i_addr1[3], wh->i_addr1[4], wh->i_addr1[5]);
+	if (ethertype == 0x888e)
+		aprint_normal_dev(sc->sc_dev,
+		    "EAPOL desc: msg=%s mode=%d usb_len=%zu packet_len=%u ac=%u "
+		    "tid=%u vif=%u sta=%u cfm=%d slot=%u idx=%u\n",
+		    emsg, aic8800u_dbg_payload_mode, len,
+		    le16toh(desc->packet_len), desc->ac, desc->tid,
+		    desc->vif_idx, desc->staid, cfm, slot, cfmidx);
 
 	/* pad to 4; a multiple of 512 needs one extra byte (short packet) */
 	len = (len + 3) & ~3u;
@@ -1337,9 +1577,20 @@ aic8800u_tx_frame(struct aic8800u_softc *sc, struct mbuf *m)
 		return;
 	}
 
+	if_statinc(ifp, if_opackets);
+	if_statadd(ifp, if_obytes, plen + 14);
+
+	/* Low-rate diagnostic for the 4-way: one line per EAPOL write so a
+	 * silent M2 can be told apart from one the AP rejects. */
+	if (ethertype == 0x888e)
+		aprint_normal_dev(sc->sc_dev, "EAPOL tx len=%zu ok\n", len);
+
 	if (cfm) {
 		sc->sc_txcfm_m[slot] = m;
-		sc->sc_txcfm_free++;
+		sc->sc_txcfm_plen[slot] = (uint16_t)plen;
+		sc->sc_txcfm_submitted++;
+		sc->sc_txcfm_last_submit = slot;
+		sc->sc_txcfm_free = cfmidx + 1;
 		/* node ref rides the mbuf to the confirmation */
 	} else {
 		ieee80211_free_node(ni);
@@ -1387,8 +1638,6 @@ aic8800u_worker(void *arg)
 	struct mbuf *m;
 	struct ieee80211_node *ni;
 	uint32_t flags;
-	enum ieee80211_state nstate;
-	int narg;
 
 	MBUFQ_INIT(&locq);
 
@@ -1396,14 +1645,12 @@ aic8800u_worker(void *arg)
 		mutex_enter(&sc->sc_work_mtx);
 		while (!(sc->sc_flags & (AIC8800U_F_NEWSTATE |
 		    AIC8800U_F_TX | AIC8800U_F_EVENT | AIC8800U_F_SCANTIMO |
-		    AIC8800U_F_EXIT)) && !sc->sc_dying) {
+		    AIC8800U_F_KEYSYNC | AIC8800U_F_EXIT)) && !sc->sc_dying) {
 			if (cv_timedwait(&sc->sc_cv, &sc->sc_work_mtx,
 			    mstohz(100)) == EWOULDBLOCK)
 				break;
 		}
 		flags = sc->sc_flags;
-		nstate = sc->sc_nstate;
-		narg = sc->sc_narg;
 		sc->sc_flags = 0;
 		/* Steal the TX queue without holding the mutex on USB. */
 		for (;;) {
@@ -1424,10 +1671,40 @@ aic8800u_worker(void *arg)
 		if (flags & AIC8800U_F_EVENT)
 			aic8800u_handle_events(sc);
 
-		if (flags & AIC8800U_F_NEWSTATE)
-			aic8800u_newstate_cb(sc, nstate, narg);
+		/* Drain the pending-transition queue: connect_ind queues
+		 * S_ASSOC and S_RUN back to back and both hops must run,
+		 * in order, for the stack to fire the association-complete
+		 * notification. */
+		for (;;) {
+			enum ieee80211_state ns;
+			int na;
 
+			mutex_enter(&sc->sc_work_mtx);
+			if (sc->sc_nstateq_head == sc->sc_nstateq_tail) {
+				mutex_exit(&sc->sc_work_mtx);
+				break;
+			}
+			ns = sc->sc_nstateq[sc->sc_nstateq_head];
+			na = sc->sc_nargq[sc->sc_nstateq_head];
+			sc->sc_nstateq_head = (sc->sc_nstateq_head + 1) %
+			    AIC8800U_NSTATEQ_MAX;
+			mutex_exit(&sc->sc_work_mtx);
+
+			aic8800u_newstate_cb(sc, ns, na);
+		}
+
+		/* EAPOL M4 must hit the air BEFORE the PTK lands in the
+		 * firmware: wpa_supplicant queues M4 and installs the PTK
+		 * microseconds later, and the firmware that already owns the
+		 * pairwise key treats the queued M4 as a data frame (the AP
+		 * then retransmits M3 forever -- 20260921 M4 investigation).
+		 * Same for the data frames that follow. */
 		aic8800u_tx_drain(sc, &locq);
+
+		/* After any connect_ind in this batch: the firmware needs
+		 * the keys before wpa's EAPOL timeout elapses. */
+		if (flags & AIC8800U_F_KEYSYNC)
+			aic8800u_key_sync(sc);
 	}
 
 	/* Flush anything still queued. */

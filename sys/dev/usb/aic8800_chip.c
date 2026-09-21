@@ -62,6 +62,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/device.h>
+#include <sys/sysctl.h>
 
 #include <dev/firmload.h>
 
@@ -71,6 +72,88 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include "aic8800var.h"
 
 #define AIC8800_FWDIR	"aic8800u"
+
+/*
+ * Board-debug knobs (hw.aic8800.*): runtime A/B of the SM_CONNECT_REQ
+ * fields while chasing the 4-way handshake stall.  0 keeps the driver
+ * default.  Deliberately global, not per-device: this board has a single
+ * AIC8800D80 and the values surviving USB re-enumeration is the point.
+ */
+static int aic8800u_dbg_connect_flags;
+static int aic8800u_dbg_ctrl_ethertype;
+static int aic8800u_dbg_cp_early;
+int aic8800u_dbg_payload_mode;
+/*
+ * The firmware silently discards short data frames: an EAPOL-Key M4 at
+ * packet_len 113 never appeared on air (no TX confirmation at all, while
+ * M2 at 135 was acknowledged), and ARP frames (~60 bytes of descriptor
+ * length) never left the chip either.  Padding the payload up to a safe
+ * minimum fixes the 4-way handshake (M4 now acknowledged, first
+ * CTRL-EVENT-CONNECTED and 5/5 ping after 589 failed attempts) and lets
+ * ARP out.  Trailing zeros are protocol-legal: EAPOL/ARP carry their own
+ * length.  0 disables the padding (diagnostic only).
+ */
+int aic8800u_dbg_min_tx = AIC8800U_TX_MIN_PAYLOAD;
+
+void
+aic8800u_dbg_sysctl_init(void)
+{
+	const struct sysctlnode *rnode, *cnode;
+	static int done;
+	int error;
+
+	if (done)
+		return;
+
+	error = sysctl_createv(NULL, 0, NULL, &rnode,
+	    0, CTLTYPE_NODE, "aic8800",
+	    SYSCTL_DESCR("AIC8800D80 board-debug controls"),
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "connect_flags", SYSCTL_DESCR(
+	    "if nonzero, overrides SM_CONNECT_REQ flags"),
+	    NULL, 0, &aic8800u_dbg_connect_flags,
+	    sizeof(aic8800u_dbg_connect_flags), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "ctrl_port_ethertype", SYSCTL_DESCR(
+	    "if nonzero, overrides ctrl_port_ethertype (0x8e88 = on-wire)"),
+	    NULL, 0, &aic8800u_dbg_ctrl_ethertype,
+	    sizeof(aic8800u_dbg_ctrl_ethertype), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "cp_early", SYSCTL_DESCR(
+	    "if nonzero, open the control port right after SM_CONNECT"),
+	    NULL, 0, &aic8800u_dbg_cp_early,
+	    sizeof(aic8800u_dbg_cp_early), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "payload_mode", SYSCTL_DESCR(
+	    "TX layout: 0 payload-only, 1 embedded Ethernet header, 2 length+14"),
+	    NULL, 0, &aic8800u_dbg_payload_mode,
+	    sizeof(aic8800u_dbg_payload_mode), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "min_tx", SYSCTL_DESCR(
+	    "minimum descriptor packet_len; short frames are padded (0 = off)"),
+	    NULL, 0, &aic8800u_dbg_min_tx,
+	    sizeof(aic8800u_dbg_min_tx), CTL_CREATE, CTL_EOL);
+	done = 1;
+	return;
+fail:
+	aprint_error("aic8800: sysctl_createv failed (%d)\n", error);
+}
 
 /*
  * patch_tbl_d80 as resolved for the ground-truth build (USE_5G,
@@ -644,11 +727,13 @@ out:
 /* App-runtime command wrappers (M2+)                                  */
 /* ------------------------------------------------------------------ */
 
-/* The channel set we announce to the firmware: 2.4 GHz 1-13, 5 GHz the
- * common non-weather channels.  tx_power 20 dBm; the firmware clamps. */
-static const uint16_t aic8800u_chan_5g[] = {
-	36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120,
-	124, 128, 132, 136, 140, 149, 153, 157, 161, 165,
+/* Frequencies in MHz, as required by mac_chan_def (not channel numbers).
+ * Keep the existing channel set for the frequency-encoding A/B test;
+ * regulatory flags and DFS policy still need the Linux trace comparison. */
+static const uint16_t aic8800u_freq_5g[] = {
+	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
+	5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640,
+	5660, 5680, 5700, 5745, 5765, 5785, 5805, 5825,
 };
 
 static void
@@ -693,6 +778,37 @@ aic8800u_fw_init(struct aic8800u_softc *sc)
 		    "fw version %08x lmac %08x\n",
 		    le32dec(&vercfm[8]), le32dec(&vercfm[0]));
 
+	/*
+	 * Ask the firmware which MAC it uses on air and adopt it.  Linux's
+	 * vendor driver does exactly this (MM_GET_MAC_ADDR, efuse first)
+	 * before building the interface; a host-invented address that the
+	 * firmware ignores would make the AP derive the PTK from a source
+	 * address the supplicant never used, so every EAPOL-Key 2/4 would
+	 * fail the MIC check while still being acknowledged on air.
+	 */
+	{
+		uint8_t maccfm[6];
+		static const uint8_t zero[6] = { 0 }, bcast[6] =
+		    { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+		error = aic8800u_cmd(sc, AIC8800_MM_GET_MAC_ADDR_REQ,
+		    AIC8800_TASK_MM, AIC8800_DRV_TASK_ID, NULL, 0, maccfm,
+		    sizeof(maccfm));
+		if (error == 0 && memcmp(maccfm, zero, 6) != 0 &&
+		    memcmp(maccfm, bcast, 6) != 0) {
+			memcpy(sc->sc_mac_addr, maccfm, 6);
+			aprint_normal_dev(sc->sc_dev,
+			    "firmware MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+			    maccfm[0], maccfm[1], maccfm[2], maccfm[3],
+			    maccfm[4], maccfm[5]);
+		} else {
+			aprint_normal_dev(sc->sc_dev,
+			    "firmware MAC query failed (%d), keeping host MAC\n",
+			    error);
+		}
+		error = 0;
+	}
+
 	/* ME_CONFIG: legacy 20MHz STA, power save off */
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.ps_on = 0;
@@ -708,9 +824,9 @@ aic8800u_fw_init(struct aic8800u_softc *sc)
 	for (i = 0; i < 13; i++)
 		aic8800u_fill_chan(&chans.chan2G4[i], 2412 + 5 * i);
 	chans.chan2G4_cnt = 13;
-	for (i = 0; i < __arraycount(aic8800u_chan_5g); i++)
-		aic8800u_fill_chan(&chans.chan5G[i], aic8800u_chan_5g[i]);
-	chans.chan5G_cnt = __arraycount(aic8800u_chan_5g);
+	for (i = 0; i < __arraycount(aic8800u_freq_5g); i++)
+		aic8800u_fill_chan(&chans.chan5G[i], aic8800u_freq_5g[i]);
+	chans.chan5G_cnt = __arraycount(aic8800u_freq_5g);
 	error = aic8800u_cmd(sc, AIC8800_ME_CHAN_CONFIG_REQ, AIC8800_TASK_ME,
 	    AIC8800_DRV_TASK_ID, &chans, sizeof(chans), NULL, 0);
 	if (error != 0)
@@ -747,9 +863,9 @@ aic8800u_fw_init(struct aic8800u_softc *sc)
 }
 
 /*
- * One firmware scan over the whole channel set.  The command answers
- * with SCANU_START_CFM_ADDTIONAL; results arrive as SCANU_RESULT_IND
- * events and the async SCANU_START_CFM (0x1001) marks the end.
+ * One firmware scan over the whole channel set.  Results arrive as
+ * SCANU_RESULT_IND events; this firmware reports completion through
+ * the async SCANU_START_CFM (0x1001), without an additional CFM.
  */
 int
 aic8800u_scan_start(struct aic8800u_softc *sc, const uint8_t *ssid,
@@ -762,9 +878,9 @@ aic8800u_scan_start(struct aic8800u_softc *sc, const uint8_t *ssid,
 	memset(&req, 0, sizeof(req));
 	for (i = 0; i < 13; i++)
 		aic8800u_fill_chan(&req.chan[i], 2412 + 5 * i);
-	for (i = 0; i < __arraycount(aic8800u_chan_5g); i++)
-		aic8800u_fill_chan(&req.chan[13 + i], aic8800u_chan_5g[i]);
-	req.chan_cnt = 13 + __arraycount(aic8800u_chan_5g);
+	for (i = 0; i < __arraycount(aic8800u_freq_5g); i++)
+		aic8800u_fill_chan(&req.chan[13 + i], aic8800u_freq_5g[i]);
+	req.chan_cnt = 13 + __arraycount(aic8800u_freq_5g);
 
 	memset(req.bssid.a, 0xff, sizeof(req.bssid.a));
 
@@ -812,13 +928,83 @@ aic8800u_connect(struct aic8800u_softc *sc, struct ieee80211_node *ni)
 	else
 		req.chan.freq = htole16((uint16_t)-1);
 
-	req.flags = htole32(AIC8800_CONNECT_CONTROL_PORT_HOST);
+	/*
+	 * CONTROL_PORT_NO_ENC keeps the EAPOL exchange in the clear while
+	 * the PTK is still being negotiated.  Linux sets it by default
+	 * (cfg80211 control_port_no_encrypt); without it the firmware
+	 * encrypted our EAPOL-Key 2/4, the AP answered every frame at
+	 * the link layer (TX CFM status 0x9 acknowledged) yet kept
+	 * retransmitting M1 because the handshake payload was unreadable.
+	 */
+	req.flags = htole32(AIC8800_CONNECT_CONTROL_PORT_HOST |
+	    AIC8800_CONNECT_CONTROL_PORT_NO_ENC);
 	if ((ic->ic_flags & IEEE80211_F_WPA) != 0)
 		req.flags |= htole32(AIC8800_CONNECT_WPA_WPA2_IN_USE);
-	req.ctrl_port_ethertype = htole16(0x888e);
+	/* Vendor stores the on-wire ethertype bytes verbatim (cfg80211
+	 * hands over htons(ETH_P_PAE)); byte-swapping here makes the
+	 * firmware fail to recognize the control port. */
+	req.ctrl_port_ethertype = htole16(0x8e88);	/* = BE 0x888e */
+	if (aic8800u_dbg_connect_flags != 0)
+		req.flags = htole32(aic8800u_dbg_connect_flags);
+	if (aic8800u_dbg_ctrl_ethertype != 0)
+		req.ctrl_port_ethertype =
+		    htole16(aic8800u_dbg_ctrl_ethertype);
+	aprint_normal_dev(sc->sc_dev,
+	    "connect flags %#x ctrl_port_ethertype %#06x\n",
+	    le32toh(req.flags), le16toh(req.ctrl_port_ethertype));
 	req.auth_type = 0;	/* open */
 	req.uapsd_queues = 0;
 	req.vif_idx = sc->sc_vif_idx;
+
+	/* Vendor module defaults: wake for every beacon, wait for the
+	 * BC/MC window.  listen_interval=0 told the firmware never to
+	 * schedule beacon reception -- the board saw a handful of
+	 * beacons at association and then eternal RX silence. */
+	req.listen_interval = htole16(1);
+	req.dont_wait_bcmc = 0;
+
+	/*
+	 * The association request must carry the same RSN IE that
+	 * wpa_supplicant will use in its EAPOL-Key 2/4, or hostapd's
+	 * wpa_validate_wpa_ie() drops M2 and keeps retransmitting M1
+	 * (the board saw exactly that: MIC verified correct offline,
+	 * frame acknowledged, AP still resending M1).  The software-SME
+	 * path gets this IE from ieee80211_output.c, which appends
+	 * ic_opt_ie -- the buffer wpa_supplicant writes via
+	 * IEEE80211_IOC_OPTIE.  Take it from there; fall back to the
+	 * AP's own RSN IE captured during scan only when wpa has not
+	 * supplied one.
+	 */
+	if (ic->ic_opt_ie != NULL && ic->ic_opt_ie_len >= 2 &&
+	    ic->ic_opt_ie_len <= sizeof(req.ie_buf)) {
+		const uint8_t *ie = ic->ic_opt_ie;
+
+		if (ie[0] == IEEE80211_ELEMID_RSN && 2 + ie[1] <= ic->ic_opt_ie_len) {
+			memcpy(req.ie_buf, ie, 2 + ie[1]);
+			req.ie_len = htole16(2 + ie[1]);
+		}
+	}
+	if (req.ie_len == 0 && ni->ni_wpa_ie != NULL &&
+	    ni->ni_wpa_ie[0] == IEEE80211_ELEMID_RSN &&
+	    ni->ni_wpa_ie[1] <= sizeof(req.ie_buf) - 2) {
+		memcpy(req.ie_buf, ni->ni_wpa_ie, 2 + ni->ni_wpa_ie[1]);
+		req.ie_len = htole16(2 + ni->ni_wpa_ie[1]);
+	}
+
+	/* Which IE actually went into the association request, and does it
+	 * match what wpa_supplicant puts in EAPOL-Key 2/4?  hostapd drops
+	 * M2 when the two disagree. */
+	{
+		const uint8_t *ie = (const uint8_t *)req.ie_buf;
+		unsigned n = le16toh(req.ie_len), i;
+
+		aprint_normal_dev(sc->sc_dev,
+		    "assoc ie: len=%u src=%s\n",
+		    n, ic->ic_opt_ie != NULL ? "optie" : "beacon");
+		for (i = 0; i + 1 < n && i < 32; i += 2)
+			aprint_normal_dev(sc->sc_dev,
+			    "assoc ie[%u]: %02x %02x\n", i, ie[i], ie[i + 1]);
+	}
 
 	error = aic8800u_cmd(sc, AIC8800_SM_CONNECT_REQ, AIC8800_TASK_SM,
 	    AIC8800_DRV_TASK_ID, &req, sizeof(req), cfm, sizeof(cfm));
@@ -828,6 +1014,13 @@ aic8800u_connect(struct aic8800u_softc *sc, struct ieee80211_node *ni)
 	if (cfm[0] != 0) {
 		aprint_error_dev(sc->sc_dev, "sm_connect status %u\n", cfm[0]);
 		return EIO;
+	}
+	if (aic8800u_dbg_cp_early) {
+		/* A/B lever: vendor STA mode never opens the control port
+		 * (only AP/TDLS does); test whether this firmware gates the
+		 * EAPOL exchange on it anyway. */
+		aprint_normal_dev(sc->sc_dev, "cp_early: opening control port\n");
+		aic8800u_control_port(sc, true);
 	}
 	return 0;
 }
@@ -882,11 +1075,16 @@ void
 aic8800u_control_port(struct aic8800u_softc *sc, bool open)
 {
 	struct aic8800u_me_set_control_port_req req;
+	int error;
 
 	memset(&req, 0, sizeof(req));
 	req.sta_idx = sc->sc_ap_idx;
 	req.control_port_open = open;
-	(void)aic8800u_cmd(sc, AIC8800_ME_SET_CONTROL_PORT_REQ,
+	error = aic8800u_cmd(sc, AIC8800_ME_SET_CONTROL_PORT_REQ,
 	    AIC8800_TASK_ME, AIC8800_DRV_TASK_ID, &req, sizeof(req),
 	    NULL, 0);
+	if (error != 0)
+		aprint_error_dev(sc->sc_dev,
+		    "control port %s failed (%d)\n", open ? "open" : "close",
+		    error);
 }

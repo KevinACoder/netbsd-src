@@ -603,14 +603,28 @@ aic8800u_evt_thread(void *arg)
 {
 	struct aic8800u_softc *sc = arg;
 	uint32_t count;
-	int error;
+	int error, errs = 0;
 
 	while (!sc->sc_dying) {
 		error = aic8800u_bulk_read_evt(sc, &count);
-		if (error == ETIMEDOUT)
+		if (error == ETIMEDOUT) {
+			errs = 0;
 			continue;
-		if (error != 0)
-			break;		/* pipe aborted or device gone */
+		}
+		if (error != 0) {
+			/* same self-heal as the rx thread: a transient pipe
+			 * error must not silence the event channel (every
+			 * command CFM and SM_CONNECT_IND arrives here) */
+			if (++errs > 100 || sc->sc_dying)
+				break;
+			usbd_abort_pipe(sc->sc_evt_pipe);
+			if (error == EIO)
+				(void)usbd_clear_endpoint_stall(
+				    sc->sc_evt_pipe);
+			kpause("aicevr", false, mstohz(10), NULL);
+			continue;
+		}
+		errs = 0;
 		aic8800u_app_dispatch(sc, count);
 	}
 
@@ -649,8 +663,25 @@ aic8800u_rx_frame(struct aic8800u_softc *sc, uint32_t count)
 	if (!sc->sc_if_attached)
 		return;
 
-	if (buf[2] & 0x10)		/* msg frame on the wrong endpoint */
+	if (buf[2] & AIC8800_USB_TYPE_CFG) {
+		/*
+		 * Config frame on the data endpoint.  The vendor driver
+		 * reads every incoming transfer from one bulk-in pipe and
+		 * demultiplexes by this type byte; on this part the TX
+		 * confirmations (EAPOL need_cfm slots) come up here too.
+		 * Treating them as data dropped every confirmation, so the
+		 * 4-way never showed whether M2 reached the AP.
+		 */
+		uint16_t pkt_len = buf[0] | (buf[1] << 8);
+		uint8_t type = buf[2] & 0x7f;
+
+		if (type == AIC8800_USB_TYPE_CFG_DATA_CFM && pkt_len >= 8 &&
+		    4 + 8 <= count)
+			aic8800u_evt_enqueue(sc, AIC8800U_EVT_TXCFM,
+			    &buf[4], 8);
+		/* CMD_RSP/PRINT on this pipe: the evt pipe carries them */
 		return;
+	}
 	if (mpdu_len < sizeof(*wh) ||
 	    AIC8800_RX_MPDU_OFF + mpdu_len > count)
 		return;
@@ -720,14 +751,38 @@ aic8800u_rx_thread(void *arg)
 {
 	struct aic8800u_softc *sc = arg;
 	uint32_t count;
-	int error;
+	int error, errs = 0;
 
 	while (!sc->sc_dying) {
 		error = aic8800u_bulk_read_data(sc, &count);
-		if (error == ETIMEDOUT)
+		if (error == ETIMEDOUT) {
+			errs = 0;
 			continue;
-		if (error != 0)
-			break;
+		}
+		if (error != 0) {
+			/*
+			 * A stalled or out-of-sync bulk pipe around firmware
+			 * state changes (scan -> connect) must not kill RX
+			 * for good: the exit-on-error loop showed up on the
+			 * board as "a dozen frames around association, then
+			 * eternal silence" -- EAPOL M1 never reached wpa.
+			 * Recover the pipe and keep reading; a detached or
+			 * dead device ends the loop through sc_dying / the
+			 * abort below.
+			 */
+			if (++errs > 100 || sc->sc_dying)
+				break;
+			aprint_error_dev(sc->sc_dev,
+			    "rx read error %d (#%d), resetting pipe\n",
+			    error, errs);
+			usbd_abort_pipe(sc->sc_data_in_pipe);
+			if (error == EIO)
+				(void)usbd_clear_endpoint_stall(
+				    sc->sc_data_in_pipe);
+			kpause("aicrxr", false, mstohz(10), NULL);
+			continue;
+		}
+		errs = 0;
 		aic8800u_rx_frame(sc, count);
 	}
 
