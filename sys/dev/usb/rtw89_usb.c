@@ -72,6 +72,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/device.h>
 #include <sys/mutex.h>
 #include <sys/queue.h>
+#include <sys/sysctl.h>
 
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -100,6 +101,9 @@ static void	rtw89_usb_txeof(struct usbd_xfer *, void *, usbd_status);
 static void	rtw89_usb_rxeof(struct usbd_xfer *, void *, usbd_status);
 static int	rtw89_usb_xfers_init(struct rtw89_usb_softc *);
 static void	rtw89_usb_xfers_fini(struct rtw89_usb_softc *);
+static void	rtw89_usb_sysctl_init(struct rtw89_usb_softc *);
+/* the single instance, for the hw.<xname>.stats handler */
+static struct rtw89_usb_softc *rtw89_usb_dbg_sc;
 
 /*
  * Per-chip USB data: the register addresses and the DMA channel to bulk
@@ -796,16 +800,19 @@ rtw89_usb_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	usbd_get_xfer_status(xfer, NULL, NULL, &actlen, NULL);
 
 	/*
-	 * Linux rejects transfers shorter than a receive descriptor; a
-	 * transfer that fills the whole buffer means the device split a
-	 * packet across transfers, which the demux would misread --
-	 * drop both.
+	 * Linux rejects transfers shorter than a receive descriptor.  A
+	 * transfer that OVERFLOWS the buffer means the device split a
+	 * packet across transfers, which the demux would misread -- drop
+	 * it.  A transfer that exactly fills the buffer is a legitimately
+	 * full hardware aggregate (the RXAGG limit is 5 x 4K = this buffer
+	 * size); rejecting >= that dropped whole aggregates under load, so
+	 * only > is an error here, as in Linux.
 	 */
 	if (actlen < RTW89_USB_RX_MIN_LEN) {
 		sc->rx_drop_short++;
 		goto resubmit;
 	}
-	if (actlen >= RTW89_USB_RX_BUFSZ) {
+	if (actlen > RTW89_USB_RX_BUFSZ) {
 		sc->rx_drop_full++;
 		goto resubmit;
 	}
@@ -1396,7 +1403,85 @@ rtw89_usb_attach(struct rtw89_usb_softc *sc, device_t dev,
 	if (error != 0)
 		return error;
 
+	rtw89_usb_sysctl_init(sc);
+
 	return rtw89_usb_xfers_init(sc);
+}
+
+/* ------------------------------------------------------------------ */
+/* Diagnostics: hw.<xname>.stats read-only summary                     */
+/* ------------------------------------------------------------------ */
+
+static int
+rtw89_usb_stats_sysctl(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct rtw89_usb_softc *sc = rtw89_usb_dbg_sc;
+	char ch[160];
+	char buf[512];
+	unsigned int i;
+	int error;
+
+	if (sc == NULL)
+		return ENXIO;
+
+	ch[0] = '\0';
+	mutex_enter(&sc->tx_mtx);
+	for (i = 0; i < RTW89_USB_CH_MAX; i++) {
+		if (sc->ch[i].nslots == 0)
+			continue;
+		snprintf(ch + strlen(ch), sizeof(ch) - strlen(ch),
+		    "%sch%u=%u/%u", (i != 0) ? " " : "", i,
+		    sc->ch[i].busy, sc->ch[i].nslots);
+	}
+	mutex_exit(&sc->tx_mtx);
+
+	snprintf(buf, sizeof(buf),
+	    "tx: frames=%u completes=%u kicks=%u errprints=%u\n"
+	    "rx: drop_full=%u drop_short=%u drop_overrun=%u errprints=%u\n"
+	    "io: errors=%u slots: %s\n",
+	    sc->tx_frames, sc->tx_completes, sc->tx_kicks,
+	    sc->tx_errprints,
+	    sc->rx_drop_full, sc->rx_drop_short, sc->rx_drop_overrun,
+	    sc->rx_errprints,
+	    sc->io_errors, ch);
+
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error != 0 || newp == NULL)
+		return error;
+
+	return 0;
+}
+
+static void
+rtw89_usb_sysctl_init(struct rtw89_usb_softc *sc)
+{
+	const struct sysctlnode *rnode, *cnode;
+	static int done;
+	int error;
+
+	if (done)
+		return;
+	done = 1;
+	rtw89_usb_dbg_sc = sc;
+
+	error = sysctl_createv(NULL, 0, NULL, &rnode,
+	    0, CTLTYPE_NODE, device_xname(sc->dev),
+	    SYSCTL_DESCR("rtw89u transport diagnostics"),
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READONLY, CTLTYPE_STRING,
+	    "stats", SYSCTL_DESCR("transport counters and slot occupancy"),
+	    rtw89_usb_stats_sysctl, 0, NULL, 512, CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	return;
+fail:
+	aprint_error_dev(sc->dev, "sysctl_createv failed (%d)\n", error);
 }
 
 void

@@ -667,6 +667,11 @@ rtw89_start(struct ifnet *ifp)
 				ieee80211_free_node(ni);
 			break;
 		}
+		/* counted as "handed to the device", data frames only */
+		if (!is_mgmt) {
+			if_statinc(ifp, if_opackets);
+			if_statadd(ifp, if_obytes, m->m_pkthdr.len);
+		}
 		if (ni != NULL)
 			ieee80211_free_node(ni);
 	}

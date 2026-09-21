@@ -93,8 +93,8 @@ struct rtw89_usb_ch {
 
 /*
  * Slot pool layout per DMA channel; every other channel is not carried on
- * USB.  CH12 (H2C) gets eight slots: the firmware download streams frames
- * back to back and each needs somewhere to wait for completion.
+ * USB.  CH12 (H2C) is deliberately serialised to one slot so H2C commands
+ * complete strictly in order (the tx_kick_off CH12 path waits for it).
  */
 static const struct {
 	uint8_t	ch_dma;
