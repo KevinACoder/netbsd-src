@@ -64,7 +64,13 @@ if [ "X${DONEPROFILE}" = "X" ]; then
 	# mount the ramdisk read write
 	mount -u $ROOTDEV /
 
-	grep() sed -n "/$1/p"
+	# rk3568 lab (KI-043②): no grep() shim here on purpose.  The old
+	# `grep() sed -n "/$1/p"` dropped every argument but the pattern, so any
+	# real `grep [-opts] pattern file` became `sed -n /pattern` with no input
+	# file -- sed then reads the console forever, eating every typed line and
+	# looking exactly like a total console wedge.  Without a shim, a missing
+	# grep is an honest "grep: not found"; the lab closure carries the real
+	# grep at /tmp/nb/usr/bin/grep.
 
 	# rk3568 lab: stay in the shell instead of starting sysinst; "touch
 	# /runsysinst" re-enables the installer.  The interactive menu
