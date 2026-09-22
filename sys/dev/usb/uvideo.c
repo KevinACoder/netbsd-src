@@ -91,6 +91,17 @@ __KERNEL_RCSID(0, "$NetBSD: uvideo.c,v 1.85 2023/04/10 15:27:51 mlelstv Exp $");
 #define DPRINTF(x)	do { if (uvideodebug) printf x; } while (0)
 #define DPRINTFN(n,x)	do { if (uvideodebug>(n)) printf x; } while (0)
 int	uvideodebug = 20;
+
+/*
+ * KI-044 payload-path counters (single-camera diagnostic kernel; not
+ * synchronized -- diagnostics only). EOF = UVC payload header End-of-Frame.
+ */
+static unsigned uvideo_diag_submitted;
+static unsigned uvideo_diag_eof;
+static unsigned uvideo_diag_drop_short;
+static unsigned uvideo_diag_drop_hdronly;
+static unsigned uvideo_diag_drop_badlen;
+static unsigned uvideo_diag_drop_err;
 #else
 #define DPRINTF(x)	__nothing
 #define DPRINTFN(n,x)	__nothing
@@ -197,6 +208,9 @@ struct uvideo_isoc_xfer {
 	struct uvideo_isoc	ix_i[UVIDEO_NXFERS];
 	uint32_t		ix_nframes;
 	uint32_t		ix_uframe_len;
+	bool			ix_stopping;	/* stop begun: callbacks
+						 * must not resubmit or
+						 * touch i_frlengths */
 
 	struct altlist		ix_altlist;
 #ifdef UVIDEO_DEBUG
@@ -1756,6 +1770,7 @@ uvideo_stream_start_xfer(struct uvideo_stream *vs)
 
 		ix->ix_nframes = nframes;
 		ix->ix_uframe_len = uframe_len;
+		ix->ix_stopping = false;
 		for (i = 0; i < UVIDEO_NXFERS; i++) {
 			struct uvideo_isoc *isoc = &ix->ix_i[i];
 			isoc->i_frlengths =
@@ -1838,6 +1853,7 @@ uvideo_stream_stop_xfer(struct uvideo_stream *vs)
 		return 0;
 	case UE_ISOCHRONOUS:
 		ix = &vs->vs_xfer.isoc;
+		ix->ix_stopping = true;	/* before abort: callbacks must stop */
 		if (ix->ix_pipe != NULL) {
 			usbd_abort_pipe(ix->ix_pipe);
 		}
@@ -1908,6 +1924,10 @@ uvideo_stream_recv_isoc_start1(struct uvideo_isoc *isoc)
 
 	ix = isoc->i_ix;
 
+	/* Stop may have begun between completion and this resubmit. */
+	if (__predict_false(ix->ix_stopping))
+		return USBD_CANCELLED;
+
 	for (i = 0; i < ix->ix_nframes; ++i)
 		isoc->i_frlengths[i] = ix->ix_uframe_len;
 
@@ -1934,53 +1954,58 @@ uvideo_stream_recv_process(struct uvideo_stream *vs, uint8_t *buf, uint32_t len)
 	struct video_payload payload;
 
 	if (len < sizeof(uvideo_payload_header_t)) {
-		DPRINTF(("uvideo_stream_recv_process: len %d < payload hdr\n",
-			 len));
+#ifdef UVIDEO_DEBUG
+		if (uvideo_diag_drop_short++ < 8)
+			DPRINTF(("uvideo_stream_recv_process: len %d < "
+				 "payload hdr\n", len));
+#endif
 		return USBD_SHORT_XFER;
 	}
 
 	hdr = (uvideo_payload_header_t *)buf;
 
-#ifdef UVIDEO_DEBUG
-	/*
-	 * The drop paths below used to be silent even with UVIDEO_DEBUG;
-	 * they fire per microframe, so bound the new prints.
-	 */
-	{
-		static unsigned uvideo_drop_diag;
-
-		if (uvideo_drop_diag++ < 20) {
-			if (hdr->bHeaderLength > UVIDEO_PAYLOAD_HEADER_SIZE ||
-			    hdr->bHeaderLength <
-			    sizeof(uvideo_payload_header_t))
-				DPRINTF(("uvideo_stream_recv_process: bad "
-				    "bHeaderLength=%d len=%d\n",
-				    hdr->bHeaderLength, len));
-			else if (hdr->bHeaderLength == len &&
-			    !(hdr->bmHeaderInfo & UV_END_OF_FRAME))
-				DPRINTF(("uvideo_stream_recv_process: "
-				    "hdr-only pkt without EOF "
-				    "(bmHeaderInfo=%#x)\n",
-				    hdr->bmHeaderInfo));
-			else if (hdr->bmHeaderInfo & UV_ERROR)
-				DPRINTF(("uvideo_stream_recv_process: payload "
-				    "error bit (bmHeaderInfo=%#x)\n",
-				    hdr->bmHeaderInfo));
-		}
-	}
-#endif
 	if (hdr->bHeaderLength > UVIDEO_PAYLOAD_HEADER_SIZE ||
-	    hdr->bHeaderLength < sizeof(uvideo_payload_header_t))
+	    hdr->bHeaderLength < sizeof(uvideo_payload_header_t)) {
+#ifdef UVIDEO_DEBUG
+		if (uvideo_diag_drop_badlen++ < 8)
+			DPRINTF(("uvideo_stream_recv_process: bad "
+			    "bHeaderLength=%d len=%d\n",
+			    hdr->bHeaderLength, len));
+#endif
 		return USBD_INVAL;
-	if (hdr->bHeaderLength == len && !(hdr->bmHeaderInfo & UV_END_OF_FRAME))
+	}
+	if (hdr->bHeaderLength == len &&
+	    !(hdr->bmHeaderInfo & UV_END_OF_FRAME)) {
+#ifdef UVIDEO_DEBUG
+		uvideo_diag_drop_hdronly++;
+#endif
 		return USBD_INVAL;
-	if (hdr->bmHeaderInfo & UV_ERROR)
+	}
+	if (hdr->bmHeaderInfo & UV_ERROR) {
+#ifdef UVIDEO_DEBUG
+		if (uvideo_diag_drop_err++ < 8)
+			DPRINTF(("uvideo_stream_recv_process: payload error "
+			    "bit (bmHeaderInfo=%#x)\n", hdr->bmHeaderInfo));
+#endif
 		return USBD_IOERROR;
+	}
 
 	payload.data = buf + hdr->bHeaderLength;
 	payload.size = len - hdr->bHeaderLength;
 	payload.frameno = hdr->bmHeaderInfo & UV_FRAME_ID;
 	payload.end_of_frame = hdr->bmHeaderInfo & UV_END_OF_FRAME;
+
+#ifdef UVIDEO_DEBUG
+	uvideo_diag_submitted++;
+	if (payload.end_of_frame)
+		uvideo_diag_eof++;
+	if (uvideo_diag_submitted <= 8)
+		DPRINTF(("uvideo: data pkt #%u len=%u bhl=%d bmi=%#x "
+		    "eof=%d size=%u\n", uvideo_diag_submitted, len,
+		    hdr->bHeaderLength, hdr->bmHeaderInfo,
+		    payload.end_of_frame ? 1 : 0,
+		    (unsigned)payload.size));
+#endif
 
 	video_submit_payload(vs->vs_videodev, &payload);
 
@@ -2004,6 +2029,14 @@ uvideo_stream_recv_isoc_complete(struct usbd_xfer *xfer,
 	vs = isoc->i_vs;
 	ix = isoc->i_ix;
 
+	/*
+	 * uvideo_stream_stop_xfer() aborts the pipe and frees i_frlengths
+	 * and the xfers; a callback that races with (or trails) teardown
+	 * must neither resubmit nor touch per-xfer state.
+	 */
+	if (__predict_false(ix->ix_stopping))
+		return;
+
 	if (status != USBD_NORMAL_COMPLETION) {
 		DPRINTF(("uvideo_stream_recv_isoc_complete: status=%s (%d)\n",
 			usbd_errstr(status), status));
@@ -2016,16 +2049,22 @@ uvideo_stream_recv_isoc_complete(struct usbd_xfer *xfer,
 		usbd_get_xfer_status(xfer, NULL, NULL, &count, NULL);
 
 #ifdef UVIDEO_DEBUG
-		/* rate-limited: first 10 completions, then every 100th */
-		if (ix->ix_diag_count < 10 || (ix->ix_diag_count % 100) == 0)
-			DPRINTF(("uvideo: isoc complete #%u actlen=%u "
-			    "nframes=%u\n", ix->ix_diag_count, count,
-			    ix->ix_nframes));
+		/* first 3 raw, then a payload-path summary every 500th */
+		if (ix->ix_diag_count < 3 || (ix->ix_diag_count % 500) == 0)
+			DPRINTF(("uvideo: isoc #%u actlen=%u | sub=%u eof=%u "
+			    "drop[short=%u hdronly=%u badlen=%u err=%u]\n",
+			    ix->ix_diag_count, count, uvideo_diag_submitted,
+			    uvideo_diag_eof, uvideo_diag_drop_short,
+			    uvideo_diag_drop_hdronly, uvideo_diag_drop_badlen,
+			    uvideo_diag_drop_err));
 		ix->ix_diag_count++;
 #endif
 		if (count == 0)
 			goto next;
 
+		/* stopping may have begun while we printed */
+		if (__predict_false(ix->ix_stopping))
+			return;
 
 		for (i = 0, buf = isoc->i_buf;
 		     i < ix->ix_nframes;
