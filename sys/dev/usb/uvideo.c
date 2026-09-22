@@ -256,6 +256,20 @@ struct uvideo_stream {
 	/* current video format */
 	uint32_t		vs_max_payload_size;
 	uint32_t		vs_frame_interval;
+
+	/*
+	 * Frame-boundary watchdog (KI-044): some boots the camera streams
+	 * headers/payload forever without signalling a frame boundary
+	 * (UVC Frame ID toggle or EOF); the MI video layer then never
+	 * completes a frame and read(2) starves.  Track boundaries and
+	 * re-run the probe/commit handshake from the usb taskq when the
+	 * stream looks starved.
+	 */
+	int			vs_last_frameno;
+	unsigned		vs_frames_done;
+	unsigned		vs_kick_ctr;
+	unsigned		vs_rekick_attempts;
+
 	SLIST_ENTRY(uvideo_stream) entries;
 
 	uvideo_state		vs_state;
@@ -276,6 +290,9 @@ struct uvideo_softc {
 
 	struct uvideo_stream_list sc_stream_list;
 
+	/* deferred stream re-kick (sleeps: must not run in softint) */
+	struct usb_task		sc_rekick_task;
+
 	char			sc_businfo[32];
 #ifdef UVIDEO_DEBUG
 	uint32_t		sc_alt_maxpkt_cap; /* diag: alt wMaxPacketSize cap */
@@ -290,6 +307,7 @@ static int	uvideo_activate(device_t, enum devact);
 
 static int	uvideo_open(void *, int);
 static void	uvideo_close(void *);
+static void	uvideo_stream_rekick_task(void *);
 static const char * uvideo_get_devname(void *);
 static const char * uvideo_get_businfo(void *);
 
@@ -656,6 +674,8 @@ uvideo_attach(device_t parent, device_t self, void *aux)
 
 	if (!pmf_device_register(self, NULL, NULL))
 		aprint_error_dev(self, "couldn't establish power handler\n");
+
+	usb_init_task(&sc->sc_rekick_task, uvideo_stream_rekick_task, sc, 0);
 
 #ifdef UVIDEO_DEBUG
 	uvideo_sysctl_init(sc);
@@ -1768,6 +1788,11 @@ uvideo_stream_start_xfer(struct uvideo_stream *vs)
 		nframes = uimin(UVIDEO_NFRAMES_MAX, nframes);
 		DPRINTF(("uvideo_stream_start_xfer: nframes=%d\n", nframes));
 
+		vs->vs_last_frameno = -1;
+		vs->vs_frames_done = 0;
+		vs->vs_kick_ctr = 0;
+		vs->vs_rekick_attempts = 0;
+
 		ix->ix_nframes = nframes;
 		ix->ix_uframe_len = uframe_len;
 		ix->ix_stopping = false;
@@ -1995,6 +2020,13 @@ uvideo_stream_recv_process(struct uvideo_stream *vs, uint8_t *buf, uint32_t len)
 	payload.frameno = hdr->bmHeaderInfo & UV_FRAME_ID;
 	payload.end_of_frame = hdr->bmHeaderInfo & UV_END_OF_FRAME;
 
+	/* count frame boundaries: EOF, or a change of UVC Frame ID */
+	if (payload.end_of_frame ||
+	    (vs->vs_last_frameno >= 0 &&
+	     (int)payload.frameno != vs->vs_last_frameno))
+		vs->vs_frames_done++;
+	vs->vs_last_frameno = (int)payload.frameno;
+
 #ifdef UVIDEO_DEBUG
 	uvideo_diag_submitted++;
 	if (payload.end_of_frame)
@@ -2078,7 +2110,45 @@ uvideo_stream_recv_isoc_complete(struct usbd_xfer *xfer,
 	}
 
 next:
+	/*
+	 * Watchdog: if the camera keeps the stream up but never signals a
+	 * frame boundary, the MI video layer never completes a frame and
+	 * read(2) starves (KI-044, per-boot on the Pro 9000).  Re-run the
+	 * probe/commit handshake from the usb taskq - control transfers
+	 * sleep, which is forbidden in this (softint) context.
+	 */
+	if (!ix->ix_stopping && ++vs->vs_kick_ctr >= 100) {
+		vs->vs_kick_ctr = 0;
+		if (vs->vs_frames_done == 0 && vs->vs_rekick_attempts < 3) {
+			vs->vs_rekick_attempts++;
+			usb_add_task(vs->vs_parent->sc_udev,
+			    &vs->vs_parent->sc_rekick_task,
+			    USB_TASKQ_DRIVER);
+		}
+	}
 	uvideo_stream_recv_isoc_start1(isoc);
+}
+
+static void
+uvideo_stream_rekick_task(void *arg)
+{
+	struct uvideo_softc *sc = arg;
+	struct uvideo_stream *vs;
+	unsigned attempt;
+
+	if (sc->sc_dying)
+		return;
+	vs = SLIST_FIRST(&sc->sc_stream_list);
+	if (vs == NULL || vs->vs_xfer.isoc.ix_stopping)
+		return;
+	if (vs->vs_frames_done != 0)
+		return;	/* stream framing recovered on its own */
+
+	attempt = vs->vs_rekick_attempts;
+	aprint_error_dev(sc->sc_dev, "no frame boundary seen after %u "
+	    "completions; re-committing stream (attempt %u of 3)\n",
+	    100u * attempt, attempt);
+	(void)uvideo_set_format(vs, &vs->vs_current_format);
 }
 
 static void
