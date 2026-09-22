@@ -42,6 +42,11 @@ iwm*		at pci? dev ? function ?
 # firmware error investigation on this board.
 options 	IWM_DEBUG
 
+# uvideo isochronous diagnostics (KI-044: video iso delivers 0 bytes on the
+# fd800000 hub line).  USB_DEBUG is a declared dependency of UVIDEO_DEBUG.
+options 	UVIDEO_DEBUG
+options 	USB_DEBUG
+
 # Onboard I2C devices (i2c0 PMIC, i2c1 battery RTC + power monitor);
 # rkiic/iic/cpufreqdt/rktsadc come in via GENERIC64.
 rk809pmic*	at iic?

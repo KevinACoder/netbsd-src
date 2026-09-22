@@ -67,6 +67,7 @@ __KERNEL_RCSID(0, "$NetBSD: uvideo.c,v 1.85 2023/04/10 15:27:51 mlelstv Exp $");
 #include <sys/poll.h>
 #include <sys/queue.h>	/* SLIST */
 #include <sys/kthread.h>
+#include <sys/sysctl.h>
 #include <sys/bus.h>
 
 #include <sys/videoio.h>
@@ -198,6 +199,9 @@ struct uvideo_isoc_xfer {
 	uint32_t		ix_uframe_len;
 
 	struct altlist		ix_altlist;
+#ifdef UVIDEO_DEBUG
+	uint32_t		ix_diag_count;	/* completions seen (print limiter) */
+#endif
 };
 
 struct uvideo_bulk_xfer {
@@ -259,6 +263,9 @@ struct uvideo_softc {
 	struct uvideo_stream_list sc_stream_list;
 
 	char			sc_businfo[32];
+#ifdef UVIDEO_DEBUG
+	uint32_t		sc_alt_maxpkt_cap; /* diag: alt wMaxPacketSize cap */
+#endif
 };
 
 static int	uvideo_match(device_t, cfdata_t, void *);
@@ -488,6 +495,34 @@ uvideo_match(device_t parent, cfdata_t match, void *aux)
 	return UMATCH_NONE;
 }
 
+#ifdef UVIDEO_DEBUG
+static void
+uvideo_sysctl_init(struct uvideo_softc *sc)
+{
+	const struct sysctlnode *rnode, *cnode;
+	int error;
+
+	error = sysctl_createv(NULL, 0, NULL, &rnode,
+	    0, CTLTYPE_NODE, device_xname(sc->sc_dev),
+	    SYSCTL_DESCR("uvideo debug controls"),
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	error = sysctl_createv(NULL, 0, &rnode, &cnode,
+	    CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "alt_maxpkt_cap", SYSCTL_DESCR(
+	    "if nonzero, ignore streaming alt settings whose decoded "
+	    "wMaxPacketSize exceeds this; 0 = trust dwMaxPayloadTransferSize"),
+	    NULL, 0, &sc->sc_alt_maxpkt_cap,
+	    sizeof(sc->sc_alt_maxpkt_cap), CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+	return;
+fail:
+	aprint_error_dev(sc->sc_dev, "sysctl_createv failed (%d)\n", error);
+}
+#endif
+
 static void
 uvideo_attach(device_t parent, device_t self, void *aux)
 {
@@ -607,6 +642,10 @@ uvideo_attach(device_t parent, device_t self, void *aux)
 
 	if (!pmf_device_register(self, NULL, NULL))
 		aprint_error_dev(self, "couldn't establish power handler\n");
+
+#ifdef UVIDEO_DEBUG
+	uvideo_sysctl_init(sc);
+#endif
 
 	SLIST_FOREACH(vs, &sc->sc_stream_list, entries) {
 		/*
@@ -1667,6 +1706,17 @@ uvideo_stream_start_xfer(struct uvideo_stream *vs)
 			if (alt_maybe->max_packet_size > vs->vs_max_payload_size)
 				continue;
 
+#ifdef UVIDEO_DEBUG
+			/*
+			 * Diagnostic: ignore alt settings above the cap, to
+			 * bisect high-bandwidth (multi-transaction) iso.
+			 */
+			if (vs->vs_parent->sc_alt_maxpkt_cap != 0 &&
+			    alt_maybe->max_packet_size >
+			    vs->vs_parent->sc_alt_maxpkt_cap)
+				continue;
+#endif
+
 			if (alt == NULL ||
 			    alt_maybe->max_packet_size >= alt->max_packet_size)
 				alt = alt_maybe;
@@ -1682,6 +1732,11 @@ uvideo_stream_start_xfer(struct uvideo_stream *vs)
 			     "choosing alternate interface "
 			     "%d wMaxPacketSize=%d bInterval=%d\n",
 			     alt->altno, alt->max_packet_size, alt->interval));
+
+		DPRINTF(("uvideo_stream_start_xfer: alt=%d maxpkt=%d "
+		    "payload=%u cap=%u\n", alt->altno, alt->max_packet_size,
+		    vs->vs_max_payload_size,
+		    vs->vs_parent->sc_alt_maxpkt_cap));
 
 		err = usbd_set_interface(vs->vs_iface, alt->altno);
 		if (err != USBD_NORMAL_COMPLETION) {
@@ -1886,6 +1941,34 @@ uvideo_stream_recv_process(struct uvideo_stream *vs, uint8_t *buf, uint32_t len)
 
 	hdr = (uvideo_payload_header_t *)buf;
 
+#ifdef UVIDEO_DEBUG
+	/*
+	 * The drop paths below used to be silent even with UVIDEO_DEBUG;
+	 * they fire per microframe, so bound the new prints.
+	 */
+	{
+		static unsigned uvideo_drop_diag;
+
+		if (uvideo_drop_diag++ < 20) {
+			if (hdr->bHeaderLength > UVIDEO_PAYLOAD_HEADER_SIZE ||
+			    hdr->bHeaderLength <
+			    sizeof(uvideo_payload_header_t))
+				DPRINTF(("uvideo_stream_recv_process: bad "
+				    "bHeaderLength=%d len=%d\n",
+				    hdr->bHeaderLength, len));
+			else if (hdr->bHeaderLength == len &&
+			    !(hdr->bmHeaderInfo & UV_END_OF_FRAME))
+				DPRINTF(("uvideo_stream_recv_process: "
+				    "hdr-only pkt without EOF "
+				    "(bmHeaderInfo=%#x)\n",
+				    hdr->bmHeaderInfo));
+			else if (hdr->bmHeaderInfo & UV_ERROR)
+				DPRINTF(("uvideo_stream_recv_process: payload "
+				    "error bit (bmHeaderInfo=%#x)\n",
+				    hdr->bmHeaderInfo));
+		}
+	}
+#endif
 	if (hdr->bHeaderLength > UVIDEO_PAYLOAD_HEADER_SIZE ||
 	    hdr->bHeaderLength < sizeof(uvideo_payload_header_t))
 		return USBD_INVAL;
@@ -1932,10 +2015,16 @@ uvideo_stream_recv_isoc_complete(struct usbd_xfer *xfer,
 	} else {
 		usbd_get_xfer_status(xfer, NULL, NULL, &count, NULL);
 
-		if (count == 0) {
-			/* DPRINTF(("uvideo: zero length transfer\n")); */
+#ifdef UVIDEO_DEBUG
+		/* rate-limited: first 10 completions, then every 100th */
+		if (ix->ix_diag_count < 10 || (ix->ix_diag_count % 100) == 0)
+			DPRINTF(("uvideo: isoc complete #%u actlen=%u "
+			    "nframes=%u\n", ix->ix_diag_count, count,
+			    ix->ix_nframes));
+		ix->ix_diag_count++;
+#endif
+		if (count == 0)
 			goto next;
-		}
 
 
 		for (i = 0, buf = isoc->i_buf;

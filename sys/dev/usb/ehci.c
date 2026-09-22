@@ -1165,6 +1165,53 @@ ehci_idone(struct ehci_xfer *ex, ex_completeq_t *cq)
 		i = xfer->ux_pipe->up_endpoint->ue_edesc->bInterval;
 		uframes = uimin(1 << (i - 1), USB_UFRAMES_PER_FRAME);
 
+#ifdef UVIDEO_DEBUG
+		{
+			/*
+			 * Dump raw iTD ctl words for the first completions of
+			 * the video streaming endpoint (0x81): ehci_idone
+			 * collapses per-microframe status to a zeroed length,
+			 * so this is the only place MMF/XactErr/Buffer errors
+			 * stay visible.
+			 */
+			static int uvideo_ehci_isoc_diag;
+
+			if (uvideo_ehci_isoc_diag < 3 &&
+			    xfer->ux_pipe->up_endpoint->ue_edesc->
+			    bEndpointAddress == 0x81) {
+				struct ehci_soft_itd *ditd;
+				uint32_t ctl;
+				int j;
+
+				printf("ehci_idone: isoc diag ep=0x81 "
+				    "nframes=%d uframes=%d\n",
+				    xfer->ux_nframes, uframes);
+				for (ditd = ex->ex_itdstart; ditd != NULL;
+				     ditd = ditd->xfer_next) {
+					usb_syncmem(&ditd->dma,
+					    ditd->offs +
+					    offsetof(ehci_itd_t, itd_ctl),
+					    sizeof(ditd->itd->itd_ctl),
+					    BUS_DMASYNC_POSTWRITE |
+					    BUS_DMASYNC_POSTREAD);
+					for (j = 0; j < EHCI_ITD_NUFRAMES;
+					    j++) {
+						ctl = le32toh(
+						    ditd->itd->itd_ctl[j]);
+						printf("  itd %p ctl[%d]=%#x "
+						    "st=%#x len=%u\n", ditd, j,
+						    ctl,
+						    (unsigned)
+						    EHCI_ITD_GET_STATUS(ctl),
+						    (unsigned)
+						    EHCI_ITD_GET_LEN(ctl));
+					}
+				}
+				uvideo_ehci_isoc_diag++;
+			}
+		}
+#endif
+
 		for (itd = ex->ex_itdstart; itd != NULL; itd = itd->xfer_next) {
 			usb_syncmem(&itd->dma,
 			    itd->offs + offsetof(ehci_itd_t,itd_ctl),
