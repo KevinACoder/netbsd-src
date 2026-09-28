@@ -88,6 +88,8 @@ CFATTACH_DECL_NEW(rtw8189f, sizeof(struct rtw8189f_softc), rtw8189f_match,
 static void	rtw8189f_attachhook(device_t);
 static int	rtw8189f_load_firmware(struct rtw8189f_softc *);
 static int	rtw8189f_init(struct ifnet *);
+/* NET80211_PORT(L): SDIO DAT1 card interrupt handler */
+static int	rtw8189f_sdio_intr(void *);
 static void	rtw8189f_stop(struct ifnet *, int);
 static void	rtw8189f_start(struct ifnet *);
 static void	rtw8189f_watchdog(struct ifnet *);
@@ -208,7 +210,8 @@ rtw8189f_attachhook(device_t self)
 	 * running with the PBP reset default 0x10 - RX pages of 64 bytes
 	 * instead of 128 - and every large received frame was lost on the
 	 * air interface while small frames (beacons, ARP, ICMP) passed:
-	 * the M11 TCP-downlink stall.
+	 * the M11 TCP-downlink stall.  Post-download chip_init still
+	 * re-writes these; harmless re-assertion.
 	 */
 	rtw8189f_mac_write_1(sc, RTW8189F_REG_PBP,
 	    RTW8189F_PBP_RX(RTW8189F_PBP_128) | RTW8189F_PBP_TX(RTW8189F_PBP_128));
@@ -237,6 +240,7 @@ rtw8189f_attachhook(device_t self)
 	ic->ic_state = IEEE80211_S_INIT;
 	ic->ic_caps =
 	    IEEE80211_C_MONITOR |
+	    IEEE80211_C_HOSTAP |
 	    IEEE80211_C_SHPREAMBLE |
 	    IEEE80211_C_SHSLOT |
 	    IEEE80211_C_WPA;		/* 802.11i (software crypto) */
@@ -411,6 +415,22 @@ rtw8189f_init(struct ifnet *ifp)
 			sc->sc_chip_ready = false;
 			return error;
 		}
+
+		/* NET80211_PORT(L): SDIO DAT1 interrupt mode. Chip-side
+		 * RX_REQUEST plus CCCR INT_ENABLE go on with the worker
+		 * already running; the 10 ms poll stays armed as the
+		 * watchdog (mstohz(RTW8189F_RX_POLL_MS)). */
+		sc->sc_ih = sdmmc_intr_establish(sc->sc_sf,
+		    rtw8189f_sdio_intr, sc);
+		if (sc->sc_ih != NULL) {
+			(void) rtw8189f_sdiolocal_write_1(sc,
+			    RTW8189F_SDIO_REG_HIMR, RTW8189F_HIMR_RX_REQUEST);
+			aprint_normal_dev(sc->sc_dev,
+			    "SDIO interrupt mode on\n");
+		} else {
+			aprint_normal_dev(sc->sc_dev,
+			    "SDIO interrupt establish failed, poll-only\n");
+		}
 	}
 
 	s = splnet();
@@ -439,6 +459,14 @@ rtw8189f_stop(struct ifnet *ifp, int disable)
 	if (ic->ic_state != IEEE80211_S_INIT)
 		ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
 	splx(s);
+
+	if (sc->sc_ih != NULL) {
+		/* kill the chip-side source first, then the host line */
+		(void) rtw8189f_sdiolocal_write_1(sc,
+		    RTW8189F_SDIO_REG_HIMR, 0);
+		sdmmc_intr_disestablish(sc->sc_ih);
+		sc->sc_ih = NULL;
+	}
 
 	/*
 	 * Halt the worker without joining it: the worker can be deep
@@ -657,6 +685,12 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc,
 
 	switch (nstate) {
 	case IEEE80211_S_SCAN:
+		/* The HOSTAP startup leg: net80211 runs ieee80211_create_ibss
+		 * from this transition (des_chan set by the shell) and comes
+		 * back through RUN.  No dwell machinery - the scan callout
+		 * would hop channels away from the BSS. */
+		if (ic->ic_opmode == IEEE80211_M_HOSTAP)
+			break;
 		/* One channel per pass; the callout moves to the next. */
 		rtw8189f_set_channel(sc,
 		    ieee80211_chan2ieee(ic, ic->ic_curchan));
@@ -692,6 +726,12 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc,
 			 * response must pass it (vendor joins with the
 			 * BSSID already written). */
 			rtw8189f_set_bssid(sc, ic->ic_bss->ni_bssid);
+			if (ic->ic_opmode == IEEE80211_M_HOSTAP &&
+			    nstate == IEEE80211_S_RUN) {
+				/* The BSS exists: own the nettype, the TSF
+				 * and the beacon template. */
+				rtw8189f_ap_enable(sc);
+			}
 		}
 		break;
 
@@ -699,6 +739,9 @@ rtw8189f_newstate_cb(struct rtw8189f_softc *sc,
 		if (sc->sc_scanning) {
 			sc->sc_scanning = false;
 			rtw8189f_scan_rx_fltr(sc, false);
+		}
+		if (sc->sc_ap_beaconing) {
+			rtw8189f_ap_disable(sc);
 		}
 		break;
 	}
@@ -737,6 +780,19 @@ rtw8189f_worker_stop(struct rtw8189f_softc *sc)
 		kpause("rtw8189fw", false, mstohz(10), NULL);
 }
 
+/* NET80211_PORT(L): SDIO card interrupt (DAT1). Runs in host-controller
+ * ISR context: latch the RX work flag and hand the worker cv one token -
+ * the bus itself is untouchable here. */
+static int
+rtw8189f_sdio_intr(void *arg)
+{
+	struct rtw8189f_softc *sc = arg;
+
+	sc->sc_flags |= RTW8189F_F_RX;
+	wlan_cv_isr_wake(&sc->sc_cv);
+	return 1;
+}
+
 static void
 rtw8189f_worker(void *arg)
 {
@@ -753,10 +809,13 @@ rtw8189f_worker(void *arg)
 	while (!sc->sc_dying) {
 		mutex_enter(&sc->sc_work_mtx);
 		while (!(sc->sc_flags & (RTW8189F_F_NEWSTATE | RTW8189F_F_TX |
-		    RTW8189F_F_SCANNEXT | RTW8189F_F_EXIT)) && !sc->sc_dying) {
-			/* A timeout is RX work, even without a software event. */
+		    RTW8189F_F_SCANNEXT | RTW8189F_F_EXIT |
+		    RTW8189F_F_RX)) && !sc->sc_dying) {
+			/* A timeout is RX work, even without a software event.
+			 * PORT: poll quantum is a tunable (opt_rtw8189f.h,
+			 * 10 ms here vs NetBSD's 50 ms). */
 			if (cv_timedwait(&sc->sc_cv, &sc->sc_work_mtx,
-			    mstohz(50)) == EWOULDBLOCK)
+			    mstohz(RTW8189F_RX_POLL_MS)) == EWOULDBLOCK)
 				break;
 		}
 		flags = sc->sc_flags;
@@ -774,6 +833,16 @@ rtw8189f_worker(void *arg)
 
 		if ((flags & RTW8189F_F_EXIT) || sc->sc_dying)
 			break;
+
+		/*
+		 * PORT: on NetBSD the ioctl/start contexts hold splnet
+		 * while this kthread runs at IPL_NONE; here spl is a no-op,
+		 * so the port serializer stands in for the discipline.
+		 * Held across the bus and net80211 work (ms-scale CMD53
+		 * bursts), dropped around the cv wait above - the same
+		 * shape the usbdi shim wraps its completion callbacks in.
+		 */
+		wlan_port_serializer_lock();
 
 		/*
 		 * Drain the FIFO before anything moves ic_curchan: frames
@@ -802,8 +871,17 @@ rtw8189f_worker(void *arg)
 			rtw8189f_tx_frame(sc, m);
 		}
 
-		/* Poll the RX FIFO; interrupts are a hardening step. */
+		/* NET80211_PORT(L): the DAT1 interrupt makes this drain the
+		 * primary RX path (the comment below it predates the round).
+		 * The drain doubles as the ack - the chip-side source is
+		 * consumed by then, so re-arm the host line; a frame landing
+		 * in between simply re-asserts DAT1. */
 		rtw8189f_rx_drain(sc);
+
+		if (sc->sc_ih != NULL)
+			sdmmc_intr_ack(sc->sc_ih);
+
+		wlan_port_serializer_unlock();
 	}
 
 	/* Flush anything still queued. */

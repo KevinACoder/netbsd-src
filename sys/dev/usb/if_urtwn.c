@@ -962,6 +962,22 @@ urtwn_do_async(struct urtwn_softc *sc, void (*cb)(struct urtwn_softc *, void *),
 	s = splusb();
 	mutex_spin_enter(&sc->sc_task_mtx);
 	urtwn_cmdq_invariants(sc);
+	if (ring->queued == URTWN_HOST_CMD_RING_COUNT) {
+		/*
+		 * Upstream advances ring->cur unconditionally and lets the
+		 * new command clobber the oldest unprocessed one, whose
+		 * callback then never runs - a lost urtwn_newstate_cb
+		 * permanently stops the scan heartbeat (its only
+		 * callout_schedule re-arm lives at the end of that
+		 * callback).  Keep the oldest, drop the new command and
+		 * say so instead.
+		 */
+		device_printf(sc->sc_dev,
+		    "command queue overflow, dropping new command\n");
+		mutex_spin_exit(&sc->sc_task_mtx);
+		splx(s);
+		return;
+	}
 	cmd = &ring->cmd[ring->cur];
 	cmd->cb = cb;
 	KASSERT(len <= sizeof(cmd->data));
@@ -972,9 +988,7 @@ urtwn_do_async(struct urtwn_softc *sc, void (*cb)(struct urtwn_softc *, void *),
 	 * Schedule a task to process the command if need be.
 	 */
 	if (!sc->sc_dying) {
-		if (ring->queued == URTWN_HOST_CMD_RING_COUNT)
-			device_printf(sc->sc_dev, "command queue overflow\n");
-		else if (ring->queued++ == 0)
+		if (ring->queued++ == 0)
 			schedtask = true;
 	}
 	mutex_spin_exit(&sc->sc_task_mtx);
@@ -2743,6 +2757,14 @@ urtwn_tx(struct urtwn_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 		tid = qwh->i_qos[0] & IEEE80211_QOS_TID;
 	} else if (type != IEEE80211_FC0_TYPE_DATA) {
 		tid = R92C_TXDW1_QSEL_MGNT;
+		if ((wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) ==
+		    IEEE80211_FC0_SUBTYPE_BEACON) {
+			/* the firmware re-transmits a QSEL_BEACON frame at
+			 * every TBTT (the HOSTAP/IBSS template contract);
+			 * a QSEL_MGNT beacon is a one-shot that leaves the
+			 * BSS invisible on air */
+			tid = R92C_TXDW1_QSEL_BEACON;
+		}
 	}
 
 	if (((txd_len + m->m_pkthdr.len) % 64) == 0) /* XXX: 64 */
@@ -2825,9 +2847,13 @@ urtwn_tx(struct urtwn_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 			txd->txdw5 |= htole32(SM(R92C_TXDW5_DATARATE, 11));
 	} else if (type == IEEE80211_FC0_TYPE_MGT) {
 		DPRINTFN(DBG_TX, "mgmt packet", 0, 0, 0, 0);
+		/* tid carries the beacon/mgnt split picked above: the
+		 * descriptor, not the tid computation, is what the firmware
+		 * sees - a beacon programmed QSEL_MGNT here still goes out
+		 * as a one-shot and the BSS stays invisible on air */
 		txd->txdw1 |= htole32(
 		    SM(R92C_TXDW1_MACID, RTWN_MACID_BSS) |
-		    SM(R92C_TXDW1_QSEL, R92C_TXDW1_QSEL_MGNT) |
+		    SM(R92C_TXDW1_QSEL, tid) |
 		    SM(R92C_TXDW1_RAID, R92C_RAID_11B));
 
 		/* Force CCK1. */

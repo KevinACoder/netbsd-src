@@ -1767,6 +1767,23 @@ rtw8189f_txdesc_chksum(uint8_t *desc)
 
 #define RTW8189F_TX_QUEUE_IDX_HI	0
 
+static unsigned rtw8189f_data_rate_mbps = 24;
+
+int
+rtw8189f_data_rate_set(unsigned mbps)
+{
+	if (mbps != 24 && mbps != 36 && mbps != 54)
+		return EINVAL;
+	rtw8189f_data_rate_mbps = mbps;
+	return 0;
+}
+
+unsigned
+rtw8189f_data_rate_get(void)
+{
+	return rtw8189f_data_rate_mbps;
+}
+
 void
 rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 {
@@ -1775,8 +1792,9 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 	struct ieee80211_node *ni;
 	struct ieee80211_frame *wh;
 	uint8_t *buf = sc->sc_txbuf;
-	uint32_t len, pages, free_hi, free_pub, rptseq;
-	unsigned rate;
+	uint32_t len, pages, free_queue, free_pub, rptseq;
+	unsigned rate, queue, devid, page_offset;
+	bool data;
 	int tries;
 
 	rptseq = (uint32_t)-1;
@@ -1788,8 +1806,21 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 	}
 
 	wh = mtod(m, struct ieee80211_frame *);
+	data = (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+	    IEEE80211_FC0_TYPE_DATA && (wh->i_addr1[0] & 0x01) == 0;
+	queue = data ? RTW8189F_TXDESC_QSEL_BE : RTW8189F_TXDESC_QSEL_MGNT;
+	devid = data ? RTW8189F_WLAN_TX_LOQ_DEVICE_ID :
+	    RTW8189F_WLAN_TX_HIQ_DEVICE_ID;
+	page_offset = data ? 4 : 0;
 	rate = (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT
 	    ? RTW8189F_RATE_1M : RTW8189F_RATE_6M;
+	if (data) {
+		switch (rtw8189f_data_rate_mbps) {
+		case 24: rate = RTW8189F_RATE_24M; break;
+		case 36: rate = RTW8189F_RATE_36M; break;
+		default: rate = RTW8189F_RATE_54M; break;
+		}
+	}
 
 	len = (uint32_t)m->m_pkthdr.len;
 	if (len + RTW8189F_TXDESC_SIZE > RTW8189F_TXBUFSZ) {
@@ -1802,7 +1833,7 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 
 	le32enc(buf + 0, (len & RTW8189F_TXDW0_PKTLEN_M) |
 	    (RTW8189F_TXDESC_SIZE << RTW8189F_TXDW0_OFFSET_S));
-	le32enc(buf + 4, RTW8189F_TXDESC_QSEL_MGNT << RTW8189F_TXDW1_QSEL_S);
+	le32enc(buf + 4, queue << RTW8189F_TXDW1_QSEL_S);
 	le32enc(buf + 12, RTW8189F_TXDW3_USE_RATE);
 	le32enc(buf + 16, rate & RTW8189F_TXDW4_RATE_M);
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT) {
@@ -1837,22 +1868,23 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 	len = (len + RTW8189F_TXDESC_SIZE + 3) & ~3u;
 	pages = (len + 127) / 128;
 
-	/* Wait for HIQ (+public) pages, vendor polling mode. */
+	/* FREE_TXPG stores high, normal, low and public 16-bit counts. */
 	for (tries = 0;; tries++) {
-		free_hi = rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 0);
+		free_queue = rtw8189f_sdiolocal_read_1(sc,
+		    RTW8189F_SDIO_REG_FREE_TXPG + page_offset);
 		free_pub = rtw8189f_sdiolocal_read_1(sc, RTW8189F_SDIO_REG_FREE_TXPG + 6);
-		if (free_hi + free_pub >= pages)
+		if (free_queue + free_pub >= pages)
 			break;
 		if (tries >= 100 || sc->sc_dying) {
 			DPRINTF(sc, "tx: no free pages (%u+%u < %u)\n",
-			    free_hi, free_pub, pages);
+			    free_queue, free_pub, pages);
 			if_statinc(ifp, if_oerrors);
 			goto out;
 		}
 		kpause("rtw8189ft", true, mstohz(50), NULL);
 	}
 
-	if (rtw8189f_fifo_write(sc, RTW8189F_WLAN_TX_HIQ_DEVICE_ID, buf, len) != 0) {
+	if (rtw8189f_fifo_write(sc, devid, buf, len) != 0) {
 		DPRINTF(sc, "tx: fifo write failed\n");
 		if_statinc(ifp, if_oerrors);
 		goto out;
@@ -1869,6 +1901,141 @@ rtw8189f_tx_frame(struct rtw8189f_softc *sc, struct mbuf *m)
 out:
 	ieee80211_free_node(ni);
 	m_freem(m);
+}
+
+/* ------------------------------------------------------------------ */
+/* HOSTAP                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Upload the beacon template once: qsel BEACON parks the frame in the
+ * firmware's beacon queue and the firmware transmits it at every TBTT -
+ * the same one-shot contract urtwn keeps on the USB 88E.  Runs on the
+ * worker (sc_txbuf is shared with rtw8189f_tx_frame, and only the worker
+ * holds the serializer there).
+ */
+static int
+rtw8189f_tx_beacon(struct rtw8189f_softc *sc, struct mbuf *m)
+{
+	uint8_t *buf = sc->sc_txbuf;
+	uint32_t len, pages, free_queue, free_pub;
+	int tries;
+
+	len = (uint32_t)m->m_pkthdr.len;
+	if (len + RTW8189F_TXDESC_SIZE > RTW8189F_TXBUFSZ) {
+		m_freem(m);
+		return ENOBUFS;
+	}
+
+	memset(buf, 0, RTW8189F_TXDESC_SIZE);
+	m_copydata(m, 0, len, buf + RTW8189F_TXDESC_SIZE);
+
+	/* Fixed rate 1M, BEACON queue select; no BMC flag, no CCX report -
+	 * the firmware owns repetition, the retry limit is meaningless for
+	 * a template. */
+	le32enc(buf + 0, (len & RTW8189F_TXDW0_PKTLEN_M) |
+	    (RTW8189F_TXDESC_SIZE << RTW8189F_TXDW0_OFFSET_S));
+	le32enc(buf + 4, RTW8189F_TXDESC_QSEL_BEACON << RTW8189F_TXDW1_QSEL_S);
+	le32enc(buf + 12, RTW8189F_TXDW3_USE_RATE);
+	le32enc(buf + 16, RTW8189F_RATE_1M & RTW8189F_TXDW4_RATE_M);
+	le16enc(buf + 28, rtw8189f_txdesc_chksum(buf));
+
+	len = (len + RTW8189F_TXDESC_SIZE + 3) & ~3u;
+	pages = (len + 127) / 128;
+
+	/* Page credit from the high queue (qsel BEACON drains HIQ) plus
+	 * public pages, like the mgmt path. */
+	for (tries = 0;; tries++) {
+		free_queue = rtw8189f_sdiolocal_read_1(sc,
+		    RTW8189F_SDIO_REG_FREE_TXPG + 0);
+		free_pub = rtw8189f_sdiolocal_read_1(sc,
+		    RTW8189F_SDIO_REG_FREE_TXPG + 6);
+		if (free_queue + free_pub >= pages)
+			break;
+		if (tries >= 100 || sc->sc_dying) {
+			DPRINTF(sc, "beacon: no free pages (%u+%u < %u)\n",
+			    free_queue, free_pub, pages);
+			m_freem(m);
+			return ENOBUFS;
+		}
+		kpause("rtw8189fb", true, mstohz(50), NULL);
+	}
+
+	if (rtw8189f_fifo_write(sc, RTW8189F_WLAN_TX_HIQ_DEVICE_ID, buf,
+	    len) != 0) {
+		DPRINTF(sc, "beacon: fifo write failed\n");
+		m_freem(m);
+		return EIO;
+	}
+
+	sc->sc_tx_beacons++;
+	m_freem(m);
+	return 0;
+}
+
+/*
+ * Take the AP role at RUN: the BSS node exists, the channel and BSSID are
+ * programmed.  nettype AP, the receive filter opened to any BSSID (probe
+ * and auth requests arrive addressed to our BSSID but must not depend on
+ * the CBSSID compare), TSF restarted so beacons stamp a fresh clock, and
+ * the beacon template uploaded once.
+ */
+void
+rtw8189f_ap_enable(struct rtw8189f_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mbuf *m;
+	uint32_t v;
+
+	/* nettype AP (0 = no link, 1 = adhoc, 2 = infra STA, 3 = AP). */
+	v = rtw8189f_mac_read_4(sc, RTW8189F_REG_CR);
+	v = (v & ~RTW8189F_CR_NETTYPE_M) | RTW8189F_CR_NETTYPE(RTW8189F_NT_AP);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_CR, v);
+
+	/* Accept any BSSID for the AP lifetime (the STA default restores
+	 * these bits in chip_init). */
+	sc->sc_rcr &= ~(RTW8189F_RCR_CBSSID_BCN | RTW8189F_RCR_CBSSID_DATA);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_RCR, sc->sc_rcr);
+
+	/* Restart the TSF: the AP owns the clock its beacons are stamped
+	 * with (self-clearing strobe, toggled like the 88E MSR path). */
+	v = rtw8189f_mac_read_4(sc, RTW8189F_REG_TCR) & ~RTW8189F_TCR_TSFRST;
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_TCR, v);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_TCR, v | RTW8189F_TCR_TSFRST);
+
+	rtw8189f_mac_write_2(sc, RTW8189F_REG_BCN_INTERVAL,
+	    ic->ic_bss->ni_intval);
+
+	/* One template upload; TIM/DTIM updates stay on the air-less path
+	 * (ieee80211_beacon_update is never called - the urtwn-shaped gap,
+	 * harmless while no station uses power save). */
+	m = ieee80211_beacon_alloc(ic, ic->ic_bss, &sc->sc_bo);
+	if (m == NULL) {
+		aprint_error_dev(sc->sc_dev, "beacon alloc failed\n");
+		return;
+	}
+	if (rtw8189f_tx_beacon(sc, m) != 0)
+		aprint_error_dev(sc->sc_dev, "beacon upload failed\n");
+	else
+		sc->sc_ap_beaconing = true;
+}
+
+/* Back to the STA shape (nettype infra, BSSID compare back on).  The
+ * firmware drops the beacon template once the nettype leaves AP. */
+void
+rtw8189f_ap_disable(struct rtw8189f_softc *sc)
+{
+	uint32_t v;
+
+	v = rtw8189f_mac_read_4(sc, RTW8189F_REG_CR);
+	v = (v & ~RTW8189F_CR_NETTYPE_M) |
+	    RTW8189F_CR_NETTYPE(RTW8189F_NT_LINK_AP);
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_CR, v);
+
+	sc->sc_rcr |= RTW8189F_RCR_CBSSID_BCN | RTW8189F_RCR_CBSSID_DATA;
+	rtw8189f_mac_write_4(sc, RTW8189F_REG_RCR, sc->sc_rcr);
+
+	sc->sc_ap_beaconing = false;
 }
 
 /* ------------------------------------------------------------------ */

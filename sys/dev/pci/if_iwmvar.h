@@ -469,6 +469,8 @@ struct iwm_softc {
 	int sc_wantresp;
 
 	struct workqueue *sc_nswq;
+	/* setrates deferral handle (softint backend in this port) */
+	void *setrates_task;
 
 	struct iwm_rx_phy_info sc_last_phy_info;
 	int sc_ampdu_ref;

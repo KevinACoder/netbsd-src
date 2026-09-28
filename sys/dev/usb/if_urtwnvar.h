@@ -25,7 +25,13 @@
 #define URTWN_RX_LIST_COUNT		1
 #define URTWN_TX_LIST_COUNT		8
 
-#define URTWN_HOST_CMD_RING_COUNT	32
+/*
+ * 64 slots: the 20260925 first-scan stall traced to this ring backing up
+ * during cold-boot firmware bring-up and the overflow eating a
+ * newstate_cb (the scan re-arm lives at its end).  Upstream's 32 slots
+ * overflow after ~6 s of a stalled taskq at the observed ~6 cmd/s.
+ */
+#define URTWN_HOST_CMD_RING_COUNT	64
 
 #define URTWN_RXBUFSZ	(16 * 1024)
 #define URTWN_TXBUFSZ	(sizeof(struct r92c_tx_desc_usb) + IEEE80211_MAX_LEN + 8)

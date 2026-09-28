@@ -78,7 +78,7 @@ __KERNEL_RCSID(0, "$NetBSD: xhci.c,v 1.188.2.4 2026/07/05 07:37:09 martin Exp $"
 	    if (xhcidebug > 0) \
 		    hexdump(printf, a, b, c); \
     } while (/*CONSTCOND*/0)
-static int xhcidebug = 0;
+static int xhcidebug = XHCI_DEBUG_DEFAULT;
 
 SYSCTL_SETUP(sysctl_hw_xhci_setup, "sysctl hw.xhci setup")
 {

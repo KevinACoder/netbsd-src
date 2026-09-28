@@ -78,6 +78,10 @@ extern int rtw8189f_debug;
 #define RTW8189F_F_TX			0x0002
 #define RTW8189F_F_EXIT			0x0004
 #define RTW8189F_F_SCANNEXT		0x0008
+/* NET80211_PORT(L): set from the SDIO DAT1 ISR, so it lives outside the
+ * mutex discipline - a lost update to this one bit only costs one poll
+ * quantum (the 10 ms watchdog stays on). */
+#define RTW8189F_F_RX			0x0010
 
 /* Bounce buffer sizes: RX must hold the largest aggregated FIFO burst,
  * TX one TXDESC (40B) plus the largest 802.11 frame. */
@@ -98,6 +102,13 @@ struct rtw8189f_softc {
 				    enum ieee80211_state, int);
 	callout_t		sc_scan_to;
 
+	/* HOSTAP: the beacon template net80211 allocated.  One upload per
+	 * BSS - the firmware repeats it at TBTT, the same contract urtwn
+	 * keeps; ieee80211_beacon_update (TIM/DTIM) never reaches the air. */
+	struct ieee80211_beacon_offsets sc_bo;
+	bool			sc_ap_beaconing;
+	unsigned		sc_tx_beacons;	/* templates uploaded */
+
 	/* Worker thread: owns all sleeping chip/bus work at runtime. */
 	kmutex_t		sc_work_mtx;
 	kcondvar_t		sc_cv;
@@ -106,6 +117,7 @@ struct rtw8189f_softc {
 	enum ieee80211_state	sc_nstate;	/* deferred newstate args */
 	int			sc_narg;
 	lwp_t			*sc_worker;
+	void			*sc_ih;		/* NET80211_PORT(L): SDIO intr cookie */
 
 	int			sc_dying;
 	bool			sc_attached;
@@ -173,6 +185,10 @@ void	rtw8189f_set_channel(struct rtw8189f_softc *, unsigned);
 void	rtw8189f_scan_rx_fltr(struct rtw8189f_softc *, bool);
 void	rtw8189f_set_bssid(struct rtw8189f_softc *, const uint8_t *);
 void	rtw8189f_tx_frame(struct rtw8189f_softc *, struct mbuf *);
+void	rtw8189f_ap_enable(struct rtw8189f_softc *);
+void	rtw8189f_ap_disable(struct rtw8189f_softc *);
+int	rtw8189f_data_rate_set(unsigned);
+unsigned rtw8189f_data_rate_get(void);
 void	rtw8189f_rx_drain(struct rtw8189f_softc *);
 
 #endif /* !_DEV_SDMMC_RTW8189FVAR_H_ */

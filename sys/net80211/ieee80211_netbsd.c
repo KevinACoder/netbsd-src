@@ -60,6 +60,7 @@ __KERNEL_RCSID(0, "$NetBSD: ieee80211_netbsd.c,v 1.34 2018/12/22 14:28:56 maxv E
 
 #define	LOGICALLY_EQUAL(x, y)	(!(x) == !(y))
 
+#ifndef IEEE80211_PORT_NO_SYSCTL
 static void ieee80211_sysctl_fill_node(struct ieee80211_node *,
     struct ieee80211_node_sysctl *, int, const struct ieee80211_channel *,
     uint32_t);
@@ -70,6 +71,9 @@ static struct ieee80211_node *ieee80211_node_walkfirst(
 static int ieee80211_sysctl_node(SYSCTLFN_ARGS);
 
 static void ieee80211_sysctl_setup(void);
+#else
+static void ieee80211_sysctl_setup(void);
+#endif
 
 #ifdef IEEE80211_DEBUG
 int	ieee80211_debug = 0;
@@ -106,6 +110,9 @@ ieee80211_init(void)
 	RUN_ONCE(&ieee80211_init_once, ieee80211_init0);
 }
 
+/* NET80211_PORT(L): the sysctl configuration tree is compiled out on
+ * this port; attach/detach keep empty implementations. */
+#ifndef IEEE80211_PORT_NO_SYSCTL
 static int
 ieee80211_sysctl_inact(SYSCTLFN_ARGS)
 {
@@ -499,6 +506,24 @@ ieee80211_sysctl_setup(void)
 err:
 	printf("%s: sysctl_createv failed (rc = %d)\n", __func__, rc);
 }
+#else
+static void
+ieee80211_sysctl_setup(void)
+{
+}
+
+void
+ieee80211_sysctl_attach(struct ieee80211com *ic)
+{
+	(void) ic;
+}
+
+void
+ieee80211_sysctl_detach(struct ieee80211com *ic)
+{
+	(void) ic;
+}
+#endif /* IEEE80211_PORT_NO_SYSCTL */
 
 int
 ieee80211_node_dectestref(struct ieee80211_node *ni)

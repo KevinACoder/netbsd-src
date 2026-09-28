@@ -159,6 +159,61 @@ int iwm_debug = 0;
 #define DPRINTFN(n, x)	do { ; } while (0)
 #endif
 
+/* Port forensics counters (read by the port's shell `wlan status`): a
+ * port-side DMA/descriptor or ring mistake shows up here as "the
+ * interrupt keeps arriving but nothing reaches net80211". */
+unsigned iwm_dbg_rx_entries, iwm_dbg_rx_phy_bad, iwm_dbg_rx_crc_bad,
+    iwm_dbg_rx_rearm_fail, iwm_dbg_rx_delivered, iwm_dbg_notif_calls;
+/* AMRR feedback / notif-dispatch forensics (read by wlan status): the
+ * rate stays pinned at the lowest entry when completions never reach
+ * iwm_rx_tx_cmd_single or every completion reads as a retry. */
+unsigned iwm_dbg_calib_ticks, iwm_dbg_calib_choose;
+unsigned iwm_dbg_tx_status, iwm_dbg_tx_failack_sum, iwm_dbg_tx_status_err;
+int iwm_dbg_tx_last_failack = -1;
+unsigned iwm_dbg_notif_garbage, iwm_dbg_notif_unhandled;
+unsigned iwm_dbg_last_unhandled_code;
+/* Scan-lifecycle event ring: the 0x090A (UMAC scan family) fatal fires
+ * somewhere between a scan request, its completion notification and the
+ * state-machine resets around them - the ORDER is what the dump at the
+ * fatal label answers. Letters: N=newstate, F=force-init, J=join running
+ * scan, R=scan request (arg 1=umac 0=lmac), S=scanning set, C=scanning
+ * clear, D=scan completion notif (arg=kind), E=endscan, P=stop, I=init,
+ * H=init_hw. newstate packs (ostate<<4)|nstate. */
+struct iwm_scan_ev {
+	uint8_t ev;
+	uint8_t arg;
+};
+#define IWM_SCAN_EV_N 32
+static struct iwm_scan_ev iwm_scan_evs[IWM_SCAN_EV_N];
+static unsigned iwm_scan_ev_n;
+
+static void
+iwm_scan_ev(uint8_t ev, uint8_t arg)
+{
+	struct iwm_scan_ev *e = &iwm_scan_evs[iwm_scan_ev_n++ % IWM_SCAN_EV_N];
+
+	e->ev = ev;
+	e->arg = arg;
+}
+
+void
+iwm_scan_ev_dump(void)
+{
+	unsigned i;
+
+	printf("iwm scan-ev ring (n=%u):\n", iwm_scan_ev_n);
+	for (i = 0; i < IWM_SCAN_EV_N; i++) {
+		const struct iwm_scan_ev *e =
+		    &iwm_scan_evs[(iwm_scan_ev_n + i) % IWM_SCAN_EV_N];
+
+		if (e->ev == 0)
+			continue;
+		printf("  [%u] %c arg=%02x\n", i, e->ev, e->arg);
+	}
+}
+unsigned iwm_dbg_rx_allocs, iwm_dbg_rx_nombuf, iwm_dbg_rx_noext,
+    iwm_dbg_rx_mapfail;
+
 #include <dev/pci/if_iwmreg.h>
 #include <dev/pci/if_iwmvar.h>
 
@@ -449,10 +504,14 @@ static int	iwm_update_quotas(struct iwm_softc *, struct iwm_node *);
 static int	iwm_auth(struct iwm_softc *);
 static int	iwm_assoc(struct iwm_softc *);
 static void	iwm_calib_timeout(void *);
-#ifndef IEEE80211_NO_HT
+/*
+ * The legacy-rate LQ plumbing is deliberately kept in IEEE80211_NO_HT
+ * builds (this port defines it): without iwm_setrates() the firmware's
+ * rate table is never installed and data frames stay at the ucode
+ * default rate no matter what AMRR chooses.
+ */
 static void	iwm_setrates_task(void *);
 static int	iwm_setrates(struct iwm_node *);
-#endif
 static int	iwm_media_change(struct ifnet *);
 static int	iwm_do_newstate(struct ieee80211com *, enum ieee80211_state,
 		    int);
@@ -3773,8 +3832,11 @@ iwm_rx_addbuf(struct iwm_softc *sc, int size, int idx)
 	int fatal = 0;
 
 	m = m_gethdr(M_DONTWAIT, MT_DATA);
-	if (m == NULL)
+	if (m == NULL) {
+		iwm_dbg_rx_nombuf++;
 		return ENOBUFS;
+	}
+	iwm_dbg_rx_allocs++;
 
 	if (size <= MCLBYTES) {
 		MCLGET(m, M_DONTWAIT);
@@ -3782,6 +3844,7 @@ iwm_rx_addbuf(struct iwm_softc *sc, int size, int idx)
 		MEXTMALLOC(m, size, M_DONTWAIT);
 	}
 	if ((m->m_flags & M_EXT) == 0) {
+		iwm_dbg_rx_noext++;
 		m_freem(m);
 		return ENOBUFS;
 	}
@@ -3795,6 +3858,7 @@ iwm_rx_addbuf(struct iwm_softc *sc, int size, int idx)
 	err = bus_dmamap_load_mbuf(sc->sc_dmat, data->map, m,
 	    BUS_DMA_READ|BUS_DMA_NOWAIT);
 	if (err) {
+		iwm_dbg_rx_mapfail++;
 		/* XXX */
 		if (fatal)
 			panic("iwm: could not load RX mbuf");
@@ -3923,6 +3987,7 @@ iwm_rx_rx_mpdu(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 	int rssi;
 	int s;
 
+	iwm_dbg_rx_entries++;
 	bus_dmamap_sync(sc->sc_dmat, data->map, 0, IWM_RBUF_SIZE,
 	    BUS_DMASYNC_POSTREAD);
 
@@ -3937,17 +4002,48 @@ iwm_rx_rx_mpdu(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 	m->m_data = pkt->data + sizeof(*rx_res);
 	m->m_pkthdr.len = m->m_len = len;
 
+	/*
+	 * Re-arm the ring slot *before* any of the early returns below.
+	 *
+	 * The slot's mbuf has just been re-pointed at the frame, while the RBD
+	 * still holds the buffer's original address (the device rebuilds it as
+	 * rbd << 8, so the slot's DMA view is fixed).  A return with the mbuf
+	 * still re-pointed therefore poisons the slot: every later DMA into it
+	 * is parsed from the wrong offset, which yields a garbage packet per
+	 * wrap - dropped, so the slot never recovers - and the garbage can
+	 * even look like a command or TX completion, at which point the
+	 * bookkeeping is fed bogus indices.  Rid the driver of that by taking
+	 * a fresh buffer for the slot here; the frame below still travels on
+	 * the mbuf `m`, which iwm_rx_addbuf no longer owns.
+	 */
+	if (iwm_rx_addbuf(sc, IWM_RBUF_SIZE, sc->rxq.cur) != 0) {
+		/*
+		 * Keep the slot's DMA view consistent even when no fresh
+		 * buffer could be had (heap exhausted): the frame is dropped
+		 * below, but the next DMA into this slot must still be parsed
+		 * at the offset the RBD names.
+		 */
+		m->m_data = (char *)(uintptr_t)data->map->dm_segs[0].ds_addr;
+		m->m_len = m->m_pkthdr.len = IWM_RBUF_SIZE;
+		iwm_dbg_rx_rearm_fail++;
+		return;
+	}
+
 	if (__predict_false(phy_info->cfg_phy_cnt > 20)) {
 		DPRINTF(("dsp size out of range [0,20]: %d\n",
 		    phy_info->cfg_phy_cnt));
+		iwm_dbg_rx_phy_bad++;
 		return;
 	}
 
 	if (!(rx_pkt_status & IWM_RX_MPDU_RES_STATUS_CRC_OK) ||
 	    !(rx_pkt_status & IWM_RX_MPDU_RES_STATUS_OVERRUN_OK)) {
 		DPRINTF(("Bad CRC or FIFO: 0x%08X.\n", rx_pkt_status));
+		iwm_dbg_rx_crc_bad++;
 		return; /* drop */
 	}
+
+	iwm_dbg_rx_delivered++;
 
 	device_timestamp = le32toh(phy_info->system_timestamp);
 
@@ -3960,9 +4056,6 @@ iwm_rx_rx_mpdu(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 
 	if (ic->ic_state == IEEE80211_S_SCAN)
 		iwm_fix_channel(sc, m);
-
-	if (iwm_rx_addbuf(sc, IWM_RBUF_SIZE, sc->rxq.cur) != 0)
-		return;
 
 	m_set_rcvif(m, IC2IFP(ic));
 
@@ -4038,6 +4131,12 @@ iwm_rx_tx_cmd_single(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
 	KASSERT(tx_resp->frame_count == 1);
 
 	/* Update rate control statistics. */
+	iwm_dbg_tx_status++;
+	iwm_dbg_tx_failack_sum += failack;
+	iwm_dbg_tx_last_failack = failack;
+	if (status != IWM_TX_STATUS_SUCCESS &&
+	    status != IWM_TX_STATUS_DIRECT_DONE)
+		iwm_dbg_tx_status_err++;
 	in->in_amn.amn_txcnt++;
 	if (failack > 0) {
 		in->in_amn.amn_retrycnt++;
@@ -4469,14 +4568,30 @@ iwm_cmd_done(struct iwm_softc *sc, int qid, int idx)
 	wakeup(&ring->desc[idx]);
 
 	if (((idx + ring->queued) % IWM_TX_RING_COUNT) != ring->cur) {
-		device_printf(sc->sc_dev,
-		    "Some HCMDs skipped?: idx=%d queued=%d cur=%d\n",
-		    idx, ring->queued, ring->cur);
+		/*
+		 * A completion processed against ring bookkeeping the
+		 * submitter was mid-update on lands here; it used to print
+		 * unconditionally (once per frame in the worst case).  Keep
+		 * the first few, then one per thousand, with the running
+		 * count so a board log still says whether it happens at all.
+		 */
+		static unsigned hcmd_skipped;
+
+		if (hcmd_skipped++ < 8 || (hcmd_skipped % 1000) == 0) {
+			device_printf(sc->sc_dev,
+			    "Some HCMDs skipped?: idx=%d queued=%d cur=%d (n=%u)\n",
+			    idx, ring->queued, ring->cur, hcmd_skipped);
+		}
 	}
 
 	if (ring->queued == 0) {
+		static unsigned cmd_empty;
+
 		splx(s);
-		device_printf(sc->sc_dev, "cmd_done with empty ring\n");
+		if (cmd_empty++ < 8 || (cmd_empty % 1000) == 0) {
+			device_printf(sc->sc_dev,
+			    "cmd_done with empty ring (n=%u)\n", cmd_empty);
+		}
 		return;
 	}
 
@@ -5359,6 +5474,7 @@ iwm_fill_probe_req(struct iwm_softc *sc, struct iwm_scan_probe_req *preq)
 static int
 iwm_lmac_scan(struct iwm_softc *sc)
 {
+	iwm_scan_ev('R', 0);
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_host_cmd hcmd = {
 		.id = IWM_SCAN_OFFLOAD_REQUEST_CMD,
@@ -5534,6 +5650,7 @@ iwm_config_umac_scan(struct iwm_softc *sc)
 static int
 iwm_umac_scan(struct iwm_softc *sc)
 {
+	iwm_scan_ev('R', 1);
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_host_cmd hcmd = {
 		.id = iwm_cmd_id(IWM_SCAN_REQ_UMAC, IWM_ALWAYS_LONG_GROUP, 0),
@@ -6006,12 +6123,11 @@ iwm_calib_timeout(void *arg)
 	struct iwm_softc *sc = arg;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
-#ifndef IEEE80211_NO_HT
 	struct ieee80211_node *ni = &in->in_ni;
 	int otxrate;
-#endif
 	int s;
 
+	iwm_dbg_calib_ticks++;
 	s = splnet();
 	if ((ic->ic_fixed_rate == -1
 #ifndef IEEE80211_NO_HT
@@ -6023,28 +6139,29 @@ iwm_calib_timeout(void *arg)
 		if (ni->ni_flags & IEEE80211_NODE_HT)
 			otxrate = ni->ni_txmcs;
 		else
-			otxrate = ni->ni_txrate;
 #endif
+			otxrate = ni->ni_txrate;
+		iwm_dbg_calib_choose++;
 		ieee80211_amrr_choose(&sc->sc_amrr, &in->in_ni, &in->in_amn);
 
-#ifndef IEEE80211_NO_HT
 		/*
 		 * If AMRR has chosen a new TX rate we must update
 		 * the firwmare's LQ rate table from process context.
 		 */
+#ifndef IEEE80211_NO_HT
 		if ((ni->ni_flags & IEEE80211_NODE_HT) &&
 		    otxrate != ni->ni_txmcs)
 			softint_schedule(sc->setrates_task);
-		else if (otxrate != ni->ni_txrate)
-			softint_schedule(sc->setrates_task);
+		else
 #endif
+		if (otxrate != ni->ni_txrate)
+			softint_schedule(sc->setrates_task);
 	}
 	splx(s);
 
 	callout_schedule(&sc->sc_calib_to, mstohz(500));
 }
 
-#ifndef IEEE80211_NO_HT
 static void
 iwm_setrates_task(void *arg)
 {
@@ -6156,7 +6273,6 @@ iwm_setrates(struct iwm_node *in)
 	cmd.data[0] = &in->in_lq;
 	return iwm_send_cmd(sc, &cmd);
 }
-#endif
 
 static int
 iwm_media_change(struct ifnet *ifp)
@@ -6204,6 +6320,7 @@ iwm_do_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 
 	DPRINTF(("switching state %s->%s\n", ieee80211_state_name[ostate],
 	    ieee80211_state_name[nstate]));
+	iwm_scan_ev('N', (ostate << 4) | nstate);
 
 	if (ostate == IEEE80211_S_SCAN && nstate != ostate)
 		iwm_led_blink_stop(sc);
@@ -6219,17 +6336,21 @@ iwm_do_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 		 * puts the driver into AUTH state. This will fail with this
 		 * driver so bring the FSM from RUN to SCAN in this case.
 		 */
-		if (nstate != IEEE80211_S_INIT) {
-			DPRINTF(("Force transition to INIT; MGT=%d\n", arg));
-			/* Always pass arg as -1 since we can't Tx right now. */
-			sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
-			iwm_stop(ifp, 0);
-			iwm_init(ifp);
-			return 0;
-		}
-
-		iwm_stop_device(sc);
-		iwm_init_hw(sc);
+		/*
+		 * Take the full stop+init road for every downgrade into
+		 * INIT, INIT included: the soft reset (stop_device +
+		 * init_hw) leaves the firmware's scan engine unready, and
+		 * the first scan command after an assoc-failure downgrade
+		 * asserted 0x090A there (LMAC error table, scan family).
+		 * The supplicant's 1 s scan backoff absorbs the reload.
+		 */
+		DPRINTF(("Force transition to INIT; MGT=%d\n", arg));
+		iwm_scan_ev('F', nstate);
+		/* Always pass arg as -1 since we can't Tx right now. */
+		sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
+		iwm_stop(ifp, 0);
+		iwm_init(ifp);
+		return 0;
 	}
 
 	switch (nstate) {
@@ -6252,6 +6373,7 @@ iwm_do_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 		 * needed to receive frames and deliver its completion.
 		 */
 		if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING)) {
+			iwm_scan_ev('J', 0);
 			ic->ic_state = IEEE80211_S_SCAN;
 			return 0;
 		}
@@ -6264,6 +6386,7 @@ iwm_do_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 			    DEVNAME(sc), err));
 			return err;
 		}
+		iwm_scan_ev('S', 0);
 		SET(sc->sc_flags, IWM_FLAG_SCANNING);
 		ic->ic_state = nstate;
 		iwm_led_blink_start(sc);
@@ -6336,8 +6459,8 @@ iwm_do_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 		in->in_ni.ni_txrate = 0;
 #ifndef IEEE80211_NO_HT
 		in->in_ni.ni_txmcs = 0;
-		iwm_setrates(in);
 #endif
+		iwm_setrates(in);
 
 		callout_schedule(&sc->sc_calib_to, mstohz(500));
 		iwm_led_enable(sc);
@@ -6406,6 +6529,7 @@ iwm_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 static void
 iwm_endscan(struct iwm_softc *sc)
 {
+	iwm_scan_ev('E', 0);
 	struct ieee80211com *ic = &sc->sc_ic;
 	int s;
 
@@ -6634,6 +6758,7 @@ iwm_tt_tx_backoff(struct iwm_softc *sc, uint32_t backoff)
 static int
 iwm_init_hw(struct iwm_softc *sc)
 {
+	iwm_scan_ev('H', 0);
 	struct ieee80211com *ic = &sc->sc_ic;
 	int err, i, ac;
 
@@ -6800,6 +6925,8 @@ iwm_init(struct ifnet *ifp)
 	struct iwm_softc *sc = ifp->if_softc;
 	int err;
 
+	iwm_scan_ev('I', 0);
+
 	if (ISSET(sc->sc_flags, IWM_FLAG_HW_INITED))
 		return 0;
 
@@ -6911,6 +7038,8 @@ static void
 iwm_stop(struct ifnet *ifp, int disable)
 {
 	struct iwm_softc *sc = ifp->if_softc;
+
+	iwm_scan_ev('P', disable);
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct iwm_node *in = (struct iwm_node *)ic->ic_bss;
 
@@ -7298,6 +7427,8 @@ iwm_notif_intr(struct iwm_softc *sc)
 {
 	uint16_t hw;
 
+	iwm_dbg_notif_calls++;
+
 	bus_dmamap_sync(sc->sc_dmat, sc->rxq.stat_dma.map,
 	    0, sc->rxq.stat_dma.size, BUS_DMASYNC_POSTREAD);
 
@@ -7324,6 +7455,7 @@ iwm_notif_intr(struct iwm_softc *sc)
 		 */
 		if (__predict_false((pkt->hdr.code == 0 && qid == 0 && idx == 0)
 		    || pkt->len_n_flags == htole32(0x55550000))) {
+			iwm_dbg_notif_garbage++;
 			ADVANCE_RXQ(sc);
 			continue;
 		}
@@ -7502,12 +7634,14 @@ iwm_notif_intr(struct iwm_softc *sc)
 
 		case IWM_SCAN_OFFLOAD_COMPLETE: {
 			struct iwm_periodic_scan_complete *notif;
+			iwm_scan_ev('D', 'P');
 			SYNC_RESP_STRUCT(notif, pkt);
 			break;
 		}
 
 		case IWM_SCAN_ITERATION_COMPLETE: {
 			struct iwm_lmac_scan_complete_notif *notif;
+			iwm_scan_ev('D', 'L');
 			SYNC_RESP_STRUCT(notif, pkt);
 			if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING)) {
 				CLR(sc->sc_flags, IWM_FLAG_SCANNING);
@@ -7518,6 +7652,7 @@ iwm_notif_intr(struct iwm_softc *sc)
 
 		case IWM_SCAN_COMPLETE_UMAC: {
 			struct iwm_umac_scan_complete *notif;
+			iwm_scan_ev('D', 'U');
 			SYNC_RESP_STRUCT(notif, pkt);
 			if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING)) {
 				CLR(sc->sc_flags, IWM_FLAG_SCANNING);
@@ -7528,6 +7663,7 @@ iwm_notif_intr(struct iwm_softc *sc)
 
 		case IWM_SCAN_ITERATION_COMPLETE_UMAC: {
 			struct iwm_umac_scan_iter_complete_notif *notif;
+			iwm_scan_ev('D', 'M');
 			SYNC_RESP_STRUCT(notif, pkt);
 			if (ISSET(sc->sc_flags, IWM_FLAG_SCANNING)) {
 				CLR(sc->sc_flags, IWM_FLAG_SCANNING);
@@ -7563,12 +7699,26 @@ iwm_notif_intr(struct iwm_softc *sc)
 			break;
 		}
 
-		default:
-			aprint_error_dev(sc->sc_dev,
-			    "unhandled firmware response 0x%x 0x%x/0x%x "
-			    "rx ring %d[%d]\n",
-			    code, pkt->hdr.code, pkt->len_n_flags, qid, idx);
+		default: {
+			/*
+			 * A corrupted or stale RX ring entry lands here, and one
+			 * such entry is re-read on every ring wrap, so the
+			 * original unconditional print buried the console at
+			 * tens of lines per second.  Keep the first few for
+			 * diagnosis and then one per thousand.
+			 */
+			iwm_dbg_notif_unhandled++;
+			iwm_dbg_last_unhandled_code = code;
+			if (iwm_dbg_notif_unhandled < 8 ||
+			    (iwm_dbg_notif_unhandled % 1000) == 0) {
+				aprint_error_dev(sc->sc_dev,
+				    "unhandled firmware response 0x%x 0x%x/0x%x "
+				    "rx ring %d[%d] (n=%u)\n",
+				    code, pkt->hdr.code, pkt->len_n_flags, qid, idx,
+				    iwm_dbg_notif_unhandled);
+			}
 			break;
+		}
 		}
 
 		/*
@@ -7680,6 +7830,7 @@ iwm_softintr(void *arg)
 
 		aprint_error_dev(sc->sc_dev, "fatal firmware error\n");
  fatal:
+		iwm_scan_ev_dump();
 		s = splnet();
 		/*
 		 * Terminate an in-progress scan explicitly: the scan
@@ -8108,11 +8259,14 @@ iwm_attach(device_t parent, device_t self, void *aux)
 	callout_setfunc(&sc->sc_calib_to, iwm_calib_timeout, sc);
 	callout_init(&sc->sc_led_blink_to, 0);
 	callout_setfunc(&sc->sc_led_blink_to, iwm_led_blink_timeout, sc);
-#ifndef IEEE80211_NO_HT
-	if (workqueue_create(&sc->sc_setratewq, "iwmsr",
-	    iwm_setrates_task, sc, PRI_NONE, IPL_NET, 0))
-		panic("%s: could not create workqueue: setrates",
+	/* The setrates deferral rides this port's softint backend (the
+	 * upstream workqueue backend is not used here). */
+	sc->setrates_task = softint_establish(SOFTINT_NET,
+	    iwm_setrates_task, sc);
+	if (sc->setrates_task == NULL)
+		panic("%s: could not establish softint: setrates",
 		    device_xname(self));
+#ifndef IEEE80211_NO_HT
 	if (workqueue_create(&sc->sc_bawq, "iwmba",
 	    iwm_ba_task, sc, PRI_NONE, IPL_NET, 0))
 		panic("%s: could not create workqueue: blockack",

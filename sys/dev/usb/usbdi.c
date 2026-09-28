@@ -1131,7 +1131,7 @@ usb_transfer_complete(struct usbd_xfer *xfer)
 	    !usbd_xfer_isread(xfer)) {
 		USBHIST_LOG(usbdebug, "Possible output ack miss for xfer %#jx: "
 		    "hiding write timeout to %jd.%jd for %ju bytes written",
-		    (uintptr_t)xfer, curlwp->l_proc->p_pid, curlwp->l_lid,
+		    (uintptr_t)xfer, 0, 0,
 		    xfer->ux_length);
 
 		xfer->ux_status = USBD_NORMAL_COMPLETION;

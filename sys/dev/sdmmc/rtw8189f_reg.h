@@ -221,6 +221,7 @@
 #define RTW8189F_REG_SIFS_CTX			0x0514
 #define RTW8189F_REG_SIFS_TRX			0x0516
 #define RTW8189F_REG_TBTT_PROHIBIT		0x0540
+#define RTW8189F_REG_BCN_INTERVAL		0x0554
 #define RTW8189F_REG_BCN_CTRL			0x0550
 #define RTW8189F_REG_DRVERLYINT			0x0558
 #define RTW8189F_REG_BCNDMATIM			0x0559
@@ -230,6 +231,8 @@
 #define RTW8189F_BCN_EN_BCN_FUNCTION		__BIT(3)
 
 /* WMAC configuration. */
+#define RTW8189F_REG_TCR			0x0604
+#define RTW8189F_TCR_TSFRST			__BIT(0)
 #define RTW8189F_REG_RCR			0x0608
 #define RTW8189F_REG_RX_DRVINFO_SZ		0x060f
 #define RTW8189F_REG_MACID			0x0610
@@ -272,6 +275,7 @@
 #define RTW8189F_CR_NETTYPE_M			0x30000
 #define RTW8189F_CR_NETTYPE(x)			(((x) & 0x3) << 16)
 #define RTW8189F_NT_LINK_AP			0x2
+#define RTW8189F_NT_AP				0x3
 
 /* BB register file and RF LSSI access (rtl8188f_phycfg.c). */
 #define RTW8189F_BB_HSSI_P1			0x0820	/* rFPGA0_XA_HSSIParameter1 */
@@ -361,6 +365,8 @@
  * the first 32 bytes, HW sequence numbers enabled via REG_HWSEQ_CTRL).
  */
 #define RTW8189F_TXDESC_SIZE			40
+#define RTW8189F_TXDESC_QSEL_BE			0x00
+#define RTW8189F_TXDESC_QSEL_BEACON		0x10
 #define RTW8189F_TXDESC_QSEL_MGNT		0x12
 
 /* dword0: [15:0] packet size, [23:16] offset (= descriptor size). */
@@ -390,6 +396,9 @@
 /* TX rate indices (DESC8188F_RATE*) and rate-adaptive table ids. */
 #define RTW8189F_RATE_1M			0x00
 #define RTW8189F_RATE_6M			0x04
+#define RTW8189F_RATE_24M			0x08
+#define RTW8189F_RATE_36M			0x09
+#define RTW8189F_RATE_54M			0x0b
 #define RTW8189F_RATEID_G			7	/* RATEID_IDX_G */
 
 #endif /* !_DEV_SDMMC_RTW8189F_REG_H_ */
